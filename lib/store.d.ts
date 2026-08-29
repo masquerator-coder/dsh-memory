@@ -96,6 +96,7 @@ export declare class MemoryStore {
         includeLowQuality?: boolean;
     }): {
         seedId: string;
+        topic: string;
         facts: {
             id: string;
             content: string;

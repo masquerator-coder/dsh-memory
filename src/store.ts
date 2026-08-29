@@ -552,7 +552,7 @@ export class MemoryStore {
   /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates. */
   semanticClusters(
     opts: { min?: number; limit?: number; includeLowQuality?: boolean } = {},
-  ): { seedId: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] {
+  ): { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] {
     const min = opts.min ?? 2
     const byTopic = new Map<string, { id: string; content: string; kind?: Kind; importance?: Importance }[]>()
     for (const e of this.list({ includeArchived: false, includeLowQuality: opts.includeLowQuality === true })) {
@@ -560,9 +560,9 @@ export class MemoryStore {
       arr.push({ id: e.id, content: e.content, kind: e.kind, importance: e.importance })
       byTopic.set(e.topic, arr)
     }
-    const out: { seedId: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] = []
+    const out: { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] = []
     for (const [topic, facts] of byTopic) {
-      if (facts.length >= min) out.push({ seedId: facts[0].id, facts })
+      if (facts.length >= min) out.push({ seedId: facts[0].id, topic, facts })
     }
     out.sort((a, b) => b.facts.length - a.facts.length)
     return (opts.limit && opts.limit > 0) ? out.slice(0, opts.limit) : out

@@ -435,6 +435,8 @@ group('G14 L2 semantic merge/arbitration (LLM-decided)')
   const stats = await runRefineL2(s, { llm: okSeam, provider: 'p', model: 'm', minCluster: 2 })
   assert('L2 applied merge verdict', stats.verdictsApplied >= 1)
   assert('L2 merged fact written', s.activeEntries().some(e => e.content.includes('环境变量 DB_URL')))
+  const merged = s.activeEntries().find(e => e.content.includes('环境变量 DB_URL'))
+  assert('L2 merged fact inherits cluster topic (not general)', merged && merged.topic === 'db')
   const archivedTarget = s.get(id0)
   assert('L2 merge archived the targeted original (soft)', !archivedTarget || archivedTarget.archived === true)
   const db = new DatabaseSync(s.dbPath)
@@ -454,6 +456,24 @@ group('G14 L2 semantic merge/arbitration (LLM-decided)')
   const noRoute = await runRefineL2(s3, {})
   assert('L2 no-route → no-op (0 clusters, no audit spam)', noRoute.clusters === 0)
   s3.close()
+
+  // edge case: merged content collides onto a source id → that source is the
+  // merged entry (kept active), other sources removed; exactly one active left
+  const t4 = mkdtempSync(join(tmpdir(), 'dsh-memory-l2c-'))
+  const s4 = new MemoryStore(t4)
+  s4.batch([{ action: 'add', topic: 'edge', importance: 4, content: '甲事实内容完全一致X' }])
+  s4.batch([{ action: 'add', topic: 'edge', importance: 4, content: '乙事实内容重复Y' }])
+  const cl4 = s4.semanticClusters({ min: 2 })
+  const idA = cl4[0].facts[0].id
+  const repSeam = { stream: async function* () { yield { type: 'text-delta', text: JSON.stringify([{ action: 'merge', targetIds: [idA], content: '甲事实内容完全一致X', kind: 'env' }]) } } }
+  const st4 = await runRefineL2(s4, { llm: repSeam, provider: 'p', model: 'm', minCluster: 2 })
+  assert('L2 merge-worded-as-source replays no active-loss', st4.verdictsApplied >= 1)
+  const active4 = s4.activeEntries()
+  assert('L2 dedup-collided merge keeps one active fact', active4.length === 1 && active4[0].content === '甲事实内容完全一致X')
+  assert('L2 dedup-collided merge keeps the surviving source topic', active4[0].topic === 'edge')
+  s4.close()
+  rmSync(t4, { recursive: true, force: true })
+
   s.close()
   rmSync(t2, { recursive: true, force: true })
 }
