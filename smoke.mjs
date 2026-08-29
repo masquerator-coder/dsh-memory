@@ -24,6 +24,7 @@ import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shoul
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
+import { buildL1Prompt, buildL2Prompt, parseL1Json, parseL2Json, runRefineL1, runRefineL2 } from './lib/refine.js'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -358,6 +359,124 @@ group('G12 formatting (pure, M0)')
   assert('recallEmptyLabel', recallEmptyLabel() === '无匹配记忆')
   assert('formatEntries exposes id', formatEntries([{ id: 'abc123', layer: 'memory', tier: 1, low_quality: false, importance: 3, topic: 't', content: 'c' }]).includes('abc123'))
   assert('formatEpisodes renders summary', formatEpisodes([{ id: 'e1', session_id: 's', ts: 1, summary: '摘要', topic: 't', extracted: false, archived: false, created: 1 }]).includes('摘要'))
+}
+
+// ---------------------------------------------------------------------------
+group('G13 L1 episodic → semantic extraction (LLM-decided)')
+{
+  // pure prompt + parse
+  assert('buildL1Prompt frames summary + tools', buildL1Prompt('会话摘要内容', '["memory"]').user.includes('会话摘要内容'))
+  let p = parseL1Json('```json\n[{"content":"用户偏好简洁","kind":"preference","importance":5,"epistemic":"observed"}]\n```')
+  assert('parseL1Json tolerates fences + valid facts', Array.isArray(p) && p.length === 1 && p[0].content === '用户偏好简洁' && p[0].kind === 'preference')
+  assert('parseL1Json null on parse failure', parseL1Json('not json') === null)
+  assert('parseL1Json empty-valid → [] (not degraded)', Array.isArray(parseL1Json('[]')) && parseL1Json('[]').length === 0)
+  const clamped = parseL1Json('[{"content":"x","kind":"bogus","importance":9,"epistemic":"guess"}]')
+  assert('parseL1Json clamps importance + narrows kind/epistemic', clamped[0].importance === 5 && clamped[0].kind === undefined && clamped[0].epistemic === undefined)
+
+  // end-to-end: ok LLM writes facts + marks episodes extracted, audit level 1
+  const t1 = mkdtempSync(join(tmpdir(), 'dsh-memory-l1-'))
+  const s = new MemoryStore(t1)
+  s.addEpisode({ sessionId: 'sess-a', summary: '用户说喜欢用uv管理Python环境，并强调不要在WSL里用sudo命令' })
+  s.addEpisode({ sessionId: 'sess-b', summary: '讨论了一次性琐事，没有值得长期记住的内容' })
+  const okSeam = {
+    stream: async function* (o) {
+      if (o.messages[0].content[0].text.includes('一次性琐事')) yield { type: 'text-delta', text: '[]' }
+      else yield { type: 'text-delta', text: '[{"content":"用户偏好用uv管理Python环境","kind":"preference","importance":4,"epistemic":"observed"},{"content":"WSL内禁止使用sudo命令","kind":"lesson","importance":5,"epistemic":"observed"}]' }
+    },
+  }
+  const stats = await runRefineL1(s, { llm: okSeam, provider: 'p', model: 'm' })
+  assert('L1 processed both episodes', stats.processed === 2)
+  assert('L1 degraded neither', stats.degraded === 0)
+  assert('L1 wrote uv preference fact', s.activeEntries().some(e => e.content.includes('uv管理Python环境')))
+  assert('L1 wrote WSL sudo lesson fact', s.activeEntries().some(e => e.content.includes('使用sudo命令')))
+  assert('L1 empty-facts episode leaves no memory', !s.activeEntries().some(e => e.content.includes('一次性琐事')))
+  assert('L1 both episodes no longer pending (extracted=1)', s.listEpisodesForRefine().length === 0)
+  const db1 = new DatabaseSync(s.dbPath)
+  const r1 = db1.prepare("SELECT COUNT(*) AS c FROM refine_runs WHERE level=1 AND status='ok' AND llm_route='p/m'").get()
+  assert('L1 audit rows level1 ok with route', Number(r1.c) === 2)
+  db1.close()
+
+  // degrade: LLM down → zero writes, episodes marked extracted=2, audit degraded
+  const badSeam = { stream: async function* () { throw new Error('down') } }
+  s.addEpisode({ sessionId: 'sess-c', summary: '这条用于测试LLM故障时的降级路径行为' })
+  const beforeC = s.count()
+  const badStats = await runRefineL1(s, { llm: badSeam, provider: 'p', model: 'm' })
+  assert('L1 llm-down writes 0 memories', s.count() === beforeC)
+  assert('L1 llm-down marks episode degraded', badStats.degraded === 1 && s.listEpisodesForRefine().length === 0)
+  const db2 = new DatabaseSync(s.dbPath)
+  const r2 = db2.prepare("SELECT status FROM refine_runs ORDER BY id DESC LIMIT 1").get()
+  assert('L1 llm-down audit status degraded', r2.status === 'degraded')
+  db2.close()
+
+  // no route: pending episode degraded with null route (no hot-loop retry)
+  s.addEpisode({ sessionId: 'sess-d', summary: '没有任何路由配置时也应降级跳过且审计留空路由' })
+  const noRoute = await runRefineL1(s, {})
+  assert('L1 no-route degrades pending episode', noRoute.degraded === 1)
+  assert('L1 no-route episode not pending (no retry loop)', s.listEpisodesForRefine().length === 0)
+  const db3 = new DatabaseSync(s.dbPath)
+  const r3 = db3.prepare('SELECT status, llm_route FROM refine_runs ORDER BY id DESC LIMIT 1').get()
+  assert('L1 no-route audit route null + degraded', r3.status === 'degraded' && r3.llm_route === null)
+  db3.close()
+  s.close()
+  rmSync(t1, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G14 L2 semantic merge/arbitration (LLM-decided)')
+{
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-l2-'))
+  const s = new MemoryStore(t2)
+  s.batch([{ action: 'add', topic: 'db', content: '数据库连接串在env文件的DB_URL变量' }])
+  s.batch([{ action: 'add', topic: 'db', content: '数据库连接信息放在环境变量DB_URL' }])
+  const cluster = s.semanticClusters({ min: 2 })
+  assert('L2 semanticClusters groups same-topic ≥2', cluster.length >= 1 && cluster[0].facts.length >= 2)
+  const id0 = cluster[0].facts[0].id
+  const okSeam = { stream: async function* () { yield { type: 'text-delta', text: JSON.stringify([{ action: 'merge', targetIds: [id0], content: '数据库连接串在环境变量 DB_URL', kind: 'env' }]) } } }
+  const stats = await runRefineL2(s, { llm: okSeam, provider: 'p', model: 'm', minCluster: 2 })
+  assert('L2 applied merge verdict', stats.verdictsApplied >= 1)
+  assert('L2 merged fact written', s.activeEntries().some(e => e.content.includes('环境变量 DB_URL')))
+  const archivedTarget = s.get(id0)
+  assert('L2 merge archived the targeted original (soft)', !archivedTarget || archivedTarget.archived === true)
+  const db = new DatabaseSync(s.dbPath)
+  const r = db.prepare('SELECT level, status, llm_route FROM refine_runs WHERE level=2 ORDER BY id DESC LIMIT 1').get()
+  assert('L2 audit level2 ok with route', r.level === 2 && r.status === 'ok' && r.llm_route === 'p/m')
+  db.close()
+
+  // degrade: LLM down → memories untouched; no route → no-op entirely
+  const s3 = new MemoryStore(t2)
+  s3.batch([{ action: 'add', topic: 't', content: '降级第一条相同话题记忆内容AAA' }])
+  s3.batch([{ action: 'add', topic: 't', content: '降级第二条相同话题记忆内容BBB' }])
+  const before = s3.count()
+  const badSeam = { stream: async function* () { throw new Error('down') } }
+  const badStats = await runRefineL2(s3, { llm: badSeam, provider: 'p', model: 'm' })
+  assert('L2 llm-down leaves memories unchanged', s3.count() === before)
+  assert('L2 llm-down degraded audit', badStats.degraded >= 1)
+  const noRoute = await runRefineL2(s3, {})
+  assert('L2 no-route → no-op (0 clusters, no audit spam)', noRoute.clusters === 0)
+  s3.close()
+  s.close()
+  rmSync(t2, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G15 refine_runs audit schema + isolation')
+{
+  const t3 = mkdtempSync(join(tmpdir(), 'dsh-memory-runs-'))
+  const s = new MemoryStore(t3)
+  const db = new DatabaseSync(s.dbPath)
+  const cols = db.prepare('PRAGMA table_info(refine_runs)').all().map(r => r.name)
+  assert('refine_runs has audit columns', ['level', 'source_id', 'prompt_sha', 'llm_route', 'decisions', 'status'].every(c => cols.includes(c)))
+  db.close()
+  // L1/L2 inactivated: episodes stay pending; no refine_runs rows written (the
+  // enable guard lives in index.ts wiring — here we confirm pending surfaces).
+  s.addEpisode({ sessionId: 's', summary: 'L1未启用时这条会话应保持待抽取状态不自动处理' })
+  assert('inactive L1 leaves episode pending', s.listEpisodesForRefine().length === 1)
+  const db2 = new DatabaseSync(s.dbPath)
+  const runCount = db2.prepare('SELECT COUNT(*) AS c FROM refine_runs').get()
+  db2.close()
+  assert('no refine_runs written when not driven', Number(runCount.c) === 0)
+  s.close()
+  rmSync(t3, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

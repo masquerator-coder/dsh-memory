@@ -17,6 +17,7 @@ import { DEFAULT_BUDGET, MemoryStore, resolveDshHome } from './store.js'
 import { buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
+import { runRefineL1, runRefineL2 } from './refine.js'
 import type { ForgetDays } from './types.js'
 
 export const name = 'memory'
@@ -50,6 +51,30 @@ export interface Config {
   l0MaxTokens?: number
   /** L0 LLM deadline ms. Default 8000. */
   l0TimeoutMs?: number
+  /** L1 episodic→semantic extraction (LLM-decided). Default false (dormant; enable after真机验证). */
+  l1Enabled?: boolean
+  /** L2 semantic merge/arbitration (LLM-decided). Default false. */
+  l2Enabled?: boolean
+  /** Explicit route pair for L1 (background has no request-header; must be explicit when enabled). */
+  l1Provider?: string
+  l1Model?: string
+  /** L1 LLM output-token cap. Default 800. */
+  l1MaxTokens?: number
+  /** L1 LLM deadline ms. Default 10000. */
+  l1TimeoutMs?: number
+  /** Explicit route pair for L2 (same as L1: explicit when enabled). */
+  l2Provider?: string
+  l2Model?: string
+  /** L2 LLM output-token cap. Default 800. */
+  l2MaxTokens?: number
+  /** L2 LLM deadline ms. Default 10000. */
+  l2TimeoutMs?: number
+  /** Background refine scan interval ms. Default 1h. */
+  refineIntervalMs?: number
+  /** Minimum members for an L2 cluster to be offered to the LLM. Default 2. */
+  l2MinCluster?: number
+  /** Whether L1 retries LLM-degraded episodes (extracted=2) on later passes. Default false. */
+  l1RetryDegraded?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -75,6 +100,19 @@ export const Config: z<Config> = z.object({
   l0Model: z.string(),
   l0MaxTokens: z.number(),
   l0TimeoutMs: z.number(),
+  l1Enabled: z.boolean(),
+  l2Enabled: z.boolean(),
+  l1Provider: z.string(),
+  l1Model: z.string(),
+  l1MaxTokens: z.number(),
+  l1TimeoutMs: z.number(),
+  l2Provider: z.string(),
+  l2Model: z.string(),
+  l2MaxTokens: z.number(),
+  l2TimeoutMs: z.number(),
+  refineIntervalMs: z.number(),
+  l2MinCluster: z.number(),
+  l1RetryDegraded: z.boolean(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -100,9 +138,19 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l0Summarize = config.l0Summarize ?? 'llm'
   const l0MaxTokens = config.l0MaxTokens ?? 400
   const l0TimeoutMs = config.l0TimeoutMs ?? 8000
+  const l1Enabled = config.l1Enabled ?? false
+  const l2Enabled = config.l2Enabled ?? false
+  const l1MaxTokens = config.l1MaxTokens ?? 800
+  const l1TimeoutMs = config.l1TimeoutMs ?? 10000
+  const l2MaxTokens = config.l2MaxTokens ?? 800
+  const l2TimeoutMs = config.l2TimeoutMs ?? 10000
+  const refineIntervalMs = config.refineIntervalMs ?? 3600_000
+  const l2MinCluster = config.l2MinCluster ?? 2
+  const l1RetryDegraded = config.l1RetryDegraded ?? false
 
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
+  let refineTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): void => {
     if (disposed) return
@@ -137,10 +185,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     registerMemoryTools(ctx, store, { epistemicWeighting })
 
-    // ---- L0 episodic condensation: turn/end(completed) → episode summary ----
+    // ---- L0 episodic condensation + L1/L2 background refinement ----
     // Adapt the dsh LLM seam (LlmRuntime.stream -> text-delta iterable) into the
-    // shape l0.ts consumes, and resolve the model route (plan 2: session header).
-    const l0Llm = 'llm' in ctx
+    // shape l0.ts / refine.ts consume, and resolve the model route (plan 2: session
+    // header for L0; explicit config for background L1/L2 which have no session).
+    const llmSeam = 'llm' in ctx
       ? {
           stream: (o: { provider: string; model: string; messages: { role: string; content: { type: string; text: string }[] }[]; system?: string; maxTokens?: number; signal?: AbortSignal }) => {
             const opaque = (ctx.llm as unknown as { stream(o: never): AsyncIterable<never> }).stream(o as never)
@@ -163,7 +212,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         events: session.events as readonly unknown[],
         turn: (event.data as { turn?: number } | null | undefined)?.turn,
         summarize: l0Summarize,
-        llm: l0Llm,
+        llm: llmSeam,
         provider,
         model,
         maxTokens: l0MaxTokens,
@@ -175,11 +224,54 @@ export function apply(ctx: Context, config: Config = {}): void {
       }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
     })
 
+    // L1/L2 refinement: unified background timer (no per-turn cost). Runs on the
+    // same seam; explicit route (l1/l2Provider/model, falling back to l0 route)
+    // because the timer has no request-header. Guarded by a re-entrancy latch so
+    // a slow pass never stacks; never blocks the core write/recall loop.
+    let refining = false
+    const runRefine = async (): Promise<void> => {
+      if (disposed || refining) return
+      refining = true
+      try {
+        if (l1Enabled) {
+          await runRefineL1(store, {
+            llm: llmSeam,
+            provider: config.l1Provider ?? config.l0Provider,
+            model: config.l1Model ?? config.l0Model,
+            maxTokens: l1MaxTokens, timeoutMs: l1TimeoutMs,
+            retryDegraded: l1RetryDegraded,
+          })
+        }
+        if (l2Enabled) {
+          await runRefineL2(store, {
+            llm: llmSeam,
+            provider: config.l2Provider ?? config.l0Provider,
+            model: config.l2Model ?? config.l0Model,
+            maxTokens: l2MaxTokens, timeoutMs: l2TimeoutMs,
+            minCluster: l2MinCluster,
+          })
+        }
+      } catch (err) {
+        if (!disposed) console.warn('[dsh-memory] refine run failed:', err instanceof Error ? err.message : err)
+      } finally {
+        refining = false
+      }
+    }
+    const scheduleRefine = (delay: number): void => {
+      if (disposed) return
+      refineTimer = setTimeout(() => {
+        refineTimer = undefined
+        void runRefine().finally(() => scheduleRefine(refineIntervalMs))
+      }, delay)
+    }
+
     scheduleForget(FORGET_FIRST_DELAY_MS)
+    scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
     return () => {
       disposed = true
       l0Dispose()
       if (timer) clearTimeout(timer)
+      if (refineTimer) clearTimeout(refineTimer)
       store.close()
     }
   })

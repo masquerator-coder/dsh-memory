@@ -1,4 +1,4 @@
-import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Kind, Layer, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
+import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Importance, Kind, Layer, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
 export declare const DEFAULT_BUDGET: MemoryBudget;
 export declare function resolveDshHome(): string;
 /** Hard-content id: identical facts collapse instead of duplicating. */
@@ -77,6 +77,41 @@ export declare class MemoryStore {
         topK?: number;
     }): EpisodeHit[];
     private hardDeleteEpisode;
+    /**
+     * Episodes awaiting L1 extraction, oldest first. `extracted == 0` are never
+     * processed (untouched / LLM-degraded when retryDegraded is false); `== 2`
+     * are retried only when retryDegraded is set — so a hot LLM outage degrades
+     * cleanly without hammering the route every pass.
+     */
+    listEpisodesForRefine(opts?: {
+        retryDegraded?: boolean;
+        limit?: number;
+    }): Episode[];
+    /** Record L1 processing state on an episode (0 untouched → 1 extracted → 2 degraded-skip). */
+    markEpisodeExtracted(id: string, status: 1 | 2): void;
+    /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates. */
+    semanticClusters(opts?: {
+        min?: number;
+        limit?: number;
+        includeLowQuality?: boolean;
+    }): {
+        seedId: string;
+        facts: {
+            id: string;
+            content: string;
+            kind?: Kind;
+            importance?: Importance;
+        }[];
+    }[];
+    /** Append one L1/L2 LLM-decision audit row (degraded runs record null route). */
+    writeRefineRun(fields: {
+        level: number;
+        sourceId?: string;
+        promptSha?: string;
+        route?: string;
+        decisions: string;
+        status: string;
+    }): number;
     recordFailure(memoryId: string, oldContent: string, newContent: string): void;
     failureTrail(): {
         memoryId: string;

@@ -527,6 +527,63 @@ export class MemoryStore {
     if (r.changes > 0 && row) this.db.prepare('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
   }
 
+  // ---- L1/L2 refine support (zero LLM — pure scheduling, reading, audit) ----
+
+  /**
+   * Episodes awaiting L1 extraction, oldest first. `extracted == 0` are never
+   * processed (untouched / LLM-degraded when retryDegraded is false); `== 2`
+   * are retried only when retryDegraded is set — so a hot LLM outage degrades
+   * cleanly without hammering the route every pass.
+   */
+  listEpisodesForRefine(opts: { retryDegraded?: boolean; limit?: number } = {}): Episode[] {
+    const status = opts.retryDegraded ? 'extracted IN (0, 2)' : 'extracted = 0'
+    const limit = opts.limit && opts.limit > 0 ? `LIMIT ${Math.floor(opts.limit)}` : ''
+    const rows = this.db.prepare(
+      `SELECT * FROM episodes WHERE archived = 0 AND ${status} ORDER BY ts ASC ${limit}`,
+    ).all()
+    return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
+  }
+
+  /** Record L1 processing state on an episode (0 untouched → 1 extracted → 2 degraded-skip). */
+  markEpisodeExtracted(id: string, status: 1 | 2): void {
+    this.db.prepare('UPDATE episodes SET extracted = ? WHERE id = ?').run(status, id)
+  }
+
+  /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates. */
+  semanticClusters(
+    opts: { min?: number; limit?: number; includeLowQuality?: boolean } = {},
+  ): { seedId: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] {
+    const min = opts.min ?? 2
+    const byTopic = new Map<string, { id: string; content: string; kind?: Kind; importance?: Importance }[]>()
+    for (const e of this.list({ includeArchived: false, includeLowQuality: opts.includeLowQuality === true })) {
+      const arr = byTopic.get(e.topic) ?? []
+      arr.push({ id: e.id, content: e.content, kind: e.kind, importance: e.importance })
+      byTopic.set(e.topic, arr)
+    }
+    const out: { seedId: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] = []
+    for (const [topic, facts] of byTopic) {
+      if (facts.length >= min) out.push({ seedId: facts[0].id, facts })
+    }
+    out.sort((a, b) => b.facts.length - a.facts.length)
+    return (opts.limit && opts.limit > 0) ? out.slice(0, opts.limit) : out
+  }
+
+  /** Append one L1/L2 LLM-decision audit row (degraded runs record null route). */
+  writeRefineRun(fields: {
+    level: number
+    sourceId?: string
+    promptSha?: string
+    route?: string
+    decisions: string
+    status: string
+  }): number {
+    const r = this.db.prepare(
+      'INSERT INTO refine_runs(ts, level, source_id, prompt_sha, llm_route, decisions, status) VALUES (?,?,?,?,?,?,?)',
+    ).run(Date.now(), fields.level, fields.sourceId ?? null, fields.promptSha ?? null, fields.route ?? null,
+      fields.decisions, fields.status)
+    return Number(r.lastInsertRowid)
+  }
+
   // ---- correction trail ----------------------------------------------------
 
   recordFailure(memoryId: string, oldContent: string, newContent: string): void {

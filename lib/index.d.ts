@@ -43,6 +43,30 @@ export interface Config {
     l0MaxTokens?: number;
     /** L0 LLM deadline ms. Default 8000. */
     l0TimeoutMs?: number;
+    /** L1 episodic→semantic extraction (LLM-decided). Default false (dormant; enable after真机验证). */
+    l1Enabled?: boolean;
+    /** L2 semantic merge/arbitration (LLM-decided). Default false. */
+    l2Enabled?: boolean;
+    /** Explicit route pair for L1 (background has no request-header; must be explicit when enabled). */
+    l1Provider?: string;
+    l1Model?: string;
+    /** L1 LLM output-token cap. Default 800. */
+    l1MaxTokens?: number;
+    /** L1 LLM deadline ms. Default 10000. */
+    l1TimeoutMs?: number;
+    /** Explicit route pair for L2 (same as L1: explicit when enabled). */
+    l2Provider?: string;
+    l2Model?: string;
+    /** L2 LLM output-token cap. Default 800. */
+    l2MaxTokens?: number;
+    /** L2 LLM deadline ms. Default 10000. */
+    l2TimeoutMs?: number;
+    /** Background refine scan interval ms. Default 1h. */
+    refineIntervalMs?: number;
+    /** Minimum members for an L2 cluster to be offered to the LLM. Default 2. */
+    l2MinCluster?: number;
+    /** Whether L1 retries LLM-degraded episodes (extracted=2) on later passes. Default false. */
+    l1RetryDegraded?: boolean;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;
