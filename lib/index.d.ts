@@ -34,6 +34,15 @@ export interface Config {
     episodeRetentionDays?: number;
     /** Observation window (days) between archive and hard-delete. Default 30. */
     forgetObserveDays?: number;
+    /** L0 episodic condensation mode: 'llm' (default, with rule fallback) | 'rules' (pure). */
+    l0Summarize?: 'rules' | 'llm';
+    /** Optional explicit LLM route pair for L0 (must be set together). */
+    l0Provider?: string;
+    l0Model?: string;
+    /** L0 LLM output-token cap. Default 400. */
+    l0MaxTokens?: number;
+    /** L0 LLM deadline ms. Default 8000. */
+    l0TimeoutMs?: number;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;

@@ -23,6 +23,7 @@ import { MemoryStore } from './lib/store.js'
 import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shouldDemote } from './lib/heat.js'
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
+import { collectTurnTexts, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 
 let passed = 0
 let failed = 0
@@ -151,6 +152,86 @@ group('G8 episodes + recall (M1)')
   assert('episodic recall finds session summary', hits.some(h => h.episode.summary.includes('迁移')))
   assert('episodes listed newest-first', s.listEpisodes()[0].session_id === 'sess-2')
   s.close()
+}
+
+// ---------------------------------------------------------------------------
+group('G8.5 L0 episodic condensation (M1, new)')
+{
+  // pure collect + rules
+  const events = [
+    { type: 'request/header', data: {} },
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '帮我查一下数据库迁移方案' }] } },
+    { type: 'agent/message', data: { turn: 1, content: [{ type: 'text', text: '好的，我来检查迁移步骤。' }] } },
+    { type: 'user/message', data: { turn: 2, content: [{ type: 'text', text: '这是另一个回合，不该进 turn 1' }] } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+  const t1 = collectTurnTexts(events, 1)
+  assert('collectTurnTexts scoped to requested turn', t1.length === 2 && t1.every(x => !x.includes('另一个回合')))
+  assert('collectTurnTexts extracts message text', t1[0].includes('数据库迁移'))
+
+  const rules = summarizeRules(['  a ', 'a', 'b', 'b', 'c'])
+  assert('summarizeRules dedupes consecutive + trims', rules === 'a\nb\nc')
+
+  assert('isCompletedTurnEnd true for completed', isCompletedTurnEnd({ type: 'turn/end', data: { reason: { kind: 'completed' } } }))
+  assert('isCompletedTurnEnd false for aborted', !isCompletedTurnEnd({ type: 'turn/end', data: { reason: { kind: 'aborted' } } }))
+  assert('isCompletedTurnEnd false for user/message', !isCompletedTurnEnd({ type: 'user/message' }))
+
+  assert('episodeWorthWriting true for real summary', episodeWorthWriting('用户在会话里讨论了迁移'))
+  assert('episodeWorthWriting false for stub', !episodeWorthWriting(''))
+
+  // LLM seam: valid (uses provider/model) vs degraded (throws -> null)
+  const okSeam = {
+    stream: async function* () { yield { type: 'text-delta', text: '用户询问数据库迁移' } },
+  }
+  const badSeam = {
+    stream: async function* () { throw new Error('down') },
+  }
+  const llmOk = await summarizeLlm(okSeam, { provider: 'p', model: 'm', text: 'x' })
+  assert('summarizeLlm returns streamed text', llmOk === '用户询问数据库迁移')
+  const llmBad = await summarizeLlm(badSeam, { provider: 'p', model: 'm', text: 'x' })
+  assert('summarizeLlm degrades to null on failure', llmBad === null)
+  const llmNoRoute = await summarizeLlm(okSeam, { provider: '', model: '', text: 'x' })
+  assert('summarizeLlm null without route', llmNoRoute === null)
+
+  // runL0 end-to-end: llm mode writes an episode (isolated store, like G10)
+  const lt = mkdtempSync(join(tmpdir(), 'dsh-memory-l0-'))
+  const s = new MemoryStore(lt)
+  const ep = await runL0(s, {
+    events,
+    turn: 1,
+    summarize: 'llm',
+    llm: okSeam,
+    provider: 'p',
+    model: 'm',
+    sessionId: 'sess-l0',
+  })
+  const list = s.listEpisodes()
+  assert('runL0 (llm) wrote an episode', list.length === 1)
+  assert('episode summary is LLM text', list[0].summary.includes('数据库迁移'))
+  assert('episode session_id tagged', list[0].session_id === 'sess-l0')
+
+  // runL0 rules-mode writes; empty turn writes nothing
+  const ep2 = await runL0(s, { events, turn: 2, summarize: 'rules', sessionId: 'sess-l0-2' })
+  const list2 = s.listEpisodes()
+  assert('runL0 rules-mode wrote episode', list2.length === 2 && ep2 !== null)
+  const nullep = await runL0(s, { events: [{ type: 'turn/start', data: { turn: 9 } }], turn: 9, summarize: 'rules', sessionId: 'sess-l0-3' })
+  const list3 = s.listEpisodes()
+  assert('runL0 empty turn writes nothing', list3.length === 2 && nullep === null)
+
+  // LLM-missing runL0 falls back to rules
+  const epFb = await runL0(s, {
+    events: events.filter(e => e.data?.turn === 1),
+    turn: 1,
+    summarize: 'llm',
+    llm: null,
+    provider: 'p',
+    model: 'm',
+    sessionId: 'sess-l0-fb',
+  })
+  assert('runL0 llm-missing falls back to rules', epFb !== null && s.listEpisodes().length === 3)
+  s.close()
+  rmSync(lt, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

@@ -11,10 +11,12 @@
  * host LLM is unavailable.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome } from './store.js'
 import { buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
+import { isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import type { ForgetDays } from './types.js'
 
 export const name = 'memory'
@@ -39,6 +41,15 @@ export interface Config {
   episodeRetentionDays?: number
   /** Observation window (days) between archive and hard-delete. Default 30. */
   forgetObserveDays?: number
+  /** L0 episodic condensation mode: 'llm' (default, with rule fallback) | 'rules' (pure). */
+  l0Summarize?: 'rules' | 'llm'
+  /** Optional explicit LLM route pair for L0 (must be set together). */
+  l0Provider?: string
+  l0Model?: string
+  /** L0 LLM output-token cap. Default 400. */
+  l0MaxTokens?: number
+  /** L0 LLM deadline ms. Default 8000. */
+  l0TimeoutMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -59,6 +70,11 @@ export const Config: z<Config> = z.object({
   windowDays: z.number(),
   episodeRetentionDays: z.number(),
   forgetObserveDays: z.number(),
+  l0Summarize: z.union([z.const('rules'), z.const('llm')]),
+  l0Provider: z.string(),
+  l0Model: z.string(),
+  l0MaxTokens: z.number(),
+  l0TimeoutMs: z.number(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -81,6 +97,9 @@ export function apply(ctx: Context, config: Config = {}): void {
   const forgetEnabled = config.forgetEnabled ?? true
   const episodeRetentionDays = config.episodeRetentionDays ?? 180
   const forgetObserveDays = config.forgetObserveDays ?? 30
+  const l0Summarize = config.l0Summarize ?? 'llm'
+  const l0MaxTokens = config.l0MaxTokens ?? 400
+  const l0TimeoutMs = config.l0TimeoutMs ?? 8000
 
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -117,9 +136,49 @@ export function apply(ctx: Context, config: Config = {}): void {
       })
     }
     registerMemoryTools(ctx, store, { epistemicWeighting })
+
+    // ---- L0 episodic condensation: turn/end(completed) → episode summary ----
+    // Adapt the dsh LLM seam (LlmRuntime.stream -> text-delta iterable) into the
+    // shape l0.ts consumes, and resolve the model route (plan 2: session header).
+    const l0Llm = 'llm' in ctx
+      ? {
+          stream: (o: { provider: string; model: string; messages: { role: string; content: { type: string; text: string }[] }[]; system?: string; maxTokens?: number; signal?: AbortSignal }) => {
+            const opaque = (ctx.llm as unknown as { stream(o: never): AsyncIterable<never> }).stream(o as never)
+            return (async function* () {
+              for await (const chunk of opaque) {
+                const c = chunk as { type?: string; text?: string }
+                if (c?.type === 'text-delta' && typeof c.text === 'string') yield c
+              }
+            })()
+          },
+        }
+      : undefined
+    const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
+      if (!isCompletedTurnEnd(event)) return
+      // Resolve the model route (plan 2: auto from the session's request header).
+      const cfg = session.requestHeader()?.config
+      const provider = config.l0Provider ?? cfg?.provider
+      const model = config.l0Model ?? cfg?.model
+      void runL0(store, {
+        events: session.events as readonly unknown[],
+        turn: (event.data as { turn?: number } | null | undefined)?.turn,
+        summarize: l0Summarize,
+        llm: l0Llm,
+        provider,
+        model,
+        maxTokens: l0MaxTokens,
+        timeoutMs: l0TimeoutMs,
+        signal: undefined,
+        sessionId: session.id,
+        toolsUsed: undefined,
+        topic: undefined,
+      }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
+    })
+
     scheduleForget(FORGET_FIRST_DELAY_MS)
     return () => {
       disposed = true
+      l0Dispose()
       if (timer) clearTimeout(timer)
       store.close()
     }
