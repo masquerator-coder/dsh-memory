@@ -1,0 +1,640 @@
+/**
+ * dsh-memory-v3 — single-file SQLite store (zero npm deps, node:sqlite).
+ *
+ * Two layers share one db:
+ *   - memories  (semantic): durable facts, dual-signal heat, three-level forgetting
+ *   - episodes  (episodic): session summaries, time-driven forgetting
+ *
+ * Model: the `memory` tool writes DIRECTLY to the global store (cross-session
+ * visible immediately — no consolidation gate on recall). Forgetting is a pure
+ * rule-based background process that never blocks write or recall (L1/L2 LLM
+ * condensation is dormant in v3).
+ *
+ * Concurrency: node:sqlite DatabaseSync is synchronous → within one process a
+ * transaction is atomic. Cross-process subagents (separate workers) would need
+ * an OS file lock — declared out of scope, not silently assumed.
+ */
+import { createHash } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import type {
+  ApplyResult,
+  BudgetUsage,
+  Episode,
+  EpisodeHit,
+  Epistemic,
+  ForgetDays,
+  Importance,
+  Kind,
+  Layer,
+  MemoryBudget,
+  MemoryEntry,
+  MemoryOp,
+  RecallHit,
+  Tier,
+} from './types.js'
+import { DAY_MS, heatOf, resolveForgetDays, shouldArchive, shouldDelete, shouldDemote } from './heat.js'
+import { contentSimilarity, isLowQuality, qualityScore } from './quality.js'
+import { DDL, migrateColumns, rebuildFts } from './schema.js'
+
+export const DEFAULT_BUDGET: MemoryBudget = { tier0: 900, user: 400, memory: 500 }
+
+/** Fallback group label for entries the model did not tag. */
+const DEFAULT_TOPIC = 'general'
+/** Topic labels are UI/index hints, not content — keep them short. */
+const TOPIC_MAX = 40
+
+/** Episode recency half-life (days) for recall ranking. */
+const EPISODE_RECENCY_DAYS = 90
+
+export function resolveDshHome(): string {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+/** Hard-content id: identical facts collapse instead of duplicating. */
+export function contentId(content: string): string {
+  return createHash('sha256').update(content).digest('hex').slice(0, 16)
+}
+
+export interface ListFilter {
+  layer?: Layer
+  tier?: Tier
+  kind?: Kind
+  includeArchived?: boolean
+  includeLowQuality?: boolean
+}
+
+export interface RecallOpts {
+  topK?: number
+  includeArchived?: boolean
+  includeLowQuality?: boolean
+  epistemicWeighting?: boolean
+}
+
+export interface ForgetResult {
+  demoted: number
+  archivedMem: number
+  deletedMem: number
+  archivedEpi: number
+  deletedEpi: number
+  runId: number
+  status: string
+}
+
+function epiMult(epistemic: string): number {
+  if (epistemic === 'observed') return 1
+  if (epistemic === 'inferred') return 0.9
+  return 0.8
+}
+
+export class MemoryStore {
+  readonly dir: string
+  readonly dbPath: string
+  readonly budget: MemoryBudget
+  readonly windowDays: number
+  readonly forgetDays: ForgetDays
+  private db: DatabaseSync
+  private readonly upsertMemStmt: ReturnType<DatabaseSync['prepare']>
+  private readonly upsertFtsStmt: ReturnType<DatabaseSync['prepare']>
+  private readonly upsertEpiStmt: ReturnType<DatabaseSync['prepare']>
+  private readonly upsertEpiFtsStmt: ReturnType<DatabaseSync['prepare']>
+  private readonly rowidStmt: ReturnType<DatabaseSync['prepare']>
+  private readonly epiRowidStmt: ReturnType<DatabaseSync['prepare']>
+
+  constructor(home = resolveDshHome(), budget: MemoryBudget = DEFAULT_BUDGET, windowDays = 30, forgetDays: ForgetDays = resolveForgetDays()) {
+    this.dir = join(home, 'memory')
+    mkdirSync(this.dir, { recursive: true })
+    this.dbPath = join(this.dir, 'memory.db')
+    this.budget = budget
+    this.windowDays = windowDays
+    this.forgetDays = forgetDays
+    this.db = new DatabaseSync(this.dbPath)
+    this.db.exec('PRAGMA journal_mode=WAL')
+    this.db.exec('PRAGMA busy_timeout=3000')
+    this.db.exec(DDL)
+    migrateColumns(this.db)
+    rebuildFts(this.db)
+
+    this.upsertMemStmt = this.db.prepare(`
+      INSERT INTO memories
+        (id, layer, kind, tier, topic, content, importance, quality, epistemic, heat,
+         created, updated, last_accessed, archived, low_quality, window_freq, window_start,
+         archived_at, session_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET
+        layer=excluded.layer, kind=excluded.kind, tier=excluded.tier, topic=excluded.topic,
+        content=excluded.content, importance=excluded.importance, quality=excluded.quality,
+        epistemic=excluded.epistemic, heat=excluded.heat, updated=excluded.updated,
+        last_accessed=excluded.last_accessed, archived=excluded.archived,
+        low_quality=excluded.low_quality, window_freq=excluded.window_freq,
+        window_start=excluded.window_start, archived_at=excluded.archived_at,
+        session_id=excluded.session_id
+    `)
+    // FTS5 virtual tables reject UPSERT — use INSERT OR REPLACE keyed by the
+    // content table's implicit rowid (id TEXT PRIMARY KEY still has one).
+    this.upsertFtsStmt = this.db.prepare('INSERT OR REPLACE INTO mem_fts(rowid, content, topic) VALUES (?,?,?)')
+    this.rowidStmt = this.db.prepare('SELECT rowid AS r FROM memories WHERE id = ?')
+
+    this.upsertEpiStmt = this.db.prepare(`
+      INSERT INTO episodes
+        (id, session_id, ts, summary, tools_used, topic, extracted, archived, archived_at, created)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_id=excluded.session_id, ts=excluded.ts, summary=excluded.summary,
+        tools_used=excluded.tools_used, topic=excluded.topic, extracted=excluded.extracted,
+        archived=excluded.archived, archived_at=excluded.archived_at, created=excluded.created
+    `)
+    this.upsertEpiFtsStmt = this.db.prepare('INSERT OR REPLACE INTO ep_fts(rowid, summary, topic) VALUES (?,?,?)')
+    this.epiRowidStmt = this.db.prepare('SELECT rowid AS r FROM episodes WHERE id = ?')
+  }
+
+  close(): void {
+    this.db.close()
+  }
+
+  // ---- row mapping ---------------------------------------------------------
+
+  private rowToEntry(r: Record<string, unknown>): MemoryEntry {
+    return {
+      id: String(r.id),
+      layer: r.layer as Layer,
+      kind: r.kind as Kind,
+      tier: Number(r.tier) as Tier,
+      topic: String(r.topic),
+      content: String(r.content),
+      importance: Number(r.importance) as Importance,
+      quality: Number(r.quality),
+      epistemic: r.epistemic as Epistemic,
+      heat: Number(r.heat),
+      created: Number(r.created),
+      updated: Number(r.updated),
+      last_accessed: Number(r.last_accessed),
+      archived: Number(r.archived) === 1,
+      low_quality: Number(r.low_quality) === 1,
+      window_freq: Number(r.window_freq ?? 0),
+      window_start: Number(r.window_start ?? 0),
+      archived_at: r.archived_at ? Number(r.archived_at) : undefined,
+      session_id: r.session_id ? String(r.session_id) : undefined,
+    }
+  }
+
+  private rowToEpisode(r: Record<string, unknown>): Episode {
+    return {
+      id: String(r.id),
+      session_id: String(r.session_id),
+      ts: Number(r.ts),
+      summary: String(r.summary),
+      tools_used: r.tools_used ? String(r.tools_used) : undefined,
+      topic: String(r.topic),
+      extracted: Number(r.extracted) === 1,
+      archived: Number(r.archived) === 1,
+      archived_at: r.archived_at ? Number(r.archived_at) : undefined,
+      created: Number(r.created),
+    }
+  }
+
+  // ---- reads (memories) ----------------------------------------------------
+
+  get(id: string): MemoryEntry | undefined {
+    const r = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return r ? this.rowToEntry(r) : undefined
+  }
+
+  list(filter: ListFilter = {}): MemoryEntry[] {
+    const clauses: string[] = ['1=1']
+    const params: (string | number)[] = []
+    if (filter.layer) { clauses.push('layer = ?'); params.push(filter.layer) }
+    if (filter.tier !== undefined) { clauses.push('tier = ?'); params.push(filter.tier) }
+    if (filter.kind) { clauses.push('kind = ?'); params.push(filter.kind) }
+    if (filter.includeArchived !== true) clauses.push('archived = 0')
+    if (filter.includeLowQuality === false) clauses.push('low_quality = 0')
+    const rows = this.db.prepare(`SELECT * FROM memories WHERE ${clauses.join(' AND ')} ORDER BY updated DESC`).all(...params)
+    return rows.map(r => this.rowToEntry(r as Record<string, unknown>))
+  }
+
+  activeEntries(): MemoryEntry[] {
+    return this.list({ includeArchived: false, includeLowQuality: true })
+  }
+
+  count(): number {
+    const r = this.db.prepare('SELECT COUNT(*) AS c FROM memories WHERE archived = 0').get() as { c: number }
+    return Number(r.c)
+  }
+
+  /** Tier-0 (injectable, non-archived, non-low-quality) usage. */
+  usage(): BudgetUsage {
+    let user = 0
+    let memory = 0
+    for (const e of this.list({ tier: 0, includeArchived: false, includeLowQuality: false })) {
+      if (e.layer === 'user') user += e.content.length
+      else memory += e.content.length
+    }
+    const total = user + memory
+    return { user, memory, total, pct: this.budget.tier0 > 0 ? Math.round((total / this.budget.tier0) * 100) : 0 }
+  }
+
+  topicsIndex(): { topic: string; count: number }[] {
+    const rows = this.db.prepare(
+      'SELECT topic, COUNT(*) AS c FROM memories WHERE tier = 1 AND archived = 0 GROUP BY topic ORDER BY c DESC',
+    ).all() as { topic: string; c: number }[]
+    return rows.map(r => ({ topic: String(r.topic), count: Number(r.c) }))
+  }
+
+  // ---- writes (memories) ---------------------------------------------------
+
+  private autoTier(layer: Layer, importance: Importance, quality: number, kind: Kind, low: boolean): Tier {
+    if (low) return 1
+    if (layer === 'user') return 0
+    if (importance >= 4 && quality >= 60 && (kind === 'preference' || kind === 'env')) return 0
+    return 1
+  }
+
+  private writeMemory(id: string, fields: Omit<MemoryEntry, 'id'>): void {
+    this.upsertMemStmt.run(
+      id, fields.layer, fields.kind, fields.tier, fields.topic, fields.content, fields.importance,
+      fields.quality, fields.epistemic, fields.heat, fields.created, fields.updated, fields.last_accessed,
+      fields.archived ? 1 : 0, fields.low_quality ? 1 : 0, fields.window_freq, fields.window_start,
+      fields.archived_at ?? null, fields.session_id ?? null,
+    )
+    const rowid = Number(this.rowidStmt.get(id)!.r)
+    this.upsertFtsStmt.run(rowid, fields.content, fields.topic)
+  }
+
+  private hardDeleteMemory(id: string): void {
+    const row = this.rowidStmt.get(id) as { r: number } | undefined
+    const r = this.db.prepare('DELETE FROM memories WHERE id = ?').run(id)
+    if (r.changes > 0 && row) this.db.prepare('DELETE FROM mem_fts WHERE rowid = ?').run(Number(row.r))
+  }
+
+  private applyOne(op: MemoryOp, now: number): { ok: boolean; error?: string } {
+    if (op.action === 'add' || op.action === 'replace') {
+      const content = (op.content ?? '').trim()
+      if (!content) return { ok: false, error: 'content is required' }
+      const layer: Layer = op.layer ?? 'memory'
+      const kind: Kind = op.kind ?? inferKind(content)
+      const importance: Importance = op.importance ?? 3
+      const epistemic: Epistemic = op.epistemic ?? 'observed'
+      const topic = op.topic === '' ? '' : (op.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
+
+      if (op.action === 'add') {
+        const id = contentId(content)
+        const existing = this.get(id)
+        const quality = existing ? existing.quality : qualityScore(content, this.activeEntries())
+        const low = isLowQuality(quality)
+        const tier = existing ? (low ? 1 : (op.tier ?? existing.tier)) : (op.tier ?? this.autoTier(layer, importance, quality, kind, low))
+        if (existing) {
+          this.writeMemory(id, {
+            layer, kind, tier, topic, content, importance, quality, epistemic,
+            heat: heatOf(existing, this.forgetDays), created: existing.created, updated: now,
+            last_accessed: existing.last_accessed, archived: existing.archived, low_quality: low,
+            window_freq: existing.window_freq, window_start: existing.window_start,
+            archived_at: existing.archived_at, session_id: op.sessionId ?? existing.session_id,
+          })
+        } else {
+          this.writeMemory(id, {
+            layer, kind, tier, topic, content, importance, quality, epistemic,
+            heat: 1, created: now, updated: now, last_accessed: now, archived: false, low_quality: low,
+            window_freq: 0, window_start: 0, session_id: op.sessionId,
+          })
+        }
+        return { ok: true }
+      }
+
+      // replace
+      let target = op.id ? this.get(op.id) : undefined
+      if (!target && op.id) return { ok: false, error: `no entry with id ${op.id}` }
+      if (!target) {
+        target = this.activeEntries().find(e => e.content.includes(content) || content.includes(e.content)) ?? undefined
+      }
+      if (!target) return { ok: false, error: 'no entry matched for replace' }
+      const oldContent = target.content
+      const quality = qualityScore(content, this.activeEntries())
+      const low = isLowQuality(quality)
+      const tier = low ? 1 : (op.tier ?? target.tier)
+
+      if (content !== oldContent) {
+        this.recordFailure(target.id, oldContent, content)
+      }
+      this.writeMemory(target.id, {
+        layer, kind, tier, topic: topic || target.topic, content, importance, quality, epistemic,
+        heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
+        last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
+        window_freq: target.window_freq, window_start: target.window_start,
+        archived_at: target.archived_at, session_id: op.sessionId ?? target.session_id,
+      })
+      return { ok: true }
+    }
+
+    if (op.action === 'remove') {
+      const target = op.id ? this.get(op.id) : undefined
+      if (!target) return { ok: false, error: `no entry with id ${op.id}` }
+      if (op.force) {
+        this.hardDeleteMemory(target.id)
+      } else {
+        this.db.prepare('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, target.id)
+      }
+      return { ok: true }
+    }
+
+    return { ok: false, error: `unsupported action ${String(op.action)}` }
+  }
+
+  private demoteToBudget(now: number): boolean {
+    const over = this.budgetOver()
+    if (!over) return false
+    const candidates = this.list({ tier: 0, includeArchived: false, includeLowQuality: false })
+      .filter(e => e.layer !== 'user') // user layer is immortal
+      .sort((a, b) => heatOf(a, this.forgetDays, now) - heatOf(b, this.forgetDays, now) || a.importance - b.importance)
+    for (const e of candidates) {
+      this.db.prepare('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
+      if (!this.budgetOver()) return false
+    }
+    return this.budgetOver()
+  }
+
+  private budgetOver(): boolean {
+    return this.usage().memory > this.budget.memory
+  }
+
+  /** Model-facing write batch; lands globally and immediately. */
+  batch(ops: MemoryOp[], sessionId?: string): ApplyResult {
+    const now = Date.now()
+    const before = this.activeEntries()
+    const applied: MemoryOp[] = []
+    const rejected: { op: MemoryOp; reason: string }[] = []
+    try {
+      this.db.exec('BEGIN IMMEDIATE')
+      for (const op of ops) {
+        if (op.action === 'list') continue
+        const mapped: MemoryOp = sessionId ? { ...op, sessionId } : op
+        const res = this.applyOne(mapped, now)
+        if (res.ok) applied.push(mapped)
+        else rejected.push({ op: mapped, reason: res.error! })
+      }
+      const stillOver = this.demoteToBudget(now)
+      if (stillOver) {
+        this.db.exec('ROLLBACK')
+        const usage = this.usage()
+        return { applied: [], rejected: ops.map(o => ({ op: o, reason: 'memory budget exceeded' })), entries: before, overflowed: true, usage }
+      }
+      this.db.exec('COMMIT')
+      return { applied, rejected, entries: this.activeEntries(), overflowed: false, usage: this.usage() }
+    } catch (err) {
+      try { this.db.exec('ROLLBACK') } catch { /* noop */ }
+      throw err
+    }
+  }
+
+  // ---- recall (memories) ---------------------------------------------------
+
+  /** Refresh last_accessed + sliding-window frequency for recalled entries. */
+  private touchAccess(ids: string[]): void {
+    const now = Date.now()
+    const windowMs = this.windowDays * DAY_MS
+    const upd = this.db.prepare('UPDATE memories SET last_accessed = ?, window_freq = ?, window_start = ? WHERE id = ?')
+    for (const id of ids) {
+      const e = this.get(id)
+      if (!e) continue
+      let freq: number
+      let start: number
+      if (e.window_start === 0 || now - e.window_start > windowMs) {
+        freq = 1
+        start = now
+      } else {
+        freq = e.window_freq + 1
+        start = e.window_start
+      }
+      upd.run(now, freq, start, id)
+    }
+  }
+
+  recall(query: string, opts: RecallOpts = {}): RecallHit[] {
+    const topK = opts.topK ?? 8
+    const weighting = opts.epistemicWeighting ?? true
+    const candidates = this.list({
+      includeArchived: opts.includeArchived,
+      includeLowQuality: opts.includeLowQuality === true,
+    })
+    if (candidates.length === 0) return []
+
+    const ftsIds = new Set<string>()
+    try {
+      const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
+      if (q) {
+        for (const row of this.db.prepare('SELECT id FROM memories WHERE rowid IN (SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?)').all(q) as { id: string }[]) {
+          ftsIds.add(String(row.id))
+        }
+      }
+    } catch { /* MATCH lex error → substring layer covers */ }
+
+    const qLower = query.toLowerCase()
+    const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
+    const scored: RecallHit[] = []
+    const now = Date.now()
+    for (const e of candidates) {
+      let base = 0
+      if (ftsIds.has(e.id)) base += 6
+      const text = `${e.topic}\n${e.content}`.toLowerCase()
+      if (text.includes(qLower)) base += 4
+      for (const k of keywords) if (text.includes(k)) base += 1
+      if (base === 0) continue
+      const heat = heatOf(e, this.forgetDays, now)
+      const score = base * (weighting ? epiMult(e.epistemic) : 1) * (0.5 + 0.5 * heat)
+      scored.push({ entry: e, score })
+    }
+    scored.sort((a, b) => b.score - a.score || b.entry.updated - a.entry.updated)
+    const top = scored.slice(0, topK)
+    if (top.length > 0) this.touchAccess(top.map(h => h.entry.id))
+    return top
+  }
+
+  // ---- episodes ------------------------------------------------------------
+
+  writeEpisode(id: string, fields: Omit<Episode, 'id'>): void {
+    this.upsertEpiStmt.run(
+      id, fields.session_id, fields.ts, fields.summary, fields.tools_used ?? null,
+      fields.topic, fields.extracted ? 1 : 0, fields.archived ? 1 : 0, fields.archived_at ?? null,
+      fields.created,
+    )
+    const rowid = Number(this.epiRowidStmt.get(id)!.r)
+    this.upsertEpiFtsStmt.run(rowid, fields.summary, fields.topic)
+  }
+
+  addEpisode(fields: { sessionId: string; summary: string; toolsUsed?: string; topic?: string }): Episode {
+    const now = Date.now()
+    const id = contentId(`${fields.sessionId}:${now}`)
+    const ep: Episode = {
+      id,
+      session_id: fields.sessionId,
+      ts: now,
+      summary: fields.summary.trim(),
+      tools_used: fields.toolsUsed,
+      topic: (fields.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC,
+      extracted: false,
+      archived: false,
+      created: now,
+    }
+    this.writeEpisode(id, ep)
+    return ep
+  }
+
+  listEpisodes(filter: { includeArchived?: boolean } = {}): Episode[] {
+    const clauses: string[] = ['1=1']
+    if (filter.includeArchived !== true) clauses.push('archived = 0')
+    const rows = this.db.prepare(`SELECT * FROM episodes WHERE ${clauses.join(' AND ')} ORDER BY ts DESC`).all()
+    return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
+  }
+
+  recallEpisodes(query: string, opts: { topK?: number } = {}): EpisodeHit[] {
+    const topK = opts.topK ?? 8
+    const candidates = this.listEpisodes({ includeArchived: false })
+    if (candidates.length === 0) return []
+
+    const ftsIds = new Set<string>()
+    try {
+      const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
+      if (q) {
+        for (const row of this.db.prepare('SELECT id FROM episodes WHERE rowid IN (SELECT rowid FROM ep_fts WHERE ep_fts MATCH ?)').all(q) as { id: string }[]) {
+          ftsIds.add(String(row.id))
+        }
+      }
+    } catch { /* MATCH lex error → substring layer covers */ }
+
+    const qLower = query.toLowerCase()
+    const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
+    const scored: EpisodeHit[] = []
+    const now = Date.now()
+    for (const ep of candidates) {
+      let base = 0
+      if (ftsIds.has(ep.id)) base += 6
+      const text = `${ep.topic}\n${ep.summary}`.toLowerCase()
+      if (text.includes(qLower)) base += 4
+      for (const k of keywords) if (text.includes(k)) base += 1
+      if (base === 0) continue
+      const recency = Math.exp(-(now - ep.ts) / (EPISODE_RECENCY_DAYS * DAY_MS))
+      const score = base * (0.5 + 0.5 * recency)
+      scored.push({ episode: ep, score })
+    }
+    scored.sort((a, b) => b.score - a.score || b.episode.ts - a.episode.ts)
+    return scored.slice(0, topK)
+  }
+
+  private hardDeleteEpisode(id: string): void {
+    const row = this.epiRowidStmt.get(id) as { r: number } | undefined
+    const r = this.db.prepare('DELETE FROM episodes WHERE id = ?').run(id)
+    if (r.changes > 0 && row) this.db.prepare('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
+  }
+
+  // ---- correction trail ----------------------------------------------------
+
+  recordFailure(memoryId: string, oldContent: string, newContent: string): void {
+    this.db.prepare('INSERT INTO failure_memories(memory_id, old_content, new_content, corrected_at) VALUES (?,?,?,?)')
+      .run(memoryId, oldContent, newContent, Date.now())
+  }
+
+  failureTrail(): { memoryId: string; oldContent: string; newContent: string; correctedAt: number }[] {
+    const rows = this.db.prepare('SELECT memory_id, old_content, new_content, corrected_at FROM failure_memories').all() as Record<string, unknown>[]
+    return rows.map(r => ({
+      memoryId: String(r.memory_id),
+      oldContent: String(r.old_content ?? ''),
+      newContent: String(r.new_content ?? ''),
+      correctedAt: Number(r.corrected_at),
+    }))
+  }
+
+  /** True when a failure trail still references this content (corrected-once → extend life). */
+  hasPendingCorrection(content: string): boolean {
+    for (const f of this.failureTrail()) {
+      const oldC = f.oldContent.trim()
+      if (!oldC) continue
+      if (contentSimilarity(oldC, content) >= 0.5 || content.includes(oldC) || oldC.includes(content)) return true
+    }
+    return false
+  }
+
+  // ---- active forgetting (three-level ladder + two faces) ------------------
+
+  forgetRun(cfg: {
+    forgetDays?: Partial<ForgetDays>
+    windowDays?: number
+    episodeRetentionDays?: number
+    observeDays?: number
+  }, now = Date.now()): ForgetResult {
+    const forgetDays = resolveForgetDays(cfg.forgetDays)
+    const observeDays = cfg.observeDays ?? 30
+    const retentionDays = cfg.episodeRetentionDays ?? 180
+    const decisions: string[] = []
+    let demoted = 0
+    let archivedMem = 0
+    let deletedMem = 0
+    let archivedEpi = 0
+    let deletedEpi = 0
+
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // 1. demote cold tier-0 memories
+      for (const e of this.list({ tier: 0, includeArchived: false, includeLowQuality: true })) {
+        if (shouldDemote(e, forgetDays, now)) {
+          this.db.prepare('UPDATE memories SET tier = 1, updated = ? WHERE id = ?').run(now, e.id)
+          demoted += 1
+          decisions.push(`demote:${e.id}`)
+        }
+      }
+      // 2. archive cold memories
+      for (const e of this.activeEntries()) {
+        if (shouldArchive(e, forgetDays, now)) {
+          this.db.prepare('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, e.id)
+          archivedMem += 1
+          decisions.push(`archive:${e.id}`)
+        }
+      }
+      // 3. hard-delete archived memories past observation
+      for (const e of this.list({ includeArchived: true, includeLowQuality: true })) {
+        if (!e.archived) continue
+        if (shouldDelete(e, observeDays, this.hasPendingCorrection(e.content), now)) {
+          this.hardDeleteMemory(e.id)
+          deletedMem += 1
+          decisions.push(`delete:${e.id}`)
+        }
+      }
+      // 4. archive old episodes (time-driven)
+      for (const ep of this.listEpisodes({ includeArchived: false })) {
+        if (now - ep.ts > retentionDays * DAY_MS) {
+          this.db.prepare('UPDATE episodes SET archived = 1, archived_at = ? WHERE id = ?').run(now, ep.id)
+          archivedEpi += 1
+          decisions.push(`ep-archive:${ep.id}`)
+        }
+      }
+      // 5. hard-delete archived episodes past observation
+      for (const ep of this.listEpisodes({ includeArchived: true })) {
+        if (!ep.archived || ep.archived_at === undefined) continue
+        if (now - ep.archived_at > observeDays * DAY_MS) {
+          this.hardDeleteEpisode(ep.id)
+          deletedEpi += 1
+          decisions.push(`ep-delete:${ep.id}`)
+        }
+      }
+
+      const applied = demoted + archivedMem + deletedMem + archivedEpi + deletedEpi
+      const sha = createHash('sha256').update(decisions.join('\n')).digest('hex').slice(0, 16)
+      const run = this.db.prepare('INSERT INTO forget_runs(ts, candidate_sha, decisions, applied, status) VALUES (?,?,?,?,?)')
+        .run(now, sha, JSON.stringify(decisions), applied, 'ok')
+      this.db.exec('COMMIT')
+      return { demoted, archivedMem, deletedMem, archivedEpi, deletedEpi, runId: Number(run.lastInsertRowid), status: 'ok' }
+    } catch (err) {
+      try { this.db.exec('ROLLBACK') } catch { /* noop */ }
+      throw err
+    }
+  }
+}
+
+function inferKind(content: string): Kind {
+  const c = content.toLowerCase()
+  if (/(偏好|喜欢|prefer|风格|ppt|颜色|字体)/.test(c)) return 'preference'
+  if (/(环境|配置|命令|安装|路径|端?口|host|url)/.test(c)) return 'env'
+  if (/(教训|注意|坑|别|以后|avoid|pitfall)/.test(c)) return 'lesson'
+  if (/(决定|结论|方案|决策|选|用|采用)/.test(c)) return 'decision'
+  return 'general'
+}
