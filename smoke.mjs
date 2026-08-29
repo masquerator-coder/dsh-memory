@@ -23,7 +23,8 @@ import { MemoryStore } from './lib/store.js'
 import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shouldDemote } from './lib/heat.js'
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
-import { collectTurnTexts, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
+import { collectTurnTexts, collectTurnTools, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
+import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
 let failed = 0
@@ -232,6 +233,50 @@ group('G8.5 L0 episodic condensation (M1, new)')
   assert('runL0 llm-missing falls back to rules', epFb !== null && s.listEpisodes().length === 3)
   s.close()
   rmSync(lt, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G8.6 tools_used collection (tools_used column realism)')
+{
+  // pure extraction: scoped to turn, dedupes, order-preserving
+  const toolEvents = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'tool/call', data: { turn: 1, step: 1, callId: 'a', name: 'memory', arguments: '{}' } },
+    { type: 'tool/call', data: { turn: 1, step: 2, callId: 'b', name: 'terminal', arguments: '{}' } },
+    { type: 'tool/call', data: { turn: 1, step: 3, callId: 'c', name: 'memory', arguments: '{}' } },
+    { type: 'tool/call', data: { turn: 2, step: 1, callId: 'd', name: 'other_tool', arguments: '{}' } },
+  ]
+  const tools1 = collectTurnTools(toolEvents, 1)
+  assert('collectTurnTools scoped to turn', tools1.join(',') === 'memory,terminal')
+  assert('collectTurnTools dedupes repeated calls', tools1.length === 2)
+  const toolsAll = collectTurnTools(toolEvents, undefined)
+  assert('collectTurnTools without turn collects all + dedup', toolsAll.join(',') === 'memory,terminal,other_tool')
+  assert('collectTurnTools [] on no tool/call', collectTurnTools([{ type: 'user/message' }], 1).length === 0)
+
+  // addEpisode persists tools_used into the tools_used column (read back)
+  const st = new MemoryStore(tmp)
+  st.addEpisode({ sessionId: 'sess-tools', summary: '用了若干工具的一回合', toolsUsed: '["memory","terminal"]' })
+  const persisted = st.listEpisodes().find(e => e.session_id === 'sess-tools')
+  assert('addEpisode persists tools_used column', persisted && persisted.tools_used === '["memory","terminal"]')
+
+  // runL0 end-to-end auto-collects tool names from the turn's events
+  const eventsWithTools = [
+    { type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '请帮我查询数据库迁移方案的整体步骤，并把关键结论记入长期记忆方便以后复用' }] } },
+    { type: 'tool/call', data: { turn: 1, callId: 'a', name: 'memory', arguments: '{}' } },
+    { type: 'tool/call', data: { turn: 1, callId: 'b', name: 'memory_recall', arguments: '{}' } },
+    { type: 'tool/call', data: { turn: 2, callId: 'c', name: 'leak_other_turn', arguments: '{}' } },
+  ]
+  const epA = await runL0(st, { events: eventsWithTools, turn: 1, summarize: 'rules', sessionId: 'sess-l0-tools' })
+  const row = st.listEpisodes().filter(e => e.session_id === 'sess-l0-tools')
+  assert('runL0 wrote tools_used auto-collected from turn', row[0] && row[0].tools_used === '["memory","memory_recall"]')
+  assert('runL0 excludes other-turn tool calls', row[0] && !row[0].tools_used.includes('leak_other_turn'))
+
+  // confirm tools_used is NOT an ep_fts column (FTS indexes summary+topic only)
+  const db = new DatabaseSync(st.dbPath)
+  const ftsCols = db.prepare("PRAGMA table_info(ep_fts)").all().map(r => r.name)
+  db.close()
+  assert('ep_fts columns are summary+topic only (tools_used not indexed)', ftsCols.join(',') === 'summary,topic')
+  st.close()
 }
 
 // ---------------------------------------------------------------------------

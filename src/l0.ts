@@ -97,6 +97,35 @@ export function collectTurnTexts(events: readonly unknown[], turn: number | unde
   return dedupe(out)
 }
 
+/** A `tool/call` event the turn produced (loose shape; name is the tool id). */
+interface ToolCallSource {
+  readonly type?: string
+  readonly data?: { readonly turn?: number; readonly name?: string } | Record<string, never> | null
+}
+
+/**
+ * Extract the distinct tool names invoked during one turn, in first-call order,
+ * from an event list. Pure — scans `tool/call` events scoped to `turn` and
+ * dedupes by name. Returns [] when no tools were called. Feed the result to
+ * JSON.stringify for the episode's `tools_used` column.
+ */
+export function collectTurnTools(events: readonly unknown[], turn: number | undefined): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const raw of events) {
+    const ev = raw as ToolCallSource
+    if (ev.type !== 'tool/call') continue
+    const d = ev.data as { turn?: number; name?: string } | null | undefined
+    if (turn !== undefined && (!d || typeof d.turn !== 'number' || d.turn !== turn)) continue
+    const name = d?.name
+    if (typeof name === 'string' && name.length > 0 && !seen.has(name)) {
+      seen.add(name)
+      out.push(name)
+    }
+  }
+  return out
+}
+
 /** Remove consecutive duplicates (rapid repeated chunks collapse). Pure. */
 export function dedupe(texts: readonly string[]): string[] {
   const out: string[] = []
@@ -231,10 +260,13 @@ export async function runL0(
 
     if (!episodeWorthWriting(summary)) return null
 
+    // tools_used: honor an explicit value, else auto-collect tool/call names.
+    const toolsUsed = input.toolsUsed ?? JSON.stringify(collectTurnTools(input.events, input.turn))
+
     return store.addEpisode({
       sessionId: input.sessionId,
       summary,
-      toolsUsed: input.toolsUsed,
+      toolsUsed,
       topic: input.topic,
     })
   } catch {

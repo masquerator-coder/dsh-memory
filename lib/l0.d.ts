@@ -60,6 +60,13 @@ export declare const DEFAULT_L0_TIMEOUT_MS = 8000;
  * Pure — tests pass a fabricated event array.
  */
 export declare function collectTurnTexts(events: readonly unknown[], turn: number | undefined): string[];
+/**
+ * Extract the distinct tool names invoked during one turn, in first-call order,
+ * from an event list. Pure — scans `tool/call` events scoped to `turn` and
+ * dedupes by name. Returns [] when no tools were called. Feed the result to
+ * JSON.stringify for the episode's `tools_used` column.
+ */
+export declare function collectTurnTools(events: readonly unknown[], turn: number | undefined): string[];
 /** Remove consecutive duplicates (rapid repeated chunks collapse). Pure. */
 export declare function dedupe(texts: readonly string[]): string[];
 /**
