@@ -21,7 +21,7 @@ import { runRefineL1, runRefineL2 } from './refine.js'
 import type { ForgetDays } from './types.js'
 
 export const name = 'memory'
-export const inject = ['tools', 'systemPrompt'] as const
+export const inject = ['tools', 'systemPrompt', 'llm'] as const
 
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {

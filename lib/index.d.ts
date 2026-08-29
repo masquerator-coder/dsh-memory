@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import type { ForgetDays } from './types.js';
 export declare const name = "memory";
-export declare const inject: readonly ["tools", "systemPrompt"];
+export declare const inject: readonly ["tools", "systemPrompt", "llm"];
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {
     memoryHome?: string;
