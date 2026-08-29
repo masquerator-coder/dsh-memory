@@ -1,7 +1,7 @@
 {
-  "name": "dsh-memory-v3",
+  "name": "dsh-memory",
   "version": "3.0.0",
-  "description": "Three-tier consolidating memory plugin for DeepSeek Harness (v3): working/episodic/semantic layers, dual-signal heat (exponential decay + frequency), active forgetting, three-level recall. Minimal, single-purpose, zero-dependency.",
+  "description": "Three-tier consolidating memory plugin for DeepSeek Harness: working/episodic/semantic layers, dual-signal heat (exponential decay + frequency), active forgetting, three-level recall. Minimal, single-purpose, zero-dependency.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

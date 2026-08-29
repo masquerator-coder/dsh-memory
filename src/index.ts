@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — Cordis plugin entry (bundle-declarative, section-provider + tools).
+ * dsh-memory — Cordis plugin entry (bundle-declarative, section-provider + tools).
  *
  * Three-layer consolidating memory: episodic (session summaries) + semantic
  * (durable facts with dual-signal heat) + active forgetting (three-level
@@ -95,7 +95,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         observeDays: forgetObserveDays,
       })
     } catch (err) {
-      if (!disposed) console.warn('[dsh-memory-v3] forget run failed:', err instanceof Error ? err.message : err)
+      if (!disposed) console.warn('[dsh-memory] forget run failed:', err instanceof Error ? err.message : err)
     }
   }
 

@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — dual-signal heat model (exponential decay + frequency) and
+ * dsh-memory — dual-signal heat model (exponential decay + frequency) and
  * the pure decision functions for active forgetting.
  *
  *   heat = recency_weight × frequency_boost

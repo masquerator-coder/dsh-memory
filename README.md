@@ -1,4 +1,4 @@
-# dsh-memory-v3
+# dsh-memory
 
 DeepSeek Harness 的**三层凝练记忆插件**（Cordis 插件、bundle-declarative、零 npm 运行时依赖）。v3 在 v2 的"语义记忆 + 全局直写 + 背景自愈"骨架上，补上**情景记忆层**与**主动遗忘**，并把热度改为**双信号（指数衰减 + 召回频率）**。
 
@@ -30,9 +30,9 @@ DeepSeek Harness 的**三层凝练记忆插件**（Cordis 插件、bundle-declar
 ## 安装（bundle-declarative）
 
 ```bash
-dsh plugin --profile web add https://gitcode.com/foqiang/dsh-memory-v3.git
+dsh plugin --profile web add https://gitcode.com/foqiang/dsh-memory.git
 # 或本地开发：
-dsh plugin --profile web add file:C:/abs/path/to/dsh-memory-v3
+dsh plugin --profile web add file:C:/abs/path/to/dsh-memory
 ```
 
 重启 dsh。验证：`~/.dsh/memory/memory.db` 初始化，新会话 system prompt 出现记忆 section。

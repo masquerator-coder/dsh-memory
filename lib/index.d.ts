@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — Cordis plugin entry (bundle-declarative, section-provider + tools).
+ * dsh-memory — Cordis plugin entry (bundle-declarative, section-provider + tools).
  *
  * Three-layer consolidating memory: episodic (session summaries) + semantic
  * (durable facts with dual-signal heat) + active forgetting (three-level

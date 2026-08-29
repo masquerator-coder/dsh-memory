@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — Tier-0 injection renderer.
+ * dsh-memory — Tier-0 injection renderer.
  *
  * Rendered as the text of a systemPrompt.section whose provider is re-evaluated
  * at every prompt assembly, so it is always fresh from the global store and

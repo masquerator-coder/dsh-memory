@@ -1,13 +1,13 @@
-# dsh-memory-v3 — bundle patch
+# dsh-memory — bundle patch
 #
 # Applied automatically when the package is installed as a profile bundle:
 # `dsh plugin --profile <name> add <spec>` mounts this file as that bundle
-# layer's loader patch. The loader resolves `name: dsh-memory-v3` against the
+# layer's loader patch. The loader resolves `name: dsh-memory` against the
 # profile's dependency graph, then calls the package's `apply` with `config`.
 
 - insert:
-    - id: memory-v3
-      name: dsh-memory-v3
+    - id: memory
+      name: dsh-memory
       config:
         enableInjection: true # always-on Tier-0 memory section in the system prompt
         # forgetEnabled: true     # active forgetting (demote/archive/hard-delete)

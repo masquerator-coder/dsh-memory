@@ -1,4 +1,4 @@
-/** dsh-memory-v3 — quality filter. Pure, side-effect-free heuristic 0–100. */
+/** dsh-memory — quality filter. Pure, side-effect-free heuristic 0–100. */
 import type { MemoryEntry } from './types.js'
 
 const META_RE = /(记忆|记住|别忘了|记得|memory)/i

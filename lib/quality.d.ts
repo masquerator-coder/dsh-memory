@@ -1,4 +1,4 @@
-/** dsh-memory-v3 — quality filter. Pure, side-effect-free heuristic 0–100. */
+/** dsh-memory — quality filter. Pure, side-effect-free heuristic 0–100. */
 import type { MemoryEntry } from './types.js';
 /** Longest-common-substring length (DP, O(n·m) time, O(m) space); guarded for large inputs. */
 export declare function longestCommonSubstr(a: string, b: string): number;

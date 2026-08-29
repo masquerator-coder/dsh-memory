@@ -1,4 +1,4 @@
-/** dsh-memory-v3 shared types. Zero dsh dependency. */
+/** dsh-memory shared types. Zero dsh dependency. */
 
 export type Layer = 'user' | 'memory'
 export type Kind = 'preference' | 'env' | 'lesson' | 'decision' | 'general'

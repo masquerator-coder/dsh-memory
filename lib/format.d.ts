@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — entry formatting for every model-facing listing surface.
+ * dsh-memory — entry formatting for every model-facing listing surface.
  *
  * Extracted from tools.ts (zero dsh dependency) so smoke.mjs can unit-test it
  * directly — untestable surfaces rot silently.

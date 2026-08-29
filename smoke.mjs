@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 smoke test — runs without dsh, drives the compiled lib/.
+ * dsh-memory smoke test — runs without dsh, drives the compiled lib/.
  * Assertion groups mirror the v3 milestones:
  *   G1  idempotent schema      (M0)
  *   G2  global direct-write + cross-session recall  (M1)
@@ -34,7 +34,7 @@ function group(name) {
   console.log(`\n=== ${name} ===`)
 }
 
-const tmp = mkdtempSync(join(tmpdir(), 'dsh-memory-v3-'))
+const tmp = mkdtempSync(join(tmpdir(), 'dsh-memory-'))
 const DAY = DAY_MS
 const now = Date.now()
 
@@ -194,7 +194,7 @@ group('G9 three-level forgetting (M3)')
 // ---------------------------------------------------------------------------
 group('G10 user-layer immortality (M3)')
 {
-  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-v3-u-'))
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-u-'))
   const s = new MemoryStore(t2)
   s.batch([{ action: 'add', layer: 'user', content: '用户是左撇子', importance: 5 }])
   const u = s.activeEntries().find(x => x.content.includes('左撇子'))

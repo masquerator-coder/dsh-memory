@@ -1,4 +1,4 @@
-/** dsh-memory-v3 — SQLite schema (DDL + idempotent migration + FTS rebuild). */
+/** dsh-memory — SQLite schema (DDL + idempotent migration + FTS rebuild). */
 import type { DatabaseSync } from 'node:sqlite'
 
 export const DDL = `

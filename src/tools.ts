@@ -1,5 +1,5 @@
 /**
- * dsh-memory-v3 — model-facing tools.
+ * dsh-memory — model-facing tools.
  *  - `memory`        list / add / replace / remove on the GLOBAL semantic store.
  *  - `memory_recall` search semantic + episodic pools (scope: semantic|episodic|all).
  *
