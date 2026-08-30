@@ -38,6 +38,7 @@ export declare class MemoryStore {
     private readonly upsertEpiFtsStmt;
     private readonly rowidStmt;
     private readonly epiRowidStmt;
+    private readonly getMemStmt;
     constructor(home?: string, budget?: MemoryBudget, windowDays?: number, forgetDays?: ForgetDays);
     close(): void;
     private rowToEntry;
@@ -48,7 +49,9 @@ export declare class MemoryStore {
     count(): number;
     /** Active (non-archived) episode count, without loading rows (P2-25). */
     episodeCount(): number;
-    /** Tier-0 (injectable, non-archived, non-low-quality) usage. */
+    /** Tier-0 (injectable, non-archived, non-low-quality) usage.
+     *  R4 (review 2026-08-30): SQL aggregate — the old version loaded and JS-mapped
+     *  every tier-0 row on each call (batch/tools both call this per write). */
     usage(): BudgetUsage;
     topicsIndex(): {
         topic: string;
@@ -56,7 +59,9 @@ export declare class MemoryStore {
     }[];
     /** Bounded dedup candidate set (P2-16): only rows sharing the head of `content`
      *  are compared for the duplicate penalty, so add/replace cost stops scaling with
-     *  library size. (Content-equality dedup — P0-2 — is exact and separate.) */
+     *  library size. (Content-equality dedup — P0-2 — is exact and separate.)
+     *  R4 (review 2026-08-30): the old `LIKE '%head%'` had a leading wildcard and
+     *  full-scanned every row; this prefix-anchored range rides idx_mem_content. */
     private nearCandidates;
     private autoTier;
     private writeMemory;
@@ -72,7 +77,11 @@ export declare class MemoryStore {
      * demoted and whether budget still exceeds after demotion (P1-9 surfaces them).
      */
     private enforceBudget;
-    /** Model-facing write batch; lands globally and immediately. */
+    /** Model-facing write batch; lands globally and immediately.
+     *  R5 (review 2026-08-30): SAVEPOINT instead of BEGIN/COMMIT — safe both
+     *  standalone and nested inside a caller-held transaction (same pattern as
+     *  writeEpisode, P1-12). The old BEGIN IMMEDIATE threw "cannot start a
+     *  transaction within a transaction" when composed. */
     batch(ops: MemoryOp[], sessionId?: string): ApplyResult;
     /** Refresh last_accessed + sliding-window frequency for recalled entries. */
     private touchAccess;
@@ -87,15 +96,21 @@ export declare class MemoryStore {
     listEpisodes(filter?: {
         includeArchived?: boolean;
     }): Episode[];
+    /** P1-5 (review 2026-08-30): candidate pre-filter pushed into SQL — FTS hits
+     *  fetched one-shot, substring candidates via LIKE over summary/topic. The old
+     *  version loaded EVERY active episode into JS before scoring (4000 rows →
+     *  8.6ms/call, strictly linear; the semantic recall path is O(hits) at 0.05ms).
+     *  Scoring itself is unchanged — same FTS/substring/keyword base + recency. */
     recallEpisodes(query: string, opts?: {
         topK?: number;
     }): EpisodeHit[];
     private hardDeleteEpisode;
     /**
-     * Episodes awaiting L1 extraction, oldest first. `extracted == 0` are never
-     * processed (untouched / LLM-degraded when retryDegraded is false); `== 2`
-     * are retried only when retryDegraded is set — so a hot LLM outage degrades
-     * cleanly without hammering the route every pass.
+     * Episodes awaiting L1 extraction, oldest first. `extracted = 0` (untouched)
+     * are the pending queue; `== 2` (degraded) are retried only when
+     * retryDegraded is set — so a hot LLM outage degrades cleanly without
+     * hammering the route every pass. (P3-14: comment previously stated the
+     * exact opposite of what the SQL does.)
      */
     listEpisodesForRefine(opts?: {
         retryDegraded?: boolean;
@@ -127,6 +142,10 @@ export declare class MemoryStore {
         decisions: string;
         status: string;
     }): number;
+    /** Prior audit rows for one refine source — bounded-retry accounting for L1
+     *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
+     *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
+    refineAttemptCount(sourceId: string): number;
     recordFailure(memoryId: string, oldContent: string, newContent: string): void;
     failureTrail(): {
         memoryId: string;
@@ -138,7 +157,6 @@ export declare class MemoryStore {
     hasPendingCorrection(content: string): boolean;
     forgetRun(cfg: {
         forgetDays?: Partial<ForgetDays>;
-        windowDays?: number;
         episodeRetentionDays?: number;
         observeDays?: number;
     }, now?: number): ForgetResult;

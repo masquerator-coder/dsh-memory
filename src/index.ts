@@ -172,7 +172,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     try {
       store.forgetRun({
         forgetDays: config.forgetDays,
-        windowDays: config.windowDays,
         episodeRetentionDays,
         observeDays: forgetObserveDays,
       })
@@ -255,6 +254,9 @@ export function apply(ctx: Context, config: Config = {}): void {
         sessionId: session.id,
         toolsUsed: undefined,
         topic: undefined,
+        // P2-7: program errors (disk full, closed DB) must leave a trace — a bare
+        // `null` looks identical to "nothing worth remembering this turn".
+        onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
       }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
     })
 

@@ -114,6 +114,10 @@ export class MemoryStore {
   private readonly upsertEpiFtsStmt: ReturnType<DatabaseSync['prepare']>
   private readonly rowidStmt: ReturnType<DatabaseSync['prepare']>
   private readonly epiRowidStmt: ReturnType<DatabaseSync['prepare']>
+  // P3-11 (review 2026-08-30): `get()` re-prepared its statement on every call
+  // (23.6µs vs 6.7µs pre-compiled, 3.5x) and sits on the recall/touchAccess
+  // hot path — prepare once here.
+  private readonly getMemStmt: ReturnType<DatabaseSync['prepare']>
 
   constructor(home = resolveDshHome(), budget: MemoryBudget = DEFAULT_BUDGET, windowDays = 30, forgetDays: ForgetDays = resolveForgetDays()) {
     this.dir = join(home, 'memory')
@@ -168,6 +172,7 @@ export class MemoryStore {
     `)
     this.upsertEpiFtsStmt = this.db.prepare('INSERT OR REPLACE INTO ep_fts(rowid, summary, topic) VALUES (?,?,?)')
     this.epiRowidStmt = this.db.prepare('SELECT rowid AS r FROM episodes WHERE id = ?')
+    this.getMemStmt = this.db.prepare('SELECT * FROM memories WHERE id = ?')
   }
 
   close(): void {
@@ -208,7 +213,9 @@ export class MemoryStore {
       summary: String(r.summary),
       tools_used: r.tools_used ? String(r.tools_used) : undefined,
       topic: String(r.topic),
-      extracted: Number(r.extracted) === 1,
+      // P3-13: three-state (0/1/2) — boolean coercion made degraded (2)
+      // indistinguishable from untouched (0) on read-back.
+      extracted: Number(r.extracted) as 0 | 1 | 2,
       archived: Number(r.archived) === 1,
       archived_at: r.archived_at ? Number(r.archived_at) : undefined,
       created: Number(r.created),
@@ -218,7 +225,7 @@ export class MemoryStore {
   // ---- reads (memories) ----------------------------------------------------
 
   get(id: string): MemoryEntry | undefined {
-    const r = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    const r = this.getMemStmt.get(id) as Record<string, unknown> | undefined
     return r ? this.rowToEntry(r) : undefined
   }
 
@@ -249,13 +256,18 @@ export class MemoryStore {
     return Number(r.c)
   }
 
-  /** Tier-0 (injectable, non-archived, non-low-quality) usage. */
+  /** Tier-0 (injectable, non-archived, non-low-quality) usage.
+   *  R4 (review 2026-08-30): SQL aggregate — the old version loaded and JS-mapped
+   *  every tier-0 row on each call (batch/tools both call this per write). */
   usage(): BudgetUsage {
+    const rows = this.db.prepare(
+      'SELECT layer AS l, SUM(LENGTH(content)) AS n FROM memories WHERE tier = 0 AND archived = 0 AND low_quality = 0 GROUP BY layer',
+    ).all() as { l: string; n: number | null }[]
     let user = 0
     let memory = 0
-    for (const e of this.list({ tier: 0, includeArchived: false, includeLowQuality: false })) {
-      if (e.layer === 'user') user += e.content.length
-      else memory += e.content.length
+    for (const r of rows) {
+      if (r.l === 'user') user += Number(r.n ?? 0)
+      else memory += Number(r.n ?? 0)
     }
     const total = user + memory
     return { user, memory, total, pct: this.budget.tier0 > 0 ? Math.round((total / this.budget.tier0) * 100) : 0 }
@@ -270,12 +282,15 @@ export class MemoryStore {
 
   /** Bounded dedup candidate set (P2-16): only rows sharing the head of `content`
    *  are compared for the duplicate penalty, so add/replace cost stops scaling with
-   *  library size. (Content-equality dedup — P0-2 — is exact and separate.) */
+   *  library size. (Content-equality dedup — P0-2 — is exact and separate.)
+   *  R4 (review 2026-08-30): the old `LIKE '%head%'` had a leading wildcard and
+   *  full-scanned every row; this prefix-anchored range rides idx_mem_content. */
   private nearCandidates(content: string, cap = 8): MemoryEntry[] {
     const slice = content.slice(0, 12).trim()
     if (!slice) return []
-    const like = `%${escapeLike(slice)}%`
-    const rows = this.db.prepare("SELECT * FROM memories WHERE archived = 0 AND content LIKE ? ESCAPE '\\' LIMIT ?").all(like, cap) as Record<string, unknown>[]
+    const rows = this.db.prepare(
+      "SELECT * FROM memories WHERE archived = 0 AND content >= ? AND content < ? LIMIT ?",
+    ).all(slice, `${slice}\uffff`, cap) as Record<string, unknown>[]
     return rows.map(r => this.rowToEntry(r))
   }
 
@@ -303,9 +318,14 @@ export class MemoryStore {
     const row = this.rowidStmt.get(id) as { r: number } | undefined
     const r = this.db.prepare('DELETE FROM memories WHERE id = ?').run(id)
     if (r.changes > 0 && row) this.db.prepare('DELETE FROM mem_fts WHERE rowid = ?').run(Number(row.r))
+    // P3-15 (review 2026-08-30): cascade the correction trail — the memory row is
+    // physically gone, so leaving failure_memories rows only extends other
+    // entries' observation windows with references to a dead id. (remove force
+    // and forgetRun's hard-delete both land here.)
+    if (r.changes > 0) this.db.prepare('DELETE FROM failure_memories WHERE memory_id = ?').run(id)
   }
 
-  private applyOne(op: MemoryOp, now: number): { ok: boolean; error?: string } {
+  private applyOne(op: MemoryOp, now: number): { ok: boolean; error?: string; lowQualityId?: string } {
     if (op.action === 'add' || op.action === 'replace') {
       const content = (op.content ?? '').trim()
       if (!content) return { ok: false, error: 'content is required' }
@@ -336,9 +356,13 @@ export class MemoryStore {
           this.writeMemory(id, {
             layer, kind, tier, topic, content, importance, quality, epistemic,
             heat: heatOf(existing, this.forgetDays), created: existing.created, updated: now,
-            last_accessed: existing.last_accessed, archived: existing.archived, low_quality: low,
+            // R1 (review 2026-08-30): re-adding content that matches an ARCHIVED
+            // entry reactivates it — the tool says "已记入", so the fact must become
+            // visible/recallable again. Keeping the old archived=1 silently broke
+            // the write contract (recorded but never retrievable).
+            last_accessed: existing.last_accessed, archived: false, low_quality: low,
             window_freq: existing.window_freq, window_start: existing.window_start,
-            archived_at: existing.archived_at, session_id: op.sessionId ?? existing.session_id,
+            archived_at: undefined, session_id: op.sessionId ?? existing.session_id,
           })
         } else {
           this.writeMemory(id, {
@@ -347,7 +371,9 @@ export class MemoryStore {
             window_freq: 0, window_start: 0, session_id: op.sessionId,
           })
         }
-        return { ok: true }
+        // P2-9: surface low_quality at the write boundary — "已记入" must not
+        // hide "recorded but excluded from default recall/injection".
+        return low ? { ok: true, lowQualityId: id } : { ok: true }
       }
 
       // replace
@@ -378,7 +404,8 @@ export class MemoryStore {
         window_freq: target.window_freq, window_start: target.window_start,
         archived_at: target.archived_at, session_id: op.sessionId ?? target.session_id,
       })
-      return { ok: true }
+      // P2-9: same low-quality surfacing on replace.
+      return low ? { ok: true, lowQualityId: target.id } : { ok: true }
     }
 
     if (op.action === 'remove') {
@@ -437,31 +464,53 @@ export class MemoryStore {
     return { demoted, over }
   }
 
-  /** Model-facing write batch; lands globally and immediately. */
+  /** Model-facing write batch; lands globally and immediately.
+   *  R5 (review 2026-08-30): SAVEPOINT instead of BEGIN/COMMIT — safe both
+   *  standalone and nested inside a caller-held transaction (same pattern as
+   *  writeEpisode, P1-12). The old BEGIN IMMEDIATE threw "cannot start a
+   *  transaction within a transaction" when composed. */
   batch(ops: MemoryOp[], sessionId?: string): ApplyResult {
     const now = Date.now()
-    const before = this.activeEntries()
     const applied: MemoryOp[] = []
     const rejected: { op: MemoryOp; reason: string }[] = []
+    // P2-9: ids written/updated with low_quality=1, surfaced to the tool layer.
+    const lowQualityIds: string[] = []
+    this.db.exec('SAVEPOINT dsh_batch')
     try {
-      this.db.exec('BEGIN IMMEDIATE')
       for (const op of ops) {
         if (op.action === 'list') continue
         const mapped: MemoryOp = sessionId ? { ...op, sessionId } : op
         const res = this.applyOne(mapped, now)
-        if (res.ok) applied.push(mapped)
+        if (res.ok) {
+          applied.push(mapped)
+          if (res.lowQualityId) lowQualityIds.push(res.lowQualityId)
+        }
         else rejected.push({ op: mapped, reason: res.error! })
       }
       const { demoted, over } = this.enforceBudget(now)
       if (over) {
-        this.db.exec('ROLLBACK')
+        this.db.exec('ROLLBACK TO dsh_batch')
+        this.db.exec('RELEASE dsh_batch')
+        // R4: compute only when actually reported — after rollback the state is
+        // exactly the pre-batch snapshot this return describes.
+        const before = this.activeEntries()
         const usage = this.usage()
-        return { applied: [], rejected: ops.map(o => ({ op: o, reason: 'memory budget exceeded' })), entries: before, overflowed: true, demoted: [], usage }
+        return { applied: [], rejected: ops.map(o => ({ op: o, reason: 'memory budget exceeded' })), entries: before, overflowed: true, demoted: [], lowQuality: [], usage }
       }
-      this.db.exec('COMMIT')
-      return { applied, rejected, entries: this.activeEntries(), overflowed: false, demoted, usage: this.usage() }
+      this.db.exec('RELEASE dsh_batch')
+      // R4 (review 2026-08-30): `entries` is only consumed on the overflow path
+      // (tools.ts) — evaluate lazily once on first access so a plain add does
+      // not pay a full active-set load per batch. Same value when read.
+      const store = this
+      let entriesCache: MemoryEntry[] | undefined
+      const res: ApplyResult = {
+        applied, rejected, overflowed: false, demoted, lowQuality: lowQualityIds, usage: this.usage(),
+        get entries(): MemoryEntry[] { return (entriesCache ??= store.activeEntries()) },
+      }
+      return res
     } catch (err) {
-      try { this.db.exec('ROLLBACK') } catch { /* noop */ }
+      try { this.db.exec('ROLLBACK TO dsh_batch') } catch { /* noop */ }
+      try { this.db.exec('RELEASE dsh_batch') } catch { /* noop */ }
       throw err
     }
   }
@@ -496,17 +545,6 @@ export class MemoryStore {
     const qLower = query.toLowerCase()
     const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
 
-    // FTS hit ids (optional first layer).
-    const ftsIds = new Set<string>()
-    try {
-      const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
-      if (q) {
-        for (const row of this.db.prepare('SELECT id FROM memories WHERE rowid IN (SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?)').all(q) as { id: string }[]) {
-          ftsIds.add(String(row.id))
-        }
-      }
-    } catch { /* MATCH lex error → substring layer covers */ }
-
     // P2-17: candidate pre-filter in SQL (FTS ∪ any-substring) so recall does NOT
     // load + scan the whole library in JS. base>0 iff the row is FTS-hit OR its
     // content/topic contains the raw query OR any keyword — all expressed below.
@@ -517,13 +555,21 @@ export class MemoryStore {
       seen.add(e.id)
       candidates.push(e)
     }
-    for (const id of ftsIds) {
-      const e = this.get(id)
-      if (!e) continue
-      if (opts.includeArchived !== true && e.archived) continue
-      if (opts.includeLowQuality !== true && e.low_quality) continue
-      push(e)
-    }
+    // FTS hit rows fetched one-shot (P1-5): the old version collected ids then
+    // re-fetched each row via get() — two queries per hit.
+    const ftsIds = new Set<string>()
+    try {
+      const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
+      if (q) {
+        for (const row of this.db.prepare('SELECT * FROM memories WHERE rowid IN (SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
+          const e = this.rowToEntry(row)
+          ftsIds.add(e.id)
+          if (opts.includeArchived !== true && e.archived) continue
+          if (opts.includeLowQuality !== true && e.low_quality) continue
+          push(e)
+        }
+      }
+    } catch { /* MATCH lex error → substring layer covers */ }
     // Substring candidates via SQL LIKE over content/topic.
     const baseClauses: string[] = ['1=1']
     if (opts.includeArchived !== true) baseClauses.push('archived = 0')
@@ -572,7 +618,7 @@ export class MemoryStore {
     try {
       this.upsertEpiStmt.run(
         id, fields.session_id, fields.ts, fields.summary, fields.tools_used ?? null,
-        fields.topic, fields.extracted ? 1 : 0, fields.archived ? 1 : 0, fields.archived_at ?? null,
+        fields.topic, fields.extracted, fields.archived ? 1 : 0, fields.archived_at ?? null,
         fields.created,
       )
       const rowid = Number(this.epiRowidStmt.get(id)!.r)
@@ -595,7 +641,7 @@ export class MemoryStore {
       summary: fields.summary.trim(),
       tools_used: fields.toolsUsed,
       topic: (fields.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC,
-      extracted: false,
+      extracted: 0,
       archived: false,
       created: now,
     }
@@ -610,23 +656,52 @@ export class MemoryStore {
     return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
   }
 
+  /** P1-5 (review 2026-08-30): candidate pre-filter pushed into SQL — FTS hits
+   *  fetched one-shot, substring candidates via LIKE over summary/topic. The old
+   *  version loaded EVERY active episode into JS before scoring (4000 rows →
+   *  8.6ms/call, strictly linear; the semantic recall path is O(hits) at 0.05ms).
+   *  Scoring itself is unchanged — same FTS/substring/keyword base + recency. */
   recallEpisodes(query: string, opts: { topK?: number } = {}): EpisodeHit[] {
     const topK = opts.topK ?? 8
-    const candidates = this.listEpisodes({ includeArchived: false })
-    if (candidates.length === 0) return []
+    const seen = new Set<string>()
+    const candidates: Episode[] = []
+    const push = (ep: Episode | undefined): void => {
+      if (!ep || seen.has(ep.id)) return
+      seen.add(ep.id)
+      candidates.push(ep)
+    }
 
     const ftsIds = new Set<string>()
     try {
       const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
       if (q) {
-        for (const row of this.db.prepare('SELECT id FROM episodes WHERE rowid IN (SELECT rowid FROM ep_fts WHERE ep_fts MATCH ?)').all(q) as { id: string }[]) {
-          ftsIds.add(String(row.id))
+        for (const row of this.db.prepare('SELECT * FROM episodes WHERE rowid IN (SELECT rowid FROM ep_fts WHERE ep_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
+          const ep = this.rowToEpisode(row)
+          ftsIds.add(ep.id)
+          if (ep.archived) continue
+          push(ep)
         }
       }
     } catch { /* MATCH lex error → substring layer covers */ }
 
+    // Substring candidates via SQL LIKE over summary/topic (only active rows).
     const qLower = query.toLowerCase()
     const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
+    const like = "(\"summary\" LIKE ? ESCAPE '\\' OR \"topic\" LIKE ? ESCAPE '\\')"
+    const ors: string[] = []
+    const params: string[] = []
+    const addTerm = (s: string): void => {
+      const e = escapeLike(s)
+      ors.push(like)
+      params.push(`%${e}%`, `%${e}%`)
+    }
+    addTerm(qLower)
+    for (const k of keywords) addTerm(k)
+    const sql = `SELECT * FROM episodes WHERE archived = 0 AND (${ors.join(' OR ')})`
+    for (const r of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEpisode(r))
+
+    if (candidates.length === 0) return []
+
     const scored: EpisodeHit[] = []
     const now = Date.now()
     for (const ep of candidates) {
@@ -663,10 +738,11 @@ export class MemoryStore {
   // ---- L1/L2 refine support (zero LLM — pure scheduling, reading, audit) ----
 
   /**
-   * Episodes awaiting L1 extraction, oldest first. `extracted == 0` are never
-   * processed (untouched / LLM-degraded when retryDegraded is false); `== 2`
-   * are retried only when retryDegraded is set — so a hot LLM outage degrades
-   * cleanly without hammering the route every pass.
+   * Episodes awaiting L1 extraction, oldest first. `extracted = 0` (untouched)
+   * are the pending queue; `== 2` (degraded) are retried only when
+   * retryDegraded is set — so a hot LLM outage degrades cleanly without
+   * hammering the route every pass. (P3-14: comment previously stated the
+   * exact opposite of what the SQL does.)
    */
   listEpisodesForRefine(opts: { retryDegraded?: boolean; limit?: number } = {}): Episode[] {
     const status = opts.retryDegraded ? 'extracted IN (0, 2)' : 'extracted = 0'
@@ -717,6 +793,14 @@ export class MemoryStore {
     return Number(r.lastInsertRowid)
   }
 
+  /** Prior audit rows for one refine source — bounded-retry accounting for L1
+   *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
+   *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
+  refineAttemptCount(sourceId: string): number {
+    const r = this.db.prepare('SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ?').get(sourceId) as { c: number }
+    return Number(r.c)
+  }
+
   // ---- correction trail ----------------------------------------------------
 
   recordFailure(memoryId: string, oldContent: string, newContent: string): void {
@@ -748,7 +832,9 @@ export class MemoryStore {
 
   forgetRun(cfg: {
     forgetDays?: Partial<ForgetDays>
-    windowDays?: number
+    // P3-12 (review 2026-08-30): the old `windowDays` param was declared but
+    // never read — the effective window is the constructor's this.windowDays.
+    // Removed instead of silently keeping a dead knob.
     episodeRetentionDays?: number
     observeDays?: number
   }, now = Date.now()): ForgetResult {
@@ -817,6 +903,12 @@ export class MemoryStore {
       for (const ep of this.listEpisodes({ includeArchived: true })) {
         if (!ep.archived || ep.archived_at === undefined) continue
         if (now - ep.archived_at > observeDays * DAY_MS) {
+          // R7 (review 2026-08-30, P2-10): snapshot BEFORE physical delete —
+          // same contract as memories (P1-13): "删了能查、误删能回滚" now holds
+          // for BOTH forgetting faces (DESIGN §5.2).
+          this.db.prepare(
+            'INSERT INTO forget_deleted_episodes(ts, episode_id, session_id, summary, topic, tools_used, reason) VALUES (?,?,?,?,?,?,?)',
+          ).run(now, ep.id, ep.session_id, ep.summary, ep.topic, ep.tools_used ?? null, 'episode-observation-passed')
           this.hardDeleteEpisode(ep.id)
           deletedEpi += 1
           decisions.push(`ep-delete:${ep.id}`)
@@ -829,6 +921,7 @@ export class MemoryStore {
       this.db.prepare('DELETE FROM forget_runs WHERE ts < ?').run(now - 180 * DAY_MS)
       this.db.prepare('DELETE FROM refine_runs WHERE ts < ?').run(now - 180 * DAY_MS)
       this.db.prepare('DELETE FROM forget_deleted WHERE ts < ?').run(now - 365 * DAY_MS)
+      this.db.prepare('DELETE FROM forget_deleted_episodes WHERE ts < ?').run(now - 365 * DAY_MS)
 
       const applied = demoted + archivedMem + deletedMem + archivedEpi + deletedEpi
       const sha = createHash('sha256').update(decisions.join('\n')).digest('hex').slice(0, 16)

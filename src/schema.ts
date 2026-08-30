@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_mem_tier   ON memories(tier, archived);
 CREATE INDEX IF NOT EXISTS idx_mem_layer  ON memories(layer, tier);
 CREATE INDEX IF NOT EXISTS idx_mem_access ON memories(last_accessed);
+-- R4 (review 2026-08-30): exact-content dedup (WHERE content = ?) was a full
+-- table SCAN on every add; this index turns it into a lookup.
+CREATE INDEX IF NOT EXISTS idx_mem_content ON memories(content);
 CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(content, topic);
 
 CREATE TABLE IF NOT EXISTS episodes (
@@ -75,6 +78,20 @@ CREATE TABLE IF NOT EXISTS forget_deleted (
   reason     TEXT
 );
 
+-- R7 (review 2026-08-30): durable snapshots of HARD-deleted episodes. DESIGN §5.2
+-- promises "删了能查、误删能回滚" for BOTH forgetting faces — episodes used to be
+-- physically deleted with no trace, so only half the promise held.
+CREATE TABLE IF NOT EXISTS forget_deleted_episodes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  episode_id TEXT NOT NULL,
+  session_id TEXT,
+  summary    TEXT NOT NULL,
+  topic      TEXT,
+  tools_used TEXT,
+  reason     TEXT
+);
+
 CREATE TABLE IF NOT EXISTS refine_runs (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,
@@ -83,7 +100,7 @@ CREATE TABLE IF NOT EXISTS refine_runs (
   prompt_sha TEXT,                  -- 输入 digest，离线可复现
   llm_route  TEXT,                  -- "provider/model"，降级时为 null
   decisions  TEXT NOT NULL,         -- L1 抽取事实 JSON / L2 合并裁决 JSON
-  status     TEXT NOT NULL          -- ok | degraded | error
+  status     TEXT NOT NULL          -- ok | ok-noop (R2: 0 facts written) | degraded | error
 );
 `
 

@@ -46,8 +46,9 @@ export interface Episode {
   /** JSON array of tool names used this session. */
   tools_used?: string
   topic: string
-  /** Reserved: whether L1 extraction already consumed it (unused in v3). */
-  extracted: boolean
+  /** L1 extraction state (P3-13): 0 = untouched, 1 = extracted, 2 = degraded-skip.
+   *  Three-state — do NOT coerce to boolean (2 must stay distinguishable from 0). */
+  extracted: 0 | 1 | 2
   archived: boolean
   archived_at?: number
   created: number
@@ -93,6 +94,9 @@ export interface ApplyResult {
   overflowed: boolean
   /** Ids of entries demoted tier0→tier1 to fit the injection budget this batch. */
   demoted: string[]
+  /** Ids written/updated with low_quality=1 (P2-9): recorded but excluded from
+   *  default recall/injection — surfaced so the model is not told a bare "已记入". */
+  lowQuality?: string[]
   usage: BudgetUsage
 }
 

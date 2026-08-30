@@ -140,7 +140,14 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
       const demoteNote = res.demoted.length > 0
         ? `（${res.demoted.length}条已有记忆因预算降级至 tier1：未注入常驻区，但可经 memory_recall 召回）`
         : ''
-      return { content: `已${ACTION_VERBS[action]}。${demoteNote}${summarizeResult(store)}` }
+      // P2-9 (review 2026-08-30): a low-quality write is NOT an ordinary "已记入" —
+      // it is recorded but excluded from injection and default recall. Telling the
+      // model bare "成功" recreated the archived-entry silent-failure class.
+      const lq = res.lowQuality?.length ?? 0
+      const lowQualityNote = lq > 0
+        ? `（注意:${lq}条因内容过短或高度重复被判为低质:已记入,但默认不注入、不参与常规召回;如需生效请用更完整的表述 replace）`
+        : ''
+      return { content: `已${ACTION_VERBS[action]}。${demoteNote}${lowQualityNote}${summarizeResult(store)}` }
     },
     presentCall(args) {
       const action = str(args.action) ?? ''

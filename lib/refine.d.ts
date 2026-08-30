@@ -19,6 +19,10 @@ import type { LlmStreamSeam } from './l0.js';
 import type { Epistemic, Importance, Kind } from './types.js';
 export declare const DEFAULT_REFINE_MAX_TOKENS = 800;
 export declare const DEFAULT_REFINE_TIMEOUT_MS = 10000;
+/** R2 (review 2026-08-30): an episode whose facts keep being rejected (e.g.
+ *  tier-0 budget permanently overflowed) is retried at most this many times,
+ *  then marked degraded — never an infinite per-cycle LLM loop. */
+export declare const L1_MAX_WRITE_RETRIES = 3;
 /** A resolvable LLM route pair (provider + model). */
 export interface RefineRoute {
     provider: string;
@@ -92,6 +96,9 @@ export interface RefineInput {
  * extracted=1. A missing/failed route or unparseable output marks extracted=2
  * (degraded-skip) with an audit row. Budget overflow falls back to writing
  * facts one-at-a-time so a tier-0 squeeze never loses facts silently.
+ * R2 (review 2026-08-30): an episode whose facts are persistently rejected
+ * (budget) is retried at most L1_MAX_WRITE_RETRIES times, then degraded —
+ * never an infinite per-cycle LLM loop; its audit rows read 'ok-noop'.
  * Never throws to the caller.
  */
 export declare function runRefineL1(store: MemoryStore, input?: RefineInput): Promise<{

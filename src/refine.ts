@@ -22,6 +22,10 @@ import type { Epistemic, Importance, Kind, MemoryOp } from './types.js'
 export const DEFAULT_REFINE_MAX_TOKENS = 800
 export const DEFAULT_REFINE_TIMEOUT_MS = 10000
 const REFINE_BATCH_LIMIT = 20
+/** R2 (review 2026-08-30): an episode whose facts keep being rejected (e.g.
+ *  tier-0 budget permanently overflowed) is retried at most this many times,
+ *  then marked degraded — never an infinite per-cycle LLM loop. */
+export const L1_MAX_WRITE_RETRIES = 3
 
 const KINDS: readonly Kind[] = ['preference', 'env', 'lesson', 'decision', 'general']
 const EPISTEMICS: readonly Epistemic[] = ['observed', 'inferred', 'subjective']
@@ -214,6 +218,9 @@ export interface RefineInput {
  * extracted=1. A missing/failed route or unparseable output marks extracted=2
  * (degraded-skip) with an audit row. Budget overflow falls back to writing
  * facts one-at-a-time so a tier-0 squeeze never loses facts silently.
+ * R2 (review 2026-08-30): an episode whose facts are persistently rejected
+ * (budget) is retried at most L1_MAX_WRITE_RETRIES times, then degraded —
+ * never an infinite per-cycle LLM loop; its audit rows read 'ok-noop'.
  * Never throws to the caller.
  */
 export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): Promise<{
@@ -244,17 +251,17 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
       }
       if (status === 'degraded' || facts === null) {
         store.markEpisodeExtracted(ep.id, 2)
-        store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: '[]', status: 'degraded' })
+        // R6 (review 2026-08-30): return the REAL audit row id (was sentinel 0,
+        // which pointed at nothing and broke traceability).
+        stats.runIds.push(store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: '[]', status: 'degraded' }))
         stats.degraded += 1
         stats.processed += 1
-        stats.runIds.push(0)
         continue
       }
       if (facts.length === 0) {
         store.markEpisodeExtracted(ep.id, 1)
-        store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: '[]', status: 'ok' })
+        stats.runIds.push(store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: '[]', status: 'ok' }))
         stats.processed += 1
-        stats.runIds.push(0)
         continue
       }
       // Write facts (dedup/quality/tier via batch); on tier-0 overflow retry 1-by-1.
@@ -269,17 +276,25 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
         }
         if (any > 0) wrote = any // P2-31: report actual facts written, not the full batch size
       }
-      if (wrote > 0) store.markEpisodeExtracted(ep.id, 1) // else leave extracted=0 to retry later
-      const runId = store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: JSON.stringify(facts), status: 'ok' })
+      if (wrote > 0) {
+        store.markEpisodeExtracted(ep.id, 1)
+      } else if (store.refineAttemptCount(ep.id) + 1 >= L1_MAX_WRITE_RETRIES) {
+        // R2 (review 2026-08-30): facts permanently rejected (budget) — stop the
+        // infinite retry loop, degrade the episode so later passes skip it.
+        store.markEpisodeExtracted(ep.id, 2)
+        stats.degraded += 1
+      } // else: leave extracted=0 to retry later (bounded by the check above)
+      // R2: audit must tell a no-op write apart from a real one — 'ok' used to
+      // mask an every-cycle LLM call that wrote nothing.
+      const runId = store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: JSON.stringify(facts), status: wrote > 0 ? 'ok' : 'ok-noop' })
       stats.factsWritten += wrote
       stats.processed += 1
       stats.runIds.push(runId)
     } catch {
       store.markEpisodeExtracted(ep.id, 2)
-      store.writeRefineRun({ level: 1, sourceId: ep.id, route, decisions: '[]', status: 'error' })
+      stats.runIds.push(store.writeRefineRun({ level: 1, sourceId: ep.id, route, decisions: '[]', status: 'error' }))
       stats.degraded += 1
       stats.processed += 1
-      stats.runIds.push(0)
     }
   }
   return stats
@@ -312,10 +327,9 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
       })
       const verdicts = raw === null ? null : parseL2Json(raw)
       if (raw === null || verdicts === null) {
-        store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'degraded' })
+        stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'degraded' }))
         stats.clusters += 1
         stats.degraded += 1
-        stats.runIds.push(0)
         continue
       }
       const ops: MemoryOp[] = []
@@ -345,10 +359,9 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
       stats.verdictsApplied += applied.length
       stats.runIds.push(runId) // P2-30: keep the real audit row id on the success path (was hard-coded 0)
     } catch {
-      store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' })
+      stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' }))
       stats.clusters += 1
       stats.degraded += 1
-      stats.runIds.push(0)
     }
   }
   return stats

@@ -593,6 +593,91 @@ group('G17 budget enforcement (P1-7/8/9) + delete snapshot (P1-13)')
 }
 
 // ---------------------------------------------------------------------------
+group('G17 review fixes 2026-08-30 — second batch (P1-5 / P2-7 / P2-9 / P2-10 / P3)')
+{
+  // P2-9: a low-quality write is surfaced on ApplyResult, not a silent "已记入".
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17a-'))
+    const s = new MemoryStore(t)
+    const r = s.batch([{ action: 'add', content: '临时记忆一次性的垃圾' }])
+    assert('P2-9 low-quality add surfaced in ApplyResult.lowQuality', Array.isArray(r.lowQuality) && r.lowQuality.length === 1)
+    const r2 = s.batch([{ action: 'add', content: '一条足够长的正常环境事实内容用于对照检查低质标记逻辑' }])
+    assert('P2-9 normal add has no lowQuality id', Array.isArray(r2.lowQuality) && r2.lowQuality.length === 0)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P2-10: episode hard-delete is snapshotted into forget_deleted_episodes (DESIGN §5.2).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17b-'))
+    const s = new MemoryStore(t)
+    s.addEpisode({ sessionId: 'snap-sess', summary: '这条情景摘要应在硬删后仍可从快照审计表查回' })
+    s.forgetRun({}, Date.now() + 181 * DAY)
+    s.forgetRun({}, Date.now() + 181 * DAY + 31 * DAY)
+    const db5 = new DatabaseSync(s.dbPath)
+    const row = db5.prepare('SELECT * FROM forget_deleted_episodes').get()
+    db5.close()
+    assert('P2-10 episode hard-delete snapshotted (summary recoverable)', row && String(row.summary).includes('快照审计'))
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P2-7: runL0 reports program errors via onError instead of swallowing them.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17c-'))
+    const s = new MemoryStore(t)
+    s.close()
+    let seen = null
+    const ep = await runL0(s, {
+      events: [{ type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '这是一段足够长的正常回合文本内容' }] } }],
+      turn: 1, summarize: 'rules', sessionId: 's',
+      onError: (e) => { seen = e },
+    })
+    assert('P2-7 runL0 surfaces program error via onError', seen !== null)
+    assert('P2-7 runL0 still returns null (never throws)', ep === null)
+    rmSync(t, { recursive: true, force: true })
+  }
+
+  // P1-5: recallEpisodes correctness after the SQL push-down (archived excluded,
+  // substring + FTS layers both hit, no false positives).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17d-'))
+    const s = new MemoryStore(t)
+    s.addEpisode({ sessionId: 'a', summary: '讨论了数据库备份策略的细节与注意事项' })
+    s.addEpisode({ sessionId: 'b', summary: '完全无关的闲聊内容关于天气和晚餐' })
+    const hits = s.recallEpisodes('数据库')
+    assert('P1-5 recallEpisodes finds substring hit', hits.length === 1 && hits[0].episode.summary.includes('数据库'))
+    const none = s.recallEpisodes('量子纠缠')
+    assert('P1-5 recallEpisodes no false positives', none.length === 0)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P3-13: episode `extracted` is a three-state number (2 ≠ 0 after read-back).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17e-'))
+    const s = new MemoryStore(t)
+    s.addEpisode({ sessionId: 'x', summary: '用于验证 extracted 三态读写不会坍缩为布尔' })
+    const ep = s.listEpisodes()[0]
+    assert('P3-13 new episode extracted === 0', ep.extracted === 0)
+    s.markEpisodeExtracted(ep.id, 2)
+    const back = s.listEpisodes({ includeArchived: true }).find(e => e.id === ep.id)
+    assert('P3-13 degraded state 2 survives read-back', back.extracted === 2)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P3-15: remove force cascades failure_memories cleanup (no orphan references).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g17f-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', content: '将被物理删除并检查留痕级联清理的一条事实正文', topic: 't' }])
+    const id = s.activeEntries().find(e => e.content.includes('级联清理')).id
+    s.batch([{ action: 'replace', id, content: '改写后的替换正文内容长度足够不会被误判为片段' }])
+    assert('P3-15 correction trail recorded before force-delete', s.failureTrail().length === 1)
+    s.batch([{ action: 'remove', id, force: true }])
+    assert('P3-15 force delete cascades failure_memories cleanup', s.failureTrail().length === 0)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(50)}`)
 console.log(`passed: ${passed}  failed: ${failed}`)
 try { rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }

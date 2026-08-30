@@ -54,7 +54,9 @@ dsh plugin --profile web add file:C:/abs/path/to/dsh-memory
 ## 配置（可选）
 
 ```yaml
-memoryHome: <path>           # 存储目录（默认 ~/.dsh/memory）
+memoryHome: <path>           # 存储目录（默认 ~/.dsh）——注意：库文件会放在 <memoryHome>/memory/memory.db，
+                             # store 会在该路径下再拼一层 memory/。想让库落在 ~/.dsh/memory/memory.db，
+                             # 就设 ~/.dsh，不要设 ~/.dsh/memory（否则会得到 ~/.dsh/memory/memory/memory.db）
 enableInjection: true        # Tier0 常驻 section
 budgetTier0: 900             # 常驻核心字符预算
 budgetUser: 400
@@ -62,7 +64,7 @@ budgetMemory: 500
 importanceThreshold: 3
 epistemicWeighting: true
 forgetEnabled: true          # 主动遗忘开关
-forgetDays:                  # 期望遗忘时间（天）
+forgetDays:                  # 期望遗忘时间（天）；0 = 立即过冷（下一次遗忘扫描即降级/归档，仍受重要性与观察期门槛保护）
   env: 365
   lesson: 180
   decision: 90
@@ -72,14 +74,17 @@ episodeRetentionDays: 180    # episodes 归档时间（天）
 forgetObserveDays: 30        # 归档→真删观察期（天）
 
 # --- 后台凝练 L0 / L1 / L2 ---
+# 路由跟随 dsh 模型选择，勿写死：L0 缺省用当前会话 request-header 的 provider/model，
+# L1/L2 缺省按 会话路由 → 宿主导航模型(agentDefaultModel) 回退。若显式写死某个 provider
+# 而无对应凭证，会导致 LLM 调用失败、refine 全程 degraded。留空 = 跟随，适合共享给不同用户。
 l0Summarize: 'llm'           # 'llm' | 'rules'（L0 会话→情景摘要）
-l0Provider: ''               # L0 显式路由（缺省用会话 request-header）
+l0Provider: ''               # L0 显式路由（缺省用会话 request-header；建议留空跟随）
 l0Model: ''
 l0MaxTokens: 400
 l0TimeoutMs: 8000            # L0 LLM 端到端超时（P1-10）
 l1Enabled: true              # L1 情景→稳定事实抽取（LLM 决策）
 l2Enabled: true              # L2 语义簇合并/仲裁（LLM 决策）
-l1Provider: ''               # L1/L2 显式路由（缺省：会话路由→宿主导航模型）
+l1Provider: ''               # L1/L2 显式路由（缺省：会话路由→宿主导航模型；建议留空跟随）
 l1Model: ''
 l1MaxTokens: 800
 l1TimeoutMs: 10000
