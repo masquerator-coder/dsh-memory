@@ -27,6 +27,35 @@ const KINDS: readonly Kind[] = ['preference', 'env', 'lesson', 'decision', 'gene
 const EPISTEMICS: readonly Epistemic[] = ['observed', 'inferred', 'subjective']
 const ACTIONS = new Set(['merge', 'keep', 'drop', 'correct'])
 
+/** A resolvable LLM route pair (provider + model). */
+export interface RefineRoute {
+  provider: string
+  model: string
+}
+/** One candidate route source (any of provider/model may be absent). */
+export interface RefineRouteSource {
+  provider?: string
+  model?: string
+}
+
+/**
+ * Resolve the route for a background L1/L2 pass. Precedence: explicit config →
+ * route learned from a live session request-header → host default model
+ * (`agentDefaultModel.currentSelection()`), else null (caller degrades).
+ * Pure: no dsh, no I/O. Returns a route only when both halves are present.
+ */
+export function resolveRefineRoute(
+  explicit?: RefineRouteSource,
+  learned?: RefineRouteSource,
+  hostDefault?: RefineRouteSource,
+): RefineRoute | null {
+  for (const src of [explicit, learned, hostDefault]) {
+    if (src?.provider && src?.model) return { provider: src.provider, model: src.model }
+  }
+  return null
+}
+
+
 /** One stable fact extracted from an episode by L1. */
 export interface ExtractedFact {
   content: string

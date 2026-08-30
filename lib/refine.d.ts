@@ -19,6 +19,23 @@ import type { LlmStreamSeam } from './l0.js';
 import type { Epistemic, Importance, Kind } from './types.js';
 export declare const DEFAULT_REFINE_MAX_TOKENS = 800;
 export declare const DEFAULT_REFINE_TIMEOUT_MS = 10000;
+/** A resolvable LLM route pair (provider + model). */
+export interface RefineRoute {
+    provider: string;
+    model: string;
+}
+/** One candidate route source (any of provider/model may be absent). */
+export interface RefineRouteSource {
+    provider?: string;
+    model?: string;
+}
+/**
+ * Resolve the route for a background L1/L2 pass. Precedence: explicit config →
+ * route learned from a live session request-header → host default model
+ * (`agentDefaultModel.currentSelection()`), else null (caller degrades).
+ * Pure: no dsh, no I/O. Returns a route only when both halves are present.
+ */
+export declare function resolveRefineRoute(explicit?: RefineRouteSource, learned?: RefineRouteSource, hostDefault?: RefineRouteSource): RefineRoute | null;
 /** One stable fact extracted from an episode by L1. */
 export interface ExtractedFact {
     content: string;

@@ -24,7 +24,7 @@ import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shoul
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
-import { buildL1Prompt, buildL2Prompt, parseL1Json, parseL2Json, runRefineL1, runRefineL2 } from './lib/refine.js'
+import { buildL1Prompt, buildL2Prompt, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -497,6 +497,26 @@ group('G15 refine_runs audit schema + isolation')
   assert('no refine_runs written when not driven', Number(runCount.c) === 0)
   s.close()
   rmSync(t3, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G16 auto-route resolution (explicit → learned session → host default)')
+{
+  const E = { provider: 'p-explicit', model: 'm-explicit' }
+  const L = { provider: 'p-learned', model: 'm-learned' }
+  const H = { provider: 'p-host', model: 'm-host' }
+  const r1 = resolveRefineRoute(E, L, H)
+  assert('explicit config wins over learned + host', r1?.provider === 'p-explicit' && r1?.model === 'm-explicit')
+  const r2 = resolveRefineRoute(undefined, L, H)
+  assert('learned session route wins over host default', r2?.provider === 'p-learned' && r2?.model === 'm-learned')
+  const r3 = resolveRefineRoute(undefined, undefined, H)
+  assert('host default model used when no explicit/learned', r3?.provider === 'p-host' && r3?.model === 'm-host')
+  const r4 = resolveRefineRoute({ provider: 'p1' }, undefined, H)
+  assert('incomplete explicit (provider only) ignored → host default', r4?.provider === 'p-host')
+  const r5 = resolveRefineRoute(undefined, undefined, undefined)
+  assert('no route → null (caller degrades)', r5 === null)
+  const r6 = resolveRefineRoute(E, L, undefined)
+  assert('explicit wins without host default too', r6?.provider === 'p-explicit')
 }
 
 // ---------------------------------------------------------------------------

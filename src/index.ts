@@ -6,9 +6,10 @@
  * ladder). Tier-0 memory is a systemPrompt.section re-evaluated at every
  * assembly; the memory / memory_recall tools write & retrieve the global store.
  *
- * L1/L2 LLM condensation is dormant in v3 — the core store/recall/forget loop
- * is zero-LLM (pure functions + rule-based), so it never degrades when the
- * host LLM is unavailable.
+ * L1/L2 LLM condensation runs on a background timer (LLM-decided, audited into
+ * `refine_runs`); the core store/recall/forget loop is zero-LLM (pure functions
+ * + rule-based), so it never degrades when the host LLM is unavailable. Routes
+ * for the background passes auto-resolve when not configured explicitly.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -17,11 +18,22 @@ import { DEFAULT_BUDGET, MemoryStore, resolveDshHome } from './store.js'
 import { buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
-import { runRefineL1, runRefineL2 } from './refine.js'
+import { resolveRefineRoute, runRefineL1, runRefineL2 } from './refine.js'
 import type { ForgetDays } from './types.js'
 
+/**
+ * Minimal shape of the host's default-model service (declared here so the
+ * plugin compiles standalone; the real `@deepseek-ai/dsh-agent-default-model`
+ * package augments Context at runtime and is required via `inject`).
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    agentDefaultModel?: { currentSelection(): { provider?: string; model?: string; reasoningEffort?: string } }
+  }
+}
+
 export const name = 'memory'
-export const inject = ['tools', 'systemPrompt', 'llm'] as const
+export const inject = ['tools', 'systemPrompt', 'llm', 'agentDefaultModel'] as const
 
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {
@@ -51,11 +63,11 @@ export interface Config {
   l0MaxTokens?: number
   /** L0 LLM deadline ms. Default 8000. */
   l0TimeoutMs?: number
-  /** L1 episodic→semantic extraction (LLM-decided). Default false (dormant; enable after真机验证). */
+  /** L1 episodic→semantic extraction (LLM-decided). Default true (idiot-proof install). */
   l1Enabled?: boolean
-  /** L2 semantic merge/arbitration (LLM-decided). Default false. */
+  /** L2 semantic merge/arbitration (LLM-decided). Default true. */
   l2Enabled?: boolean
-  /** Explicit route pair for L1 (background has no request-header; must be explicit when enabled). */
+  /** Explicit route pair for L1. Optional: auto-resolves (learned session route → host default model). */
   l1Provider?: string
   l1Model?: string
   /** L1 LLM output-token cap. Default 800. */
@@ -138,8 +150,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l0Summarize = config.l0Summarize ?? 'llm'
   const l0MaxTokens = config.l0MaxTokens ?? 400
   const l0TimeoutMs = config.l0TimeoutMs ?? 8000
-  const l1Enabled = config.l1Enabled ?? false
-  const l2Enabled = config.l2Enabled ?? false
+  const l1Enabled = config.l1Enabled ?? true
+  const l2Enabled = config.l2Enabled ?? true
   const l1MaxTokens = config.l1MaxTokens ?? 800
   const l1TimeoutMs = config.l1TimeoutMs ?? 10000
   const l2MaxTokens = config.l2MaxTokens ?? 800
@@ -186,6 +198,17 @@ export function apply(ctx: Context, config: Config = {}): void {
     registerMemoryTools(ctx, store, { epistemicWeighting })
 
     // ---- L0 episodic condensation + L1/L2 background refinement ----
+    // Host default model route (idiot-proof auto-route): read once at boot so the
+    // background L1/L2 timer has a route even before any live session ran.
+    let hostDefault: { provider?: string; model?: string } | undefined
+    try {
+      const sel = ctx.agentDefaultModel?.currentSelection?.()
+      if (sel?.provider && sel?.model) hostDefault = { provider: sel.provider, model: sel.model }
+    } catch {
+      hostDefault = undefined
+    }
+    // Route learned from a live session request-header (captured in the L0 hook).
+    const learned: { provider?: string; model?: string } = {}
     // Adapt the dsh LLM seam (LlmRuntime.stream -> text-delta iterable) into the
     // shape l0.ts / refine.ts consume, and resolve the model route (plan 2: session
     // header for L0; explicit config for background L1/L2 which have no session).
@@ -206,6 +229,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (!isCompletedTurnEnd(event)) return
       // Resolve the model route (plan 2: auto from the session's request header).
       const cfg = session.requestHeader()?.config
+      if (cfg?.provider && cfg?.model) {
+        learned.provider = cfg.provider
+        learned.model = cfg.model
+      }
       const provider = config.l0Provider ?? cfg?.provider
       const model = config.l0Model ?? cfg?.model
       void runL0(store, {
@@ -234,19 +261,39 @@ export function apply(ctx: Context, config: Config = {}): void {
       refining = true
       try {
         if (l1Enabled) {
+          const l1Route = resolveRefineRoute(
+            (config.l1Provider && config.l1Model)
+              ? { provider: config.l1Provider, model: config.l1Model }
+              : (config.l0Provider && config.l0Model)
+                ? { provider: config.l0Provider, model: config.l0Model }
+                : undefined,
+            learned,
+            hostDefault,
+          )
+          if (!l1Route && !disposed) console.warn('[dsh-memory] L1 enabled but no LLM route resolved (explicit config, learned session route, and host default model all absent) — pass will be degraded')
           await runRefineL1(store, {
             llm: llmSeam,
-            provider: config.l1Provider ?? config.l0Provider,
-            model: config.l1Model ?? config.l0Model,
+            provider: l1Route?.provider,
+            model: l1Route?.model,
             maxTokens: l1MaxTokens, timeoutMs: l1TimeoutMs,
             retryDegraded: l1RetryDegraded,
           })
         }
         if (l2Enabled) {
+          const l2Route = resolveRefineRoute(
+            (config.l2Provider && config.l2Model)
+              ? { provider: config.l2Provider, model: config.l2Model }
+              : (config.l0Provider && config.l0Model)
+                ? { provider: config.l0Provider, model: config.l0Model }
+                : undefined,
+            learned,
+            hostDefault,
+          )
+          if (!l2Route && !disposed) console.warn('[dsh-memory] L2 enabled but no LLM route resolved (explicit config, learned session route, and host default model all absent) — pass will be degraded')
           await runRefineL2(store, {
             llm: llmSeam,
-            provider: config.l2Provider ?? config.l0Provider,
-            model: config.l2Model ?? config.l0Model,
+            provider: l2Route?.provider,
+            model: l2Route?.model,
             maxTokens: l2MaxTokens, timeoutMs: l2TimeoutMs,
             minCluster: l2MinCluster,
           })

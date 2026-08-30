@@ -6,15 +6,32 @@
  * ladder). Tier-0 memory is a systemPrompt.section re-evaluated at every
  * assembly; the memory / memory_recall tools write & retrieve the global store.
  *
- * L1/L2 LLM condensation is dormant in v3 — the core store/recall/forget loop
- * is zero-LLM (pure functions + rule-based), so it never degrades when the
- * host LLM is unavailable.
+ * L1/L2 LLM condensation runs on a background timer (LLM-decided, audited into
+ * `refine_runs`); the core store/recall/forget loop is zero-LLM (pure functions
+ * + rule-based), so it never degrades when the host LLM is unavailable. Routes
+ * for the background passes auto-resolve when not configured explicitly.
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import type { ForgetDays } from './types.js';
+/**
+ * Minimal shape of the host's default-model service (declared here so the
+ * plugin compiles standalone; the real `@deepseek-ai/dsh-agent-default-model`
+ * package augments Context at runtime and is required via `inject`).
+ */
+declare module '@deepseek-ai/cordis' {
+    interface Context {
+        agentDefaultModel?: {
+            currentSelection(): {
+                provider?: string;
+                model?: string;
+                reasoningEffort?: string;
+            };
+        };
+    }
+}
 export declare const name = "memory";
-export declare const inject: readonly ["tools", "systemPrompt", "llm"];
+export declare const inject: readonly ["tools", "systemPrompt", "llm", "agentDefaultModel"];
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {
     memoryHome?: string;
@@ -43,11 +60,11 @@ export interface Config {
     l0MaxTokens?: number;
     /** L0 LLM deadline ms. Default 8000. */
     l0TimeoutMs?: number;
-    /** L1 episodic→semantic extraction (LLM-decided). Default false (dormant; enable after真机验证). */
+    /** L1 episodic→semantic extraction (LLM-decided). Default true (idiot-proof install). */
     l1Enabled?: boolean;
-    /** L2 semantic merge/arbitration (LLM-decided). Default false. */
+    /** L2 semantic merge/arbitration (LLM-decided). Default true. */
     l2Enabled?: boolean;
-    /** Explicit route pair for L1 (background has no request-header; must be explicit when enabled). */
+    /** Explicit route pair for L1. Optional: auto-resolves (learned session route → host default model). */
     l1Provider?: string;
     l1Model?: string;
     /** L1 LLM output-token cap. Default 800. */
