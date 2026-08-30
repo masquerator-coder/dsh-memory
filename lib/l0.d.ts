@@ -146,3 +146,23 @@ export declare function runL0(store: MemoryStore, input: {
 }): Promise<unknown>;
 /** True when an event is a completed turn/end — the L0 trigger predicate. */
 export declare function isCompletedTurnEnd(ev: unknown): boolean;
+/**
+ * M5 (2026-08-30): session-level LLM consolidation ("idle settle"). Turn-end
+ * keeps realtime rule summaries (zero LLM); when a session has been idle ≥
+ * l0IdleMinutes, the host calls this to upgrade the freshest pending episode to
+ * a single full-session LLM summary — the "one LLM call after the dust settles"
+ * shape of REFINE-REDESIGN.md §3.1. If no LLM/route is present, or nothing was
+ * worth writing, returns null (no duplicate row). Pure w.r.t. persistence —
+ * only awaits the injected stream + two store writes.
+ */
+export declare function condenseSession(store: MemoryStore, input: {
+    texts: string[];
+    llm?: LlmStreamSeam | null;
+    provider?: string;
+    model?: string;
+    maxTokens?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    sessionId: string;
+    topic?: string;
+}): Promise<unknown>;

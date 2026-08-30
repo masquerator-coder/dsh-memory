@@ -40,6 +40,26 @@ export interface RefineRouteSource {
  * Pure: no dsh, no I/O. Returns a route only when both halves are present.
  */
 export declare function resolveRefineRoute(explicit?: RefineRouteSource, learned?: RefineRouteSource, hostDefault?: RefineRouteSource): RefineRoute | null;
+/** One bounded peak-hour suppression window ("HH:MM" start/end, same-day). */
+export interface SuppressWindow {
+    start: string;
+    end: string;
+}
+/** M8: peak-hour suppression config (API peak/valley pricing — skip LLM burn
+ *  during expensive windows). orthogonal to idle: gating is pure time, not
+ *  activity. Same-day windows only (a window that crosses midnight is not
+ *  supported — split it into two entries). */
+export interface SuppressCfg {
+    suppressWindows: SuppressWindow[];
+    suppressLeadMinutes: number;
+    timeZone: string;
+}
+/** M8: true when `now` (in cfg.timeZone) falls inside any suppression window or
+ *  the `suppressLeadMinutes` immediately before one. Pure — no I/O, testable. */
+export declare function isSuppressedRaw(now: Date, cfg: SuppressCfg, tzHour: number, tzMinute: number): boolean;
+/** M8: resolve hour/minute in cfg.timeZone then delegate to {@link isSuppressedRaw}.
+ *  Falls back to UTC wall-clock on an unknown/invalid timeZone. */
+export declare function isSuppressed(now: Date, cfg: SuppressCfg): boolean;
 /** One stable fact extracted from an episode by L1. */
 export interface ExtractedFact {
     content: string;
@@ -88,6 +108,9 @@ export interface RefineInput {
     retryDegraded?: boolean;
     sessionId?: string;
     limit?: number;
+    /** M7: only audit clusters whose members changed since the last audit (zero-LLM
+     *  for stable clusters). Accepts `runRefineSession` and other callers. */
+    incremental?: boolean;
 }
 /**
  * Run L1 extraction over pending episodes. Per episode: LLM decides the stable

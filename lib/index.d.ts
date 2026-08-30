@@ -10,6 +10,17 @@
  * `refine_runs`); the core store/recall/forget loop is zero-LLM (pure functions
  * + rule-based), so it never degrades when the host LLM is unavailable. Routes
  * for the background passes auto-resolve when not configured explicitly.
+ *
+ * M5–M9 (2026-08-30, see docs/REFINE-REDESIGN.md):
+ *   M5 L0 session settle  — turn-end keeps realtime RULE summaries (zero LLM);
+ *                           the LLM upgrade is deferred to an idle-settle pass
+ *                           (one call per session after l0IdleMinutes idle).
+ *   M6 L1 event kick      — a new episode schedules a short-delay refine pass;
+ *                           the periodic timer remains as a fallback.
+ *   M7 L2 incremental     — clusters whose members changed since the last
+ *                           audit are the only ones re-LLM'd (l2_refined).
+ *   M8 peak-hour gate     — L1/L2 LLM passes skip during suppressWindows.
+ *   M9 identity blocks    — constant soul.md / user.md sections, KV friendly.
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
@@ -51,30 +62,32 @@ export interface Config {
     episodeRetentionDays?: number;
     /** Observation window (days) between archive and hard-delete. Default 30. */
     forgetObserveDays?: number;
-    /** L0 episodic condensation mode: 'llm' (default, with rule fallback) | 'rules' (pure). */
+    /** L0 episodic condensation mode: 'llm' (default = idle-settle LLM upgrade) | 'rules' (pure). */
     l0Summarize?: 'rules' | 'llm';
     /** Optional explicit LLM route pair for L0 (must be set together). */
     l0Provider?: string;
     l0Model?: string;
-    /** L0 LLM output-token cap. Default 400. */
+    /** L0 output-token cap. Default 400. */
     l0MaxTokens?: number;
     /** L0 LLM deadline ms. Default 8000. */
     l0TimeoutMs?: number;
-    /** L1 episodic→semantic extraction (LLM-decided). Default true (idiot-proof install). */
+    /** L1 episodic→semantic extraction (LLM-decided). Default true. */
     l1Enabled?: boolean;
     /** L2 semantic merge/arbitration (LLM-decided). Default true. */
     l2Enabled?: boolean;
+    /** M7: only re-LLM a cluster whose members changed since last audit. Default true. */
+    l2Incremental?: boolean;
     /** Explicit route pair for L1. Optional: auto-resolves (learned session route → host default model). */
     l1Provider?: string;
     l1Model?: string;
-    /** L1 LLM output-token cap. Default 800. */
+    /** L1 output-token cap. Default 800. */
     l1MaxTokens?: number;
     /** L1 LLM deadline ms. Default 10000. */
     l1TimeoutMs?: number;
     /** Explicit route pair for L2 (same as L1: explicit when enabled). */
     l2Provider?: string;
     l2Model?: string;
-    /** L2 LLM output-token cap. Default 800. */
+    /** L2 output-token cap. Default 800. */
     l2MaxTokens?: number;
     /** L2 LLM deadline ms. Default 10000. */
     l2TimeoutMs?: number;
@@ -84,6 +97,21 @@ export interface Config {
     l2MinCluster?: number;
     /** Whether L1 retries LLM-degraded episodes (extracted=2) on later passes. Default false. */
     l1RetryDegraded?: boolean;
+    /** M5: session idle (min) before the LLM settle upgrades its episode. Default 30. */
+    l0IdleMinutes?: number;
+    /** M5: idle-settle check cadence (min). Default 5. */
+    checkMinutes?: number;
+    /** M8: peak-hour LLM suppression windows ("HH:MM", same-day). Default Beijing 09–12 / 14–18. */
+    suppressWindows?: {
+        start: string;
+        end: string;
+    }[];
+    /** M8: also suppress for these minutes before each window opens. Default 15. */
+    suppressLeadMinutes?: number;
+    /** M8: timezone the suppression windows are expressed in. Default 'Asia/Shanghai'. */
+    timeZone?: string;
+    /** M9: inject constant soul.md / user.md identity sections. Default true. */
+    enableIdentity?: boolean;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;

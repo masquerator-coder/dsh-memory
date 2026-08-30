@@ -93,6 +93,14 @@ export declare class MemoryStore {
         toolsUsed?: string;
         topic?: string;
     }): Episode;
+    getEpisode(id: string): Episode | undefined;
+    /** M5: freshest episode of a session (for session-level LLM consolidation to
+     *  overwrite the last pending rule summary, avoiding per-turn episode pileup). */
+    lastEpisodeForSession(sessionId: string): Episode | undefined;
+    /** M5: overwrite an episode's summary + timestamp (keeps FTS in sync; used by
+     *  the idle session-consolidation pass to upgrade a rule snapshot to a full
+     *  session-level LLM summary without duplicating rows). */
+    replaceEpisodeSummary(id: string, summary: string): boolean;
     listEpisodes(filter?: {
         includeArchived?: boolean;
     }): Episode[];
@@ -118,11 +126,16 @@ export declare class MemoryStore {
     }): Episode[];
     /** Record L1 processing state on an episode (0 untouched → 1 extracted → 2 degraded-skip). */
     markEpisodeExtracted(id: string, status: 1 | 2): void;
-    /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates. */
+    /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates.
+     *  M7 (2026-08-30): when `incremental` is set, a cluster whose topic has been
+     *  LLM-audited before (l2_refined) AND has no member updated since is skipped —
+     *  the stable-cluster zero-LLM case. Facts carry `updated` so the caller can
+     *  judge change without a second query. */
     semanticClusters(opts?: {
         min?: number;
         limit?: number;
         includeLowQuality?: boolean;
+        incremental?: boolean;
     }): {
         seedId: string;
         topic: string;
@@ -131,6 +144,7 @@ export declare class MemoryStore {
             content: string;
             kind?: Kind;
             importance?: Importance;
+            updated: number;
         }[];
     }[];
     /** Append one L1/L2 LLM-decision audit row (degraded runs record null route). */
@@ -146,6 +160,10 @@ export declare class MemoryStore {
      *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
      *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
     refineAttemptCount(sourceId: string): number;
+    /** M7: last LLM-audit timestamp for a topic cluster (undefined = never audited → audit). */
+    l2RefinedTs(topic: string): number | undefined;
+    /** M7: record that a topic cluster was LLM-audited at `ts` (idempotent upsert). */
+    upsertL2Refined(topic: string, ts?: number): void;
     recordFailure(memoryId: string, oldContent: string, newContent: string): void;
     failureTrail(): {
         memoryId: string;

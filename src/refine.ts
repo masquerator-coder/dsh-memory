@@ -59,6 +59,53 @@ export function resolveRefineRoute(
   return null
 }
 
+/** One bounded peak-hour suppression window ("HH:MM" start/end, same-day). */
+export interface SuppressWindow { start: string; end: string }
+
+/** M8: peak-hour suppression config (API peak/valley pricing — skip LLM burn
+ *  during expensive windows). orthogonal to idle: gating is pure time, not
+ *  activity. Same-day windows only (a window that crosses midnight is not
+ *  supported — split it into two entries). */
+export interface SuppressCfg {
+  suppressWindows: SuppressWindow[]
+  suppressLeadMinutes: number
+  timeZone: string
+}
+
+/** M8: true when `now` (in cfg.timeZone) falls inside any suppression window or
+ *  the `suppressLeadMinutes` immediately before one. Pure — no I/O, testable. */
+export function isSuppressedRaw(now: Date, cfg: SuppressCfg, tzHour: number, tzMinute: number): boolean {
+  const mins = tzHour * 60 + tzMinute
+  const lead = cfg.suppressLeadMinutes ?? 0
+  for (const w of cfg.suppressWindows) {
+    const [sh, sm] = String(w.start).split(':').map(Number)
+    const [eh, em] = String(w.end).split(':').map(Number)
+    if (!Number.isFinite(sh) || !Number.isFinite(eh)) continue
+    const start = sh * 60 + (Number.isFinite(sm) ? sm : 0)
+    const end = eh * 60 + (Number.isFinite(em) ? em : 0)
+    if (mins >= start - lead && mins < end) return true
+  }
+  return false
+}
+
+/** M8: resolve hour/minute in cfg.timeZone then delegate to {@link isSuppressedRaw}.
+ *  Falls back to UTC wall-clock on an unknown/invalid timeZone. */
+export function isSuppressed(now: Date, cfg: SuppressCfg): boolean {
+  if (!cfg.suppressWindows || cfg.suppressWindows.length === 0) return false
+  let hour = now.getUTCHours()
+  let minute = now.getUTCMinutes()
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', { timeZone: cfg.timeZone, hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(now)
+    for (const p of parts) {
+      if (p.type === 'hour') hour = Number(p.value)
+      if (p.type === 'minute') minute = Number(p.value)
+    }
+  } catch {
+    /* unknown timeZone → keep UTC wall-clock; caller still gets a deterministic gate */
+  }
+  return isSuppressedRaw(now, cfg, hour, minute)
+}
+
 
 /** One stable fact extracted from an episode by L1. */
 export interface ExtractedFact {
@@ -209,6 +256,9 @@ export interface RefineInput {
   retryDegraded?: boolean
   sessionId?: string
   limit?: number
+  /** M7: only audit clusters whose members changed since the last audit (zero-LLM
+   *  for stable clusters). Accepts `runRefineSession` and other callers. */
+  incremental?: boolean
 }
 
 /**
@@ -317,7 +367,7 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
   const stats = { clusters: 0, degraded: 0, verdictsApplied: 0, runIds: [] as number[] }
   if (!input.llm || !input.provider || !input.model) return stats
   const route = `${input.provider}/${input.model}`
-  const clusters = store.semanticClusters({ min: input.minCluster ?? 2, limit: input.limit ?? REFINE_BATCH_LIMIT })
+  const clusters = store.semanticClusters({ min: input.minCluster ?? 2, limit: input.limit ?? REFINE_BATCH_LIMIT, incremental: input.incremental === true })
   for (const cluster of clusters) {
     try {
       const prompt = buildL2Prompt(cluster.facts)
@@ -358,6 +408,9 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
       stats.clusters += 1
       stats.verdictsApplied += applied.length
       stats.runIds.push(runId) // P2-30: keep the real audit row id on the success path (was hard-coded 0)
+      // M7: mark this topic audited at now — a degraded/failed pass does NOT
+      // record, so the cluster stays eligible once the LLM recovers.
+      store.upsertL2Refined(cluster.topic)
     } catch {
       stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' }))
       stats.clusters += 1

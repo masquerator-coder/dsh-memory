@@ -649,6 +649,30 @@ export class MemoryStore {
     return ep
   }
 
+  getEpisode(id: string): Episode | undefined {
+    const r = this.db.prepare('SELECT * FROM episodes WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return r ? this.rowToEpisode(r) : undefined
+  }
+
+  /** M5: freshest episode of a session (for session-level LLM consolidation to
+   *  overwrite the last pending rule summary, avoiding per-turn episode pileup). */
+  lastEpisodeForSession(sessionId: string): Episode | undefined {
+    const r = this.db.prepare(
+      'SELECT * FROM episodes WHERE session_id = ? AND archived = 0 ORDER BY ts DESC, rowid DESC LIMIT 1',
+    ).get(sessionId) as Record<string, unknown> | undefined
+    return r ? this.rowToEpisode(r) : undefined
+  }
+
+  /** M5: overwrite an episode's summary + timestamp (keeps FTS in sync; used by
+   *  the idle session-consolidation pass to upgrade a rule snapshot to a full
+   *  session-level LLM summary without duplicating rows). */
+  replaceEpisodeSummary(id: string, summary: string): boolean {
+    const cur = this.getEpisode(id)
+    if (!cur) return false
+    this.writeEpisode(id, { ...cur, summary: summary.trim(), ts: Date.now() })
+    return true
+  }
+
   listEpisodes(filter: { includeArchived?: boolean } = {}): Episode[] {
     const clauses: string[] = ['1=1']
     if (filter.includeArchived !== true) clauses.push('archived = 0')
@@ -758,20 +782,29 @@ export class MemoryStore {
     this.db.prepare('UPDATE episodes SET extracted = ? WHERE id = ?').run(status, id)
   }
 
-  /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates. */
+  /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates.
+   *  M7 (2026-08-30): when `incremental` is set, a cluster whose topic has been
+   *  LLM-audited before (l2_refined) AND has no member updated since is skipped —
+   *  the stable-cluster zero-LLM case. Facts carry `updated` so the caller can
+   *  judge change without a second query. */
   semanticClusters(
-    opts: { min?: number; limit?: number; includeLowQuality?: boolean } = {},
-  ): { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] {
+    opts: { min?: number; limit?: number; includeLowQuality?: boolean; incremental?: boolean } = {},
+  ): { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance; updated: number }[] }[] {
     const min = opts.min ?? 2
-    const byTopic = new Map<string, { id: string; content: string; kind?: Kind; importance?: Importance }[]>()
+    const byTopic = new Map<string, { id: string; content: string; kind?: Kind; importance?: Importance; updated: number }[]>()
     for (const e of this.list({ includeArchived: false, includeLowQuality: opts.includeLowQuality === true })) {
       const arr = byTopic.get(e.topic) ?? []
-      arr.push({ id: e.id, content: e.content, kind: e.kind, importance: e.importance })
+      arr.push({ id: e.id, content: e.content, kind: e.kind, importance: e.importance, updated: e.updated })
       byTopic.set(e.topic, arr)
     }
-    const out: { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] = []
+    const out: { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance; updated: number }[] }[] = []
     for (const [topic, facts] of byTopic) {
-      if (facts.length >= min) out.push({ seedId: facts[0].id, topic, facts: facts.slice(0, MAX_FACTS_PER_CLUSTER) })
+      if (facts.length < min) continue
+      if (opts.incremental) {
+        const refinedAt = this.l2RefinedTs(topic)
+        if (refinedAt !== undefined && facts.every(f => f.updated <= refinedAt)) continue
+      }
+      out.push({ seedId: facts[0].id, topic, facts: facts.slice(0, MAX_FACTS_PER_CLUSTER) })
     }
     out.sort((a, b) => b.facts.length - a.facts.length)
     return (opts.limit && opts.limit > 0) ? out.slice(0, opts.limit) : out
@@ -799,6 +832,19 @@ export class MemoryStore {
   refineAttemptCount(sourceId: string): number {
     const r = this.db.prepare('SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ?').get(sourceId) as { c: number }
     return Number(r.c)
+  }
+
+  /** M7: last LLM-audit timestamp for a topic cluster (undefined = never audited → audit). */
+  l2RefinedTs(topic: string): number | undefined {
+    const r = this.db.prepare('SELECT refined_at AS r FROM l2_refined WHERE topic = ?').get(topic) as { r: number } | undefined
+    return r ? Number(r.r) : undefined
+  }
+
+  /** M7: record that a topic cluster was LLM-audited at `ts` (idempotent upsert). */
+  upsertL2Refined(topic: string, ts = Date.now()): void {
+    this.db.prepare(
+      'INSERT INTO l2_refined(topic, refined_at) VALUES (?, ?) ON CONFLICT(topic) DO UPDATE SET refined_at = excluded.refined_at',
+    ).run(topic, ts)
   }
 
   // ---- correction trail ----------------------------------------------------

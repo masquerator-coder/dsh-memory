@@ -28,3 +28,7 @@ export declare function sanitizeText(raw: string, cap?: number): string;
 export declare function buildSection(store: MemoryStore, opts?: {
     importanceThreshold?: number;
 }): SectionBuild;
+/** Build an identity section from `<storeDir>/<file>` (e.g. soul.md / user.md).
+ *  Missing/empty file → empty section (host omits it). File text is declared as
+ *  data, not instructions (same untrusted-content rule as the tier0 section). */
+export declare function buildIdentitySection(dir: string, file: string, label: string): SectionBuild;

@@ -10,15 +10,26 @@
  * `refine_runs`); the core store/recall/forget loop is zero-LLM (pure functions
  * + rule-based), so it never degrades when the host LLM is unavailable. Routes
  * for the background passes auto-resolve when not configured explicitly.
+ *
+ * M5–M9 (2026-08-30, see docs/REFINE-REDESIGN.md):
+ *   M5 L0 session settle  — turn-end keeps realtime RULE summaries (zero LLM);
+ *                           the LLM upgrade is deferred to an idle-settle pass
+ *                           (one call per session after l0IdleMinutes idle).
+ *   M6 L1 event kick      — a new episode schedules a short-delay refine pass;
+ *                           the periodic timer remains as a fallback.
+ *   M7 L2 incremental     — clusters whose members changed since the last
+ *                           audit are the only ones re-LLM'd (l2_refined).
+ *   M8 peak-hour gate     — L1/L2 LLM passes skip during suppressWindows.
+ *   M9 identity blocks    — constant soul.md / user.md sections, KV friendly.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome } from './store.js'
-import { buildSection } from './inject.js'
+import { buildIdentitySection, buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
-import { isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
-import { resolveRefineRoute, runRefineL1, runRefineL2 } from './refine.js'
+import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
+import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
 import type { ForgetDays } from './types.js'
 
 /**
@@ -54,30 +65,32 @@ export interface Config {
   episodeRetentionDays?: number
   /** Observation window (days) between archive and hard-delete. Default 30. */
   forgetObserveDays?: number
-  /** L0 episodic condensation mode: 'llm' (default, with rule fallback) | 'rules' (pure). */
+  /** L0 episodic condensation mode: 'llm' (default = idle-settle LLM upgrade) | 'rules' (pure). */
   l0Summarize?: 'rules' | 'llm'
   /** Optional explicit LLM route pair for L0 (must be set together). */
   l0Provider?: string
   l0Model?: string
-  /** L0 LLM output-token cap. Default 400. */
+  /** L0 output-token cap. Default 400. */
   l0MaxTokens?: number
   /** L0 LLM deadline ms. Default 8000. */
   l0TimeoutMs?: number
-  /** L1 episodic→semantic extraction (LLM-decided). Default true (idiot-proof install). */
+  /** L1 episodic→semantic extraction (LLM-decided). Default true. */
   l1Enabled?: boolean
   /** L2 semantic merge/arbitration (LLM-decided). Default true. */
   l2Enabled?: boolean
+  /** M7: only re-LLM a cluster whose members changed since last audit. Default true. */
+  l2Incremental?: boolean
   /** Explicit route pair for L1. Optional: auto-resolves (learned session route → host default model). */
   l1Provider?: string
   l1Model?: string
-  /** L1 LLM output-token cap. Default 800. */
+  /** L1 output-token cap. Default 800. */
   l1MaxTokens?: number
   /** L1 LLM deadline ms. Default 10000. */
   l1TimeoutMs?: number
   /** Explicit route pair for L2 (same as L1: explicit when enabled). */
   l2Provider?: string
   l2Model?: string
-  /** L2 LLM output-token cap. Default 800. */
+  /** L2 output-token cap. Default 800. */
   l2MaxTokens?: number
   /** L2 LLM deadline ms. Default 10000. */
   l2TimeoutMs?: number
@@ -87,6 +100,18 @@ export interface Config {
   l2MinCluster?: number
   /** Whether L1 retries LLM-degraded episodes (extracted=2) on later passes. Default false. */
   l1RetryDegraded?: boolean
+  /** M5: session idle (min) before the LLM settle upgrades its episode. Default 30. */
+  l0IdleMinutes?: number
+  /** M5: idle-settle check cadence (min). Default 5. */
+  checkMinutes?: number
+  /** M8: peak-hour LLM suppression windows ("HH:MM", same-day). Default Beijing 09–12 / 14–18. */
+  suppressWindows?: { start: string; end: string }[]
+  /** M8: also suppress for these minutes before each window opens. Default 15. */
+  suppressLeadMinutes?: number
+  /** M8: timezone the suppression windows are expressed in. Default 'Asia/Shanghai'. */
+  timeZone?: string
+  /** M9: inject constant soul.md / user.md identity sections. Default true. */
+  enableIdentity?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -114,6 +139,7 @@ export const Config: z<Config> = z.object({
   l0TimeoutMs: z.number(),
   l1Enabled: z.boolean(),
   l2Enabled: z.boolean(),
+  l2Incremental: z.boolean(),
   l1Provider: z.string(),
   l1Model: z.string(),
   l1MaxTokens: z.number(),
@@ -125,6 +151,12 @@ export const Config: z<Config> = z.object({
   refineIntervalMs: z.number(),
   l2MinCluster: z.number(),
   l1RetryDegraded: z.boolean(),
+  l0IdleMinutes: z.number(),
+  checkMinutes: z.number(),
+  suppressWindows: z.array(z.object({ start: z.string(), end: z.string() })),
+  suppressLeadMinutes: z.number(),
+  timeZone: z.string(),
+  enableIdentity: z.boolean(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -132,6 +164,8 @@ const FORGET_FIRST_DELAY_MS = 5 * 60 * 1000 // 5 min after boot
 /** Cap on in-flight L0 condensation runs (P1-10): a slow LLM summary must not
  *  stack unboundedly across turns. */
 const L0_MAX_INFLIGHT = 4
+/** M6: fresh-episode refine kick delay (ms) — near-immediate, not the 1h timer. */
+const REFINE_KICK_DELAY_MS = 10_000
 
 export function apply(ctx: Context, config: Config = {}): void {
   const store = new MemoryStore(
@@ -155,6 +189,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l0TimeoutMs = config.l0TimeoutMs ?? 8000
   const l1Enabled = config.l1Enabled ?? true
   const l2Enabled = config.l2Enabled ?? true
+  const l2Incremental = config.l2Incremental ?? true
   const l1MaxTokens = config.l1MaxTokens ?? 800
   const l1TimeoutMs = config.l1TimeoutMs ?? 10000
   const l2MaxTokens = config.l2MaxTokens ?? 800
@@ -162,10 +197,21 @@ export function apply(ctx: Context, config: Config = {}): void {
   const refineIntervalMs = config.refineIntervalMs ?? 3600_000
   const l2MinCluster = config.l2MinCluster ?? 2
   const l1RetryDegraded = config.l1RetryDegraded ?? false
+  // M5 / M8 / M9
+  const l0IdleMinutes = config.l0IdleMinutes ?? 30
+  const checkMinutes = config.checkMinutes ?? 5
+  const enableIdentity = config.enableIdentity ?? true
+  const suppressCfg: SuppressCfg = {
+    suppressWindows: config.suppressWindows ?? [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
+    suppressLeadMinutes: config.suppressLeadMinutes ?? 15,
+    timeZone: config.timeZone ?? 'Asia/Shanghai',
+  }
 
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let refineTimer: ReturnType<typeof setTimeout> | undefined
+  let refineKick: ReturnType<typeof setTimeout> | undefined
+  let settleTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): void => {
     if (disposed) return
@@ -196,6 +242,19 @@ export function apply(ctx: Context, config: Config = {}): void {
         name: 'memory:tier0',
         order: 10,
         text: () => buildSection(store, { importanceThreshold }).text,
+      })
+    }
+    // M9: constant identity blocks (soul.md / user.md) — mtime-cached, KV friendly.
+    if (enableIdentity) {
+      ctx.systemPrompt.section({
+        name: 'memory:soul',
+        order: 11,
+        text: () => buildIdentitySection(store.dir, 'soul.md', 'AI 本人').text,
+      })
+      ctx.systemPrompt.section({
+        name: 'memory:user',
+        order: 12,
+        text: () => buildIdentitySection(store.dir, 'user.md', '用户画像').text,
       })
     }
     registerMemoryTools(ctx, store, { epistemicWeighting })
@@ -229,36 +288,56 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       : undefined
     let l0InFlight = 0
+
+    // M5: per-session pending LLM settle bookkeeping (activity timestamp + buffered
+    // turn texts). Idle-settle upgrades the freshest rule episode with one LLM call.
+    const l0Pending = new Map<string, { lastActivity: number; texts: string[] }>()
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
       if (l0InFlight >= L0_MAX_INFLIGHT) return // P1-10: cap concurrent condensation
+      const turn = (event.data as { turn?: number } | null | undefined)?.turn
       // Resolve the model route (plan 2: auto from the session's request header).
       const cfg = session.requestHeader()?.config
       if (cfg?.provider && cfg?.model) {
         learned.provider = cfg.provider
         learned.model = cfg.model
       }
+      // Realtime RULE summary (zero LLM) — keeps the episodic trace live while the
+      // conversation runs; the LLM upgrade is deferred to the idle-settle pass.
       const provider = config.l0Provider ?? cfg?.provider
       const model = config.l0Model ?? cfg?.model
       l0InFlight += 1
       void runL0(store, {
         events: session.events as readonly unknown[],
-        turn: (event.data as { turn?: number } | null | undefined)?.turn,
-        summarize: l0Summarize,
-        llm: llmSeam,
-        provider,
-        model,
-        maxTokens: l0MaxTokens,
-        timeoutMs: l0TimeoutMs,
-        signal: undefined,
+        turn,
+        summarize: 'rules', // M5: turn-end never burns LLM — settle does
         sessionId: session.id,
-        toolsUsed: undefined,
-        topic: undefined,
-        // P2-7: program errors (disk full, closed DB) must leave a trace — a bare
-        // `null` looks identical to "nothing worth remembering this turn".
+        // P2-7: program errors (disk full, closed DB) must leave a trace.
         onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
       }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
+
+      // Buffer this turn's texts for the idle LLM settle (bounded to last 200).
+      if (session.id) {
+        const texts = collectTurnTexts(session.events, turn)
+        const prev = l0Pending.get(session.id)
+        l0Pending.set(session.id, {
+          lastActivity: Date.now(),
+          texts: (prev ? prev.texts : []).concat(texts).slice(-200),
+        })
+      }
+      kickRefine() // M6: a fresh realtime episode → L1 extraction in ~10s
     })
+
+    // M6: a fresh episode (written above) schedules a short-delay refine pass so
+    // L1/L2 react in ~10s, not the next 1h timer. Latched; never double-fires.
+    const kickRefine = (): void => {
+      if (disposed || refineKick) return
+      refineKick = setTimeout(() => {
+        refineKick = undefined
+        void runRefine()
+      }, REFINE_KICK_DELAY_MS)
+      refineKick.unref?.()
+    }
 
     // L1/L2 refinement: unified background timer (no per-turn cost). Runs on the
     // same seam; explicit route (l1/l2Provider/model, falling back to l0 route)
@@ -269,6 +348,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed || refining) return
       refining = true
       try {
+        // M8: peak-hour gate — skip LLM burn during expensive windows; the
+        // periodic scan re-evaluates later. (Zero-token passes unaffected.)
+        if (isSuppressed(new Date(), suppressCfg)) return
         if (l1Enabled) {
           const l1Route = resolveRefineRoute(
             (config.l1Provider && config.l1Model)
@@ -305,6 +387,7 @@ export function apply(ctx: Context, config: Config = {}): void {
             model: l2Route?.model,
             maxTokens: l2MaxTokens, timeoutMs: l2TimeoutMs,
             minCluster: l2MinCluster,
+            incremental: l2Incremental, // M7
           })
         }
       } catch (err) {
@@ -322,13 +405,60 @@ export function apply(ctx: Context, config: Config = {}): void {
       refineTimer.unref() // P1-11: don't hold the event loop for the background pass
     }
 
+    // M5: idle-settle check loop — scans pending sessions each checkMinutes and
+    // upgrades those idle ≥ l0IdleMinutes with a single LLM consolidation call.
+    const runSettle = (): void => {
+      if (disposed) return
+      const now = Date.now()
+      const idleMs = l0IdleMinutes * 60 * 1000
+      for (const [sid, p] of l0Pending) {
+        if (now - p.lastActivity < idleMs) continue
+        l0Pending.delete(sid)
+        if (l0Summarize !== 'llm') continue // pure-rule mode: rule summary already live
+        const route = resolveRefineRoute(
+          (config.l0Provider && config.l0Model)
+            ? { provider: config.l0Provider, model: config.l0Model }
+            : undefined,
+          learned,
+          hostDefault,
+        )
+        if (!route) continue
+        if (l0InFlight >= L0_MAX_INFLIGHT) continue
+        l0InFlight += 1
+        void condenseSession(store, {
+          texts: p.texts,
+          llm: llmSeam,
+          provider: route.provider,
+          model: route.model,
+          maxTokens: l0MaxTokens,
+          timeoutMs: l0TimeoutMs,
+          sessionId: sid,
+        }).finally(() => {
+          l0InFlight -= 1
+          kickRefine() // M6: a settled session-level episode → L1 extraction soon
+        }).catch(() => { /* never breaks the idle loop */ })
+      }
+    }
+    const scheduleSettle = (): void => {
+      if (disposed) return
+      settleTimer = setTimeout(() => {
+        settleTimer = undefined
+        runSettle()
+        scheduleSettle()
+      }, checkMinutes * 60 * 1000)
+      settleTimer.unref?.() // P1-11: don't hold the event loop
+    }
+
     scheduleForget(FORGET_FIRST_DELAY_MS)
     scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
+    scheduleSettle() // M5: idle-settle loop (every checkMinutes)
     return () => {
       disposed = true
       l0Dispose()
       if (timer) clearTimeout(timer)
       if (refineTimer) clearTimeout(refineTimer)
+      if (refineKick) clearTimeout(refineKick)
+      if (settleTimer) clearTimeout(settleTimer)
       store.close()
     }
   })

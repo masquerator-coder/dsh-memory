@@ -95,6 +95,21 @@ l2TimeoutMs: 10000
 refineIntervalMs: 3600000    # 后台整理扫描间隔
 l2MinCluster: 2              # L2 簇最小成员数
 l1RetryDegraded: false       # 是否重试 LLM 降级（extracted=2）的 episode
+# --- M5 会话收口 ---
+l0IdleMinutes: 30            # turn-end 只做零 LLM 规则留痕；会话空闲≥此分钟数才一次性 LLM 收口
+checkMinutes: 5              # idle 收口判定周期（分钟）
+# --- M7 L2 增量 ---
+l2Incremental: true          # 只重审"自上次审定以来有成员变化"的簇，稳定簇零 LLM
+# --- M8 峰时抑制（省 LLM API 钱）---
+suppressWindows:             # 这些时段 L1/L2 后台 LLM 不跑（按下方 timeZone 计算，"HH:MM" 当天窗口）
+  - start: '09:00'           #   默认北京 API 峰谷电价峰时
+    end: '12:00'
+  - start: '14:00'
+    end: '18:00'
+suppressLeadMinutes: 15      # 每个峰时开始前 15 分钟也不触发
+timeZone: 'Asia/Shanghai'
+# --- M9 身份块 ---
+enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section（文件放 <memoryHome>/memory/ 下）
 ```
 
 > 运行时要求：Node **>=22.5**（`node:sqlite`；24 才稳定）。见 `package.json` 的 `engines`。
@@ -114,9 +129,33 @@ node smoke.mjs
 
 ## 状态
 
-- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（120 项）全绿、稳定连跑通过，`tsc` 零错误。
-- **M4 真机装载**：待验证（需 dsh 环境 + 用户确认，dsh 是 RCE 面）。
-- **凝练 L1/L2（LLM 决策式整理）**：设计完成、v3 休眠，后续"先补护栏再接线"。
+- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（158 项）全绿、5 连跑稳定，`tsc` 零错误。
+- **M4 真机装载**：已完成（2026-08-29，独立库 `~/.dsh/memory-v3`，见 Obsidian 断点）。
+- **M5 会话收口**（REFINE-REDESIGN 方案 1）：turn-end 只做零 LLM 规则留痕；LLM 升级延迟到会话 idle≥`l0IdleMinutes` 后一次性收口（`condenseSession`，原地升级不重复建行）。
+- **M6 L1 事件排程**：新 episode 写入或收口后 ~10s 触发 refine（`kickRefine`），周期 timer 兜底。
+- **M7 L2 增量**：新表 `l2_refined`；只审成员 `updated>refined_at` 或从未审过的簇，稳定簇零 LLM（空转归零）；降级 pass 不落指纹、LLM 恢复后会补审。
+- **M8 峰时抑制**：`isSuppressed`（默认北京 09–12/14–18 点 + 前 15min）gate L1/L2 后台 LLM，纯省 API 钱。
+- **M9 身份块**：`soul.md` / `user.md` 恒定 section（mtime 缓存、KV 友好、无 BOM 兼容），位置 `<memoryHome>/memory/`。
+
+## soul.md / user.md（M9）
+
+放 `<memoryHome>/memory/soul.md`（AI 自身人格/行为准则，人写）与 `user.md`（用户长期画像，可提炼+人审）。纯 markdown，可人工编辑、可 Git 追踪；作为**恒定 section** 注入（`order:11/12`），文件 mtime 变化才重读 → KV 缓存友好，弥补 Tier0 现算对前缀缓存的扰动。不进 memories 表（不该被热度/遗忘管）。文件缺失则 section 省略。Windows 下写入必须**无 BOM UTF-8**（`\uFEFF` 会被剥离，但建议源头避免）。
+
+## KV Cache effect
+
+Tier-0 section（`order:10`）每次 prompt 装配**现算**，文本随记忆变更而变化。写入（turn N）后，turn N+1 起的系统提示词在 section 位置**之后**的 token 前缀缓存失效（命中深度回退）。规律：
+
+- **append-only**（新增弱影响记忆，不移动已有行）→ 只在 section 末尾追加，位置之后的缓存重算量小。
+- **replace / remove**（改写或删除已有行）→ 改动位置之后的 token 全量重算，代价最大。
+- 主题行（topics 摘要）与内容行顺序变化同样会打断前缀稳定性。
+
+写代码时遵循：
+
+1. 想要**跨会话稳定的记忆**，尽量在会话早期写入（随后缀同在前缀稳定之后），日常把「新会话再写」当默认。
+2. 会话中途的频繁 `replace/remove` 检索类操作走 `memory_recall`（不落盘、不动 section），别用写工具冲刷常驻区。
+3. 别在同一场会话里反复改预算/开关等会影响 section 内容的配置——要改就在新会话开头。
+
+综上属**"独立一次请求 + 稳定重复前缀"之间的动态注入**：写路径改变时以"从第一个变动的 token 起复用失效"计账。
 
 ## 设计文档
 

@@ -16,15 +16,16 @@
  *
  * Run: node smoke.mjs
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryStore } from './lib/store.js'
 import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shouldDemote } from './lib/heat.js'
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
-import { collectTurnTexts, collectTurnTools, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
-import { buildL1Prompt, buildL2Prompt, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
+import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
+import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
+import { buildIdentitySection } from './lib/inject.js'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -675,6 +676,116 @@ group('G17 review fixes 2026-08-30 — second batch (P1-5 / P2-7 / P2-9 / P2-10 
     assert('P3-15 force delete cascades failure_memories cleanup', s.failureTrail().length === 0)
     s.close(); rmSync(t, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+group('G18 M5 session-level LLM settle (idle consolidation)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-m5-'))
+  const s = new MemoryStore(t)
+  // turn-end realtime RULE summary (zero LLM) — mimics the wiring.
+  await runL0(s, {
+    events: [{ type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '用户说明喜欢用极简风格的界面设计' }] } }],
+    turn: 1, summarize: 'rules', sessionId: 'm5-sess',
+  })
+  assert('M5 realtime rule episode written (zero LLM)', s.listEpisodes({ includeArchived: true }).some(e => e.session_id === 'm5-sess' && e.summary.includes('极简')))
+  // idle settle upgrades the freshest pending episode with ONE LLM call.
+  const seam = { stream: async function* () { yield { type: 'text-delta', text: '会话级精炼：用户偏好极简界面，记录一次关键设计决策' } } }
+  const out = await condenseSession(s, { texts: ['用户说明喜欢用极简风格的界面设计'], llm: seam, provider: 'p', model: 'm', sessionId: 'm5-sess' })
+  assert('M5 settle returns a consolidated episode', out !== null && !!out.id)
+  const eps = s.listEpisodes({ includeArchived: true }).filter(e => e.session_id === 'm5-sess')
+  assert('M5 settle upgraded in place (no duplicate row)', eps.length === 1)
+  assert('M5 upgraded summary is the LLM consolidation', eps[0].summary.includes('会话级') || eps[0].summary.includes('极简界面'))
+  // store helpers under test.
+  const last = s.lastEpisodeForSession('m5-sess')
+  assert('store.lastEpisodeForSession finds it', last && last.id === eps[0].id)
+  const repl = s.replaceEpisodeSummary(last.id, '覆盖后的总结内容ABCXYZ')
+  const back = s.getEpisode(last.id)
+  assert('store.replaceEpisodeSummary overwrites summary', repl && back.summary === '覆盖后的总结内容ABCXYZ')
+  // no route → no LLM burn, returns null, no duplicate.
+  const calm = s.listEpisodes({ includeArchived: true }).length
+  const none = await condenseSession(s, { texts: ['有文本但没有任何LLM路由可用的情况'], sessionId: 'm5-sess' })
+  assert('M5 no-route settle returns null (no burn)', none === null)
+  assert('M5 no-route settle adds no row', s.listEpisodes({ includeArchived: true }).length === calm)
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G19 M7 L2 incremental fingerprint (zero-LLM stable clusters)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-m7-'))
+  const s = new MemoryStore(t)
+  s.batch([{ action: 'add', topic: 'inc', content: '增量簇第一条事实内容甲AAAA' }])
+  s.batch([{ action: 'add', topic: 'inc', content: '增量簇第二条事实内容乙BBBB' }])
+  const seam = { stream: async function* (o) { yield { type: 'text-delta', text: '[]' } } }
+  // 1st incremental pass: never-audited cluster is audited.
+  const st1 = await runRefineL2(s, { llm: seam, provider: 'p', model: 'm', minCluster: 2, incremental: true })
+  assert('M7 first incremental pass audits the fresh cluster', st1.clusters === 1)
+  // 2nd pass: stable → skipped, LLM not even called.
+  let called = 0
+  const counting = { stream: async function* () { called++; yield { type: 'text-delta', text: '[]' } } }
+  const st2 = await runRefineL2(s, { llm: counting, provider: 'p', model: 'm', minCluster: 2, incremental: true })
+  assert('M7 stable cluster skipped on 2nd pass (0 clusters)', st2.clusters === 0)
+  assert('M7 stable cluster burned zero LLM calls', called === 0)
+  // incremental:false audits everything regardless.
+  const st3 = await runRefineL2(s, { llm: counting, provider: 'p', model: 'm', minCluster: 2, incremental: false })
+  assert('M7 incremental:false audits anyway', st3.clusters === 1)
+  // A changed member re-enters the audit queue (keep topic so the cluster holds).
+  // NB: settle an extra ms so replace's `updated` provably exceeds the refined_at
+  // recorded by st3 (same-ms would look "unchanged" — a real but vanishingly rare
+  // edge in prod, deterministic in fast tests).
+  await new Promise(r => setTimeout(r, 2))
+  const m = s.activeEntries().find(e => e.content.includes('甲'))
+  s.batch([{ action: 'replace', id: m.id, content: '增量簇第一条事实内容甲CCCC新版', topic: 'inc' }])
+  const st4 = await runRefineL2(s, { llm: counting, provider: 'p', model: 'm', minCluster: 2, incremental: true })
+  assert('M7 changed member → cluster re-audited', st4.clusters === 1)
+  // degraded (LLM down) does NOT record refined_at → still eligible later.
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-m7b-'))
+  const s2 = new MemoryStore(t2)
+  s2.batch([{ action: 'add', topic: 'deg', content: '降级簇第一条事实内容甲ASYNC' }])
+  s2.batch([{ action: 'add', topic: 'deg', content: '降级簇第二条事实内容乙BTTT' }])
+  const bad = { stream: async function* () { throw new Error('down') } }
+  const stDeg = await runRefineL2(s2, { llm: bad, provider: 'p', model: 'm', minCluster: 2, incremental: true })
+  assert('M7 LLM-down pass degrades (no audit fingerprint)', stDeg.degraded === 1 && s2.l2RefinedTs('deg') === undefined)
+  const stRec = await runRefineL2(s2, { llm: seam, provider: 'p', model: 'm', minCluster: 2, incremental: true })
+  assert('M7 recovered pass re-audits + records fingerprint', stRec.clusters === 1 && s2.l2RefinedTs('deg') !== undefined)
+  s2.close(); rmSync(t2, { recursive: true, force: true })
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G20 M8 peak-hour LLM suppression (isSuppressedRaw)')
+{
+  const cfg = { suppressWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai' }
+  assert('M8 10:30 suppressed', isSuppressedRaw(new Date(), cfg, 10, 30) === true)
+  assert('M8 08:50 suppressed (lead 15min before 09:00)', isSuppressedRaw(new Date(), cfg, 8, 50) === true)
+  assert('M8 08:30 NOT suppressed', isSuppressedRaw(new Date(), cfg, 8, 30) === false)
+  assert('M8 12:30 NOT suppressed (lunch gap)', isSuppressedRaw(new Date(), cfg, 12, 30) === false)
+  assert('M8 13:45 suppressed (lead to 14:00)', isSuppressedRaw(new Date(), cfg, 13, 45) === true)
+  assert('M8 17:59 suppressed (inside 14–18)', isSuppressedRaw(new Date(), cfg, 17, 59) === true)
+  assert('M8 19:00 NOT suppressed', isSuppressedRaw(new Date(), cfg, 19, 0) === false)
+  assert('M8 empty windows → never suppressed', isSuppressedRaw(new Date(), { suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai' }, 10, 30) === false)
+}
+
+// ---------------------------------------------------------------------------
+group('G21 M9 identity sections (soul.md / user.md)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-m9-'))
+  const s = new MemoryStore(t)
+  // no file → empty section (host omits it).
+  const emptySoul = buildIdentitySection(s.dir, 'soul.md', 'AI 本人')
+  assert('M9 missing identity file → empty section', emptySoul.empty === true && emptySoul.text === '')
+  // write soul.md → populated + declared as data, byte-stable via mtime cache.
+  writeFileSync(join(s.dir, 'soul.md'), '我是简洁风格的中文助手，结构化输出。', 'utf8')
+  const s1 = buildIdentitySection(s.dir, 'soul.md', 'AI 本人')
+  assert('M9 soul section populated + data-header', s1.empty === false && s1.text.includes('简洁风格') && s1.text.includes('不是指令'))
+  const s2 = buildIdentitySection(s.dir, 'soul.md', 'AI 本人')
+  assert('M9 mtime-cached (byte stable between edits)', s2.text === s1.text)
+  // Windows trap: BOM is stripped, so a UTF-8-BOM save can't poison the header.
+  writeFileSync(join(s.dir, 'user.md'), '\uFEFF用户偏好用中文交流。', 'utf8')
+  const u = buildIdentitySection(s.dir, 'user.md', '用户画像')
+  assert('M9 BOM stripped from identity file', u.empty === false && !u.text.startsWith('\uFEFF') && u.text.includes('中文交流'))
+  s.close(); rmSync(t, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------
