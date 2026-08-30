@@ -128,12 +128,12 @@ identityMaxBytes: 2000       # user.md 自动追加的内容大小上限（字�
 ## 开发
 
 ```bash
-# 编译（对齐 dsh monorepo 的类型；本项目未内置 @deepseek-ai 依赖，
-# 此处路径针对 D:/Apps/deepseek-harness 布局——独立安装请把 tsconfig 的
-# paths/typeRoots 改指向本地 node_modules 中已安装的 @deepseek-ai 包。）
-node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.json          # Node 主代码
-node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.client.json  # 前端 client.tsx 类型检查
-node build.mjs                                                                           # esbuild 打包 client → lib/client.js
+# 一键构建：自动定位 deepseek-harness（DSH_HARNESS_ROOT 环境变量优先，否则
+# 探测 D:/Apps、C:/Apps、~/deepseek-harness 等常见位置），并从其 pnpm store
+# 自动探测 esbuild / @types/react / typescript 的**最高语义版本**（不硬编码
+# 版本号），随后 tsc 类型检查（Node + client）+ esbuild 打包 client。
+# 提交的 tsconfig.json / tsconfig.client.json 仅是开发机 IDE 默认；构建不用其中的硬编码。
+node build.mjs
 # 冒烟（无 dsh 也可跑，全量断言组 G1–G23）
 node smoke.mjs
 ```

@@ -34,7 +34,7 @@
     "forgetting"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node build.mjs"
+    "build": "node build.mjs"
   },
   "dsh": {
     "bundle": {
