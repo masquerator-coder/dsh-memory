@@ -23,3 +23,13 @@ export interface MaintainResult {
 export declare function maintainUserIdentity(store: MemoryStore, dir: string, opts?: {
     maxBytes?: number;
 }): MaintainResult;
+/** Read both identity files (missing file → empty string). Used by the settings
+ *  UI's identity editor over the HTTP route. */
+export declare function readIdentityFiles(dir: string): {
+    soul: string;
+    user: string;
+};
+/** Overwrite one identity file with UTF-8 (no BOM — the Windows trap). `file`
+ *  is narrowed to the two known names, so a caller cannot escape the identity
+ *  directory via path traversal. */
+export declare function writeIdentityFile(dir: string, file: 'soul' | 'user', content: string): void;

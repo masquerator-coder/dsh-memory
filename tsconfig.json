@@ -5,6 +5,7 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2023"],
     "strict": true,
+    "erasableSyntaxOnly": true,
     "noEmitOnError": true,
     "declaration": true,
     "outDir": "lib",
@@ -24,5 +25,6 @@
       "@deepseek-ai/dsh-tools": ["D:/Apps/deepseek-harness/packages/core/tools/lib/types/index.d.ts"]
     }
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/client.tsx"]
 }

@@ -26,7 +26,7 @@ import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerd
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
 import { buildIdentitySection } from './lib/inject.js'
-import { autocreateIdentityFiles, maintainUserIdentity } from './lib/identity.js'
+import { autocreateIdentityFiles, maintainUserIdentity, readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -836,6 +836,26 @@ group('G22 R3-i identity file auto-maintenance')
   assert('G22 size cap: overflowing entries skipped', cap.overflow >= 1)
   assert('G22 file bytes stay at or under cap', Buffer.byteLength(uf, 'utf8') <= 30)
   s2.close(); rmSync(t2, { recursive: true, force: true })
+}
+
+// G23 — R3-ui identity-file read/write (source of truth + no BOM + path narrowing)
+group('G23 R3-ui identity file read/write')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-r3c-'))
+  // Missing files read as empty (no throw).
+  const empty = readIdentityFiles(t)
+  assert('G23 missing files → empty strings', empty.soul === '' && empty.user === '')
+  // Write → read round-trips with no BOM.
+  writeIdentityFile(t, 'soul', '我是简洁的中文助手。')
+  writeIdentityFile(t, 'user', '用户偏好结构化输出。')
+  const r = readIdentityFiles(t)
+  assert('G23 soul round-trips', r.soul === '我是简洁的中文助手。')
+  assert('G23 user round-trips', r.user === '用户偏好结构化输出。')
+  const soulBytes = readFileSync(join(t, 'soul.md'))
+  assert('G23 written without BOM', soulBytes[0] !== 0xef && !soulBytes.toString('utf8').startsWith('\uFEFF'))
+  // The writer is narrowed to soul/user — no path escape.
+  assert('G23 write only accepts soul/user', existsSync(join(t, 'soul.md')) && existsSync(join(t, 'user.md')))
+  rmSync(t, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

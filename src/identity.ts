@@ -94,3 +94,21 @@ export function maintainUserIdentity(store: MemoryStore, dir: string, opts: { ma
   if (wrote > 0) writeFileSync(file, buf, 'utf8') // UTF-8, no BOM
   return { candidates: todo.length, wrote, overflow }
 }
+
+/** Read both identity files (missing file → empty string). Used by the settings
+ *  UI's identity editor over the HTTP route. */
+export function readIdentityFiles(dir: string): { soul: string; user: string } {
+  const read = (file: string): string => {
+    const p = join(dir, file)
+    return existsSync(p) ? stripBom(readFileSync(p, 'utf8')) : ''
+  }
+  return { soul: read('soul.md'), user: read('user.md') }
+}
+
+/** Overwrite one identity file with UTF-8 (no BOM — the Windows trap). `file`
+ *  is narrowed to the two known names, so a caller cannot escape the identity
+ *  directory via path traversal. */
+export function writeIdentityFile(dir: string, file: 'soul' | 'user', content: string): void {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, file === 'soul' ? 'soul.md' : 'user.md'), content, 'utf8')
+}

@@ -39,10 +39,24 @@ declare module '@deepseek-ai/cordis' {
                 reasoningEffort?: string;
             };
         };
+        /** dsh settings service (host-provided). Optional so the plugin still
+         *  compiles/runs where the seam is absent; when present we register the
+         *  `memory` namespace for live settings-UI configuration. */
+        settings?: {
+            register<T>(ns: string, schema: z<T>, options?: {
+                base?: Partial<T>;
+                applies?: 'live' | 'restart';
+            }): {
+                get(): T;
+                watch(callback: (next: T, prev: T) => void): () => void;
+                update(patch: object): Promise<void>;
+                replace(section: object): Promise<void>;
+            };
+        };
     }
 }
 export declare const name = "memory";
-export declare const inject: readonly ["tools", "systemPrompt", "llm", "agentDefaultModel"];
+export declare const inject: readonly ["tools", "systemPrompt", "llm", "agentDefaultModel", "settings"];
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {
     memoryHome?: string;

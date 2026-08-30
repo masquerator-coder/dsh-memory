@@ -31,6 +31,8 @@ import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
 import { autocreateIdentityFiles, IDENTITY_MAX_BYTES, maintainUserIdentity } from './identity.js'
+import { registerIdentityRoutes } from './identity-routes.js'
+import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
 import type { ForgetDays } from './types.js'
 
 /**
@@ -41,11 +43,22 @@ import type { ForgetDays } from './types.js'
 declare module '@deepseek-ai/cordis' {
   interface Context {
     agentDefaultModel?: { currentSelection(): { provider?: string; model?: string; reasoningEffort?: string } }
+    /** dsh settings service (host-provided). Optional so the plugin still
+     *  compiles/runs where the seam is absent; when present we register the
+     *  `memory` namespace for live settings-UI configuration. */
+    settings?: {
+      register<T>(ns: string, schema: z<T>, options?: { base?: Partial<T>; applies?: 'live' | 'restart' }): {
+        get(): T
+        watch(callback: (next: T, prev: T) => void): () => void
+        update(patch: object): Promise<void>
+        replace(section: object): Promise<void>
+      }
+    }
   }
 }
 
 export const name = 'memory'
-export const inject = ['tools', 'systemPrompt', 'llm', 'agentDefaultModel'] as const
+export const inject = ['tools', 'systemPrompt', 'llm', 'agentDefaultModel', 'settings'] as const
 
 /** Plugin configuration. Every field optional; defaults applied in {@link apply}. */
 export interface Config {
@@ -209,7 +222,6 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l1TimeoutMs = config.l1TimeoutMs ?? 10000
   const l2MaxTokens = config.l2MaxTokens ?? 800
   const l2TimeoutMs = config.l2TimeoutMs ?? 10000
-  const refineIntervalMs = config.refineIntervalMs ?? 3600_000
   const l2MinCluster = config.l2MinCluster ?? 2
   const l1RetryDegraded = config.l1RetryDegraded ?? false
   // M5 / M8 / M9
@@ -221,11 +233,43 @@ export function apply(ctx: Context, config: Config = {}): void {
     suppressLeadMinutes: config.suppressLeadMinutes ?? 15,
     timeZone: config.timeZone ?? 'Asia/Shanghai',
   }
-  // R3-total / R3-i
-  const enabled = config.enabled ?? true
-  const identityAuto = config.identityAuto ?? true
-  const identityIntervalMs = config.identityIntervalMs ?? 6 * 3600_000
+  // R3-total / R3-i / R3-ui — live-toggleable settings. `runtime` is the single
+  // source of truth for everything a settings page can change at runtime: seeded
+  // from cordis config and refreshed from the dsh settings document via
+  // scope.watch() below. identityMaxBytes stays a static cordis-config value
+  // (a file-size cap, not a toggle).
   const identityMaxBytes = config.identityMaxBytes ?? IDENTITY_MAX_BYTES
+  const settingsBase: MemorySettings = {
+    enabled: config.enabled ?? MEMORY_SETTINGS_DEFAULTS.enabled,
+    identityAuto: config.identityAuto ?? MEMORY_SETTINGS_DEFAULTS.identityAuto,
+    identityIntervalMs: config.identityIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.identityIntervalMs,
+    refineIntervalMs: config.refineIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.refineIntervalMs,
+    peakHourSuppress: MEMORY_SETTINGS_DEFAULTS.peakHourSuppress,
+  }
+  const runtime = { ...settingsBase }
+
+  // R3-ui: register the `memory` settings namespace when the dsh settings seam
+  // is present. The settings user layer overrides the cordis-config base; watch()
+  // pushes changes into `runtime` for live effect (no restart required).
+  const settingsScope = ctx.settings?.register<MemorySettings>('memory', memorySettingsSchema, {
+    base: settingsBase,
+    applies: 'live',
+  })
+  if (settingsScope) {
+    const seed = settingsScope.get()
+    runtime.enabled = seed.enabled
+    runtime.identityAuto = seed.identityAuto
+    runtime.identityIntervalMs = seed.identityIntervalMs
+    runtime.refineIntervalMs = seed.refineIntervalMs
+    runtime.peakHourSuppress = seed.peakHourSuppress
+    settingsScope.watch((next) => {
+      runtime.enabled = next.enabled
+      runtime.identityAuto = next.identityAuto
+      runtime.identityIntervalMs = next.identityIntervalMs
+      runtime.refineIntervalMs = next.refineIntervalMs
+      runtime.peakHourSuppress = next.peakHourSuppress
+    })
+  }
 
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -235,7 +279,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   let identityTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): void => {
-    if (disposed) return
+    if (disposed || !runtime.enabled) return
     try {
       store.forgetRun({
         forgetDays: config.forgetDays,
@@ -258,28 +302,34 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   ctx.effect(() => {
-    // R3-i: ensure the auto-maintained identity files exist (empty shells).
-    if (enabled) autocreateIdentityFiles(store.dir)
+    // R3-i: ensure identity files exist (idempotent; empty shells). Unconditional
+    // so a later settings toggle-on has the files ready.
+    autocreateIdentityFiles(store.dir)
 
-    if (enabled && enableInjection) {
+    // R3-ui: expose soul.md/user.md over /memory/identity for the settings UI
+    // editor. Degrades silently if the host has no webServer service.
+    const disposeIdentityRoutes = registerIdentityRoutes(ctx, store)
+
+    // Tier-0 memory + identity sections stay registered; their text thunk reads
+    // runtime.enabled so toggling the master switch drops/restores injection live.
+    if (enableInjection) {
       ctx.systemPrompt.section({
         name: 'memory:tier0',
         order: 10,
-        text: () => buildSection(store, { importanceThreshold }).text,
+        text: () => (runtime.enabled ? buildSection(store, { importanceThreshold }).text : ''),
       })
     }
     // M9: constant identity blocks (soul.md / user.md) — mtime-cached, KV friendly.
-    // Gated by the master `enabled` switch too: a disabled memory also drops identity.
-    if (enabled && enableIdentity) {
+    if (enableIdentity) {
       ctx.systemPrompt.section({
         name: 'memory:soul',
         order: 11,
-        text: () => buildIdentitySection(store.dir, 'soul.md', 'AI 本人').text,
+        text: () => (runtime.enabled ? buildIdentitySection(store.dir, 'soul.md', 'AI 本人').text : ''),
       })
       ctx.systemPrompt.section({
         name: 'memory:user',
         order: 12,
-        text: () => buildIdentitySection(store.dir, 'user.md', '用户画像').text,
+        text: () => (runtime.enabled ? buildIdentitySection(store.dir, 'user.md', '用户画像').text : ''),
       })
     }
     registerMemoryTools(ctx, store, { epistemicWeighting })
@@ -319,7 +369,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const l0Pending = new Map<string, { lastActivity: number; texts: string[] }>()
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
-      if (!enabled) return // R3-total: memory disabled → no auto condensation at all
+      if (!runtime.enabled) return // R3-total: memory disabled → no auto condensation at all
       if (l0InFlight >= L0_MAX_INFLIGHT) return // P1-10: cap concurrent condensation
       const turn = (event.data as { turn?: number } | null | undefined)?.turn
       // Resolve the model route (plan 2: auto from the session's request header).
@@ -371,12 +421,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     // a slow pass never stacks; never blocks the core write/recall loop.
     let refining = false
     const runRefine = async (): Promise<void> => {
-      if (disposed || refining) return
+      if (disposed || refining || !runtime.enabled) return
       refining = true
       try {
-        // M8: peak-hour gate — skip LLM burn during expensive windows; the
-        // periodic scan re-evaluates later. (Zero-token passes unaffected.)
-        if (isSuppressed(new Date(), suppressCfg)) return
+        // M8: peak-hour gate (toggleable via settings) — skip LLM burn during
+        // expensive windows; the periodic scan re-evaluates later.
+        if (runtime.peakHourSuppress && isSuppressed(new Date(), suppressCfg)) return
         if (l1Enabled) {
           const l1Route = resolveRefineRoute(
             (config.l1Provider && config.l1Model)
@@ -426,7 +476,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed) return
       refineTimer = setTimeout(() => {
         refineTimer = undefined
-        void runRefine().finally(() => scheduleRefine(refineIntervalMs))
+        void runRefine().finally(() => scheduleRefine(runtime.refineIntervalMs))
       }, delay)
       refineTimer.unref() // P1-11: don't hold the event loop for the background pass
     }
@@ -434,7 +484,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     // M5: idle-settle check loop — scans pending sessions each checkMinutes and
     // upgrades those idle ≥ l0IdleMinutes with a single LLM consolidation call.
     const runSettle = (): void => {
-      if (disposed) return
+      if (disposed || !runtime.enabled) return
       const now = Date.now()
       const idleMs = l0IdleMinutes * 60 * 1000
       for (const [sid, p] of l0Pending) {
@@ -478,7 +528,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     // R3-i: identity-file maintenance pass — appends new user-layer memories into
     // user.md. Pure-rule, zero LLM; skips entirely when there is no new content.
     const runIdentity = (): void => {
-      if (disposed || !enabled || !identityAuto) return
+      if (disposed || !runtime.enabled || !runtime.identityAuto) return
       try {
         maintainUserIdentity(store, store.dir, { maxBytes: identityMaxBytes })
       } catch (err) {
@@ -486,24 +536,25 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
     }
     const scheduleIdentity = (delay: number): void => {
-      if (disposed || !enabled || !identityAuto) return
+      if (disposed) return
       identityTimer = setTimeout(() => {
         identityTimer = undefined
         runIdentity()
-        scheduleIdentity(identityIntervalMs)
+        scheduleIdentity(runtime.identityIntervalMs)
       }, delay)
       identityTimer.unref?.()
     }
 
-    if (enabled) {
-      scheduleForget(FORGET_FIRST_DELAY_MS)
-      scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
-      scheduleSettle() // M5: idle-settle loop (every checkMinutes)
-      scheduleIdentity(60 * 1000) // first identity pass 1 min after boot
-    }
+    // Background loops start unconditionally; each run() gates runtime.enabled,
+    // so toggling the master switch live gates the work without timer churn.
+    scheduleForget(FORGET_FIRST_DELAY_MS)
+    scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
+    scheduleSettle() // M5: idle-settle loop (every checkMinutes)
+    scheduleIdentity(60 * 1000) // first identity pass 1 min after boot
     return () => {
       disposed = true
       l0Dispose()
+      disposeIdentityRoutes()
       if (timer) clearTimeout(timer)
       if (refineTimer) clearTimeout(refineTimer)
       if (refineKick) clearTimeout(refineKick)

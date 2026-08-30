@@ -108,6 +108,7 @@ suppressWindows:             # 这些时段 L1/L2 后台 LLM 不跑（按下方 
     end: '18:00'
 suppressLeadMinutes: 15      # 每个峰时开始前 15 分钟也不触发
 timeZone: 'Asia/Shanghai'
+peakHourSuppress: true       # 忙闲时段扫描总开关（设置页可切换；false=任何时候都跑后台 LLM 凝练）
 # --- M9 身份块 ---
 enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section（文件放 <memoryHome>/memory/ 下）
 # --- R3-total: 记忆总开关 ---
@@ -116,6 +117,10 @@ enabled: true                # false → 新会话不注入任何记忆（清洁
 identityAuto: true           # 自动把 layer=user 稳定记忆增量写入 user.md（soul.md 由人写，不自动）
 identityIntervalMs: 21600000 # 维护 pass 周期（默认 6h）；先扫描，无新增内容则不写入
 identityMaxBytes: 2000       # user.md 自动追加的内容大小上限（字节），达到后跳过追加、不截断
+
+# 以上 enabled / identityAuto / identityIntervalMs / refineIntervalMs / peakHourSuppress
+# 同时经 dsh 设置页「记忆」面板（settings 命名空间 `memory`）实时读写——settings 用户层
+# 覆盖 cordis config（base），改动 live 生效无需重启。
 ```
 
 > 运行时要求：Node **>=22.5**（`node:sqlite`；24 才稳定）。见 `package.json` 的 `engines`。
@@ -126,16 +131,18 @@ identityMaxBytes: 2000       # user.md 自动追加的内容大小上限（字�
 # 编译（对齐 dsh monorepo 的类型；本项目未内置 @deepseek-ai 依赖，
 # 此处路径针对 D:/Apps/deepseek-harness 布局——独立安装请把 tsconfig 的
 # paths/typeRoots 改指向本地 node_modules 中已安装的 @deepseek-ai 包。）
-node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.json
-# 冒烟（无 dsh 也可跑，全量断言组 G1–G17）
+node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.json          # Node 主代码
+node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.client.json  # 前端 client.tsx 类型检查
+node build.mjs                                                                           # esbuild 打包 client → lib/client.js
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G23）
 node smoke.mjs
 ```
 
-`lib/` 已提交，消费者（含 git 安装）无需工具链。
+`lib/` 已提交，消费者（含 git 安装）无需工具链。前端 client 入口为 `exports["./client"]`（`dsh.client.platform: "web"`），esbuild 打包成 `window.__ModuleLoader__.load` 格式（react 走 shell 单例，不打进 bundle）。
 
 ## 状态
 
-- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（170 项）全绿、稳定连跑，`tsc` 零错误。
+- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（175 项）全绿、稳定连跑，`tsc` 零错误。
 - **M4 真机装载**：已完成（2026-08-29，独立库 `~/.dsh/memory-v3`，见 Obsidian 断点）。
 - **M5 会话收口**（REFINE-REDESIGN 方案 1）：turn-end 只做零 LLM 规则留痕；LLM 升级延迟到会话 idle≥`l0IdleMinutes` 后一次性收口（`condenseSession`，原地升级不重复建行）。
 - **M6 L1 事件排程**：新 episode 写入或收口后 ~10s 触发 refine（`kickRefine`），周期 timer 兜底。
@@ -145,7 +152,7 @@ node smoke.mjs
 - **P2-37（replace 保持 topic）**：`memory` 工具 replace 未显式传 `topic` 时保留原条目 topic，不再回落 `general`——避免拆散同 topic 的 L2 簇。
 - **R3-total（记忆开关）**：`enabled=false` 时新会话为不注入任何记忆的清洁会话（tier0 / 身份 section 均不注入），后台整理/遗忘/身份维护全停；`memory`/`memory_recall` 工具保留供主动使用。
 - **R3-i（身份文件自动进化）**：`autocreateIdentityFiles` 启动即自动建空白 soul.md/user.md；`maintainUserIdentity` 纯规则 pass（零 LLM）把 `layer=user` 稳定记忆增量写入 user.md——用 `identity_synced` 表按 `contentId` 去重，**无新增内容则不写入**（先扫描的守卫），文件超过 `identityMaxBytes` 后跳过追加、绝不截断。soul.md 保留人工维护（AI 人格是设计决策，不由凝练自动生成）。
-- **R3-ui（克制界面）**：沿用 system-prompt 注入式记忆状态行（分区占用、情景段数、可召回领域、上限）作为必要的状态显示——零 client 代码、不刷屏、天然克制；不引入 meow 式 client 面板（与本插件"注入在 system prompt、人类无需看到中间态"的哲学相悖、且需 dsh client 插件 + 真机联调，如确需要另行立项）。
+- **R3-ui（设置页面板）**：在 dsh 设置页左侧新增「记忆」设置项（官方 `settings.section` slot）——记忆总开关、user.md 自动进化开关、身份维护扫描间隔、忙闲时段抑制开关、soul.md/user.md 内联编辑。前端 client 入口（`exports["./client"]` + esbuild 打包成 ModuleLoader 格式），通过 `ctx.settingsScope.bind({namespace:'memory'})` 读写 `memory` 设置命名空间（后端 `ctx.settings.register` + `scope.watch` live 热生效）；soul/user 文件经 `/memory/identity` HTTP 路由读写（文件仍为真相源，可人工手编）。
 
 ## soul.md / user.md（M9）
 
