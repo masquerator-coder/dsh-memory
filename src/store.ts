@@ -397,8 +397,14 @@ export class MemoryStore {
       if (content !== oldContent) {
         this.recordFailure(target.id, oldContent, content)
       }
+      // P2-37: replace must keep the entry's topic unless the caller explicitly
+      // provides one — the shared `topic` default above (DEFAULT_TOPIC) used to
+      // clobber it to 'general', scattering same-topic L2 clusters.
+      const newTopic = op.topic === undefined || op.topic === null || String(op.topic).trim() === ''
+        ? target.topic
+        : String(op.topic).trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
       this.writeMemory(target.id, {
-        layer, kind, tier, topic: topic || target.topic, content, importance, quality, epistemic,
+        layer, kind, tier, topic: newTopic, content, importance, quality, epistemic,
         heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
         last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
         window_freq: target.window_freq, window_start: target.window_start,

@@ -129,13 +129,14 @@ node smoke.mjs
 
 ## 状态
 
-- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（158 项）全绿、5 连跑稳定，`tsc` 零错误。
+- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（159 项）全绿、稳定连跑，`tsc` 零错误。
 - **M4 真机装载**：已完成（2026-08-29，独立库 `~/.dsh/memory-v3`，见 Obsidian 断点）。
 - **M5 会话收口**（REFINE-REDESIGN 方案 1）：turn-end 只做零 LLM 规则留痕；LLM 升级延迟到会话 idle≥`l0IdleMinutes` 后一次性收口（`condenseSession`，原地升级不重复建行）。
 - **M6 L1 事件排程**：新 episode 写入或收口后 ~10s 触发 refine（`kickRefine`），周期 timer 兜底。
 - **M7 L2 增量**：新表 `l2_refined`；只审成员 `updated>refined_at` 或从未审过的簇，稳定簇零 LLM（空转归零）；降级 pass 不落指纹、LLM 恢复后会补审。
 - **M8 峰时抑制**：`isSuppressed`（默认北京 09–12/14–18 点 + 前 15min）gate L1/L2 后台 LLM，纯省 API 钱。
 - **M9 身份块**：`soul.md` / `user.md` 恒定 section（mtime 缓存、KV 友好、无 BOM 兼容），位置 `<memoryHome>/memory/`。
+- **P2-37（replace 保持 topic）**：`memory` 工具 replace 未显式传 `topic` 时保留原条目 topic，不再回落 `general`——避免拆散同 topic 的 L2 簇。
 
 ## soul.md / user.md（M9）
 

@@ -730,15 +730,16 @@ group('G19 M7 L2 incremental fingerprint (zero-LLM stable clusters)')
   // incremental:false audits everything regardless.
   const st3 = await runRefineL2(s, { llm: counting, provider: 'p', model: 'm', minCluster: 2, incremental: false })
   assert('M7 incremental:false audits anyway', st3.clusters === 1)
-  // A changed member re-enters the audit queue (keep topic so the cluster holds).
-  // NB: settle an extra ms so replace's `updated` provably exceeds the refined_at
-  // recorded by st3 (same-ms would look "unchanged" — a real but vanishingly rare
-  // edge in prod, deterministic in fast tests).
+  // A changed member re-enters the audit queue. NB: replace omits topic on
+  // purpose — P2-37 must keep the original 'inc' (no general fallback), so the
+  // cluster still holds AND the changed member triggers a re-audit.
   await new Promise(r => setTimeout(r, 2))
   const m = s.activeEntries().find(e => e.content.includes('甲'))
-  s.batch([{ action: 'replace', id: m.id, content: '增量簇第一条事实内容甲CCCC新版', topic: 'inc' }])
+  s.batch([{ action: 'replace', id: m.id, content: '增量簇第一条事实内容甲CCCC新版' }])
+  const agg = s.activeEntries().find(e => e.content.includes('甲'))
+  assert('P2-37 replace keeps topic when not provided', agg !== undefined && agg.topic === 'inc')
   const st4 = await runRefineL2(s, { llm: counting, provider: 'p', model: 'm', minCluster: 2, incremental: true })
-  assert('M7 changed member → cluster re-audited', st4.clusters === 1)
+  assert('M7 changed member (topic preserved) → cluster re-audited', st4.clusters === 1)
   // degraded (LLM down) does NOT record refined_at → still eligible later.
   const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-m7b-'))
   const s2 = new MemoryStore(t2)
