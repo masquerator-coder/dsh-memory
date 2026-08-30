@@ -26,6 +26,8 @@ import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerd
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
 import { buildIdentitySection } from './lib/inject.js'
+import { autocreateIdentityFiles, maintainUserIdentity } from './lib/identity.js'
+import { readFileSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -787,6 +789,53 @@ group('G21 M9 identity sections (soul.md / user.md)')
   const u = buildIdentitySection(s.dir, 'user.md', '用户画像')
   assert('M9 BOM stripped from identity file', u.empty === false && !u.text.startsWith('\uFEFF') && u.text.includes('中文交流'))
   s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// G22 — R3-i identity-file auto-maintenance (auto-create, incremental fill, cap, no-new-skip)
+group('G22 R3-i identity file auto-maintenance')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-r3-'))
+  const s = new MemoryStore(t)
+  const db = new DatabaseSync(s.dbPath)
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name)
+  db.close()
+  assert('G22 identity_synced table exists', tables.includes('identity_synced'))
+  assert('G22 identity_meta table exists', tables.includes('identity_meta'))
+  // auto-create empty shells, idempotent
+  const c1 = autocreateIdentityFiles(s.dir)
+  assert('G22 autocreate made empty soul+user', c1.created.sort().join(',') === 'soul.md,user.md')
+  assert('G22 soul starts empty (byte 0)', readFileSync(join(s.dir, 'soul.md'), 'utf8').length === 0)
+  const c2 = autocreateIdentityFiles(s.dir)
+  assert('G22 autocreate idempotent (no re-create)', c2.created.length === 0)
+  // no user memories → candidates 0, file untouched
+  const r0 = maintainUserIdentity(s, s.dir)
+  assert('G22 no-content → candidates 0, no write', r0.candidates === 0 && r0.wrote === 0)
+  assert('G22 scan records last_maintain meta', s.identityMetaGet('last_maintain') !== undefined)
+  // add user-layer memories → appended + synced
+  s.batch([
+    { action: 'add', layer: 'user', importance: 4, content: '用户偏好用中文交流' },
+    { action: 'add', layer: 'user', importance: 4, content: '用户是某大学经管学院副教授' },
+  ])
+  const r1 = maintainUserIdentity(s, s.dir)
+  const u1 = readFileSync(join(s.dir, 'user.md'), 'utf8')
+  assert('G22 wrote the 2 new user memories', r1.wrote === 2 && u1.includes('中文交流') && u1.includes('副教授'))
+  // second pass with no new content → zero write, file byte-identical
+  const r2 = maintainUserIdentity(s, s.dir)
+  assert('G22 no new content → skip, file unchanged', r2.candidates === 0 && readFileSync(join(s.dir, 'user.md'), 'utf8') === u1)
+  s.close(); rmSync(t, { recursive: true, force: true })
+  // size cap: entries that would overflow are skipped, file stays under maxBytes
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-r3b-'))
+  const s2 = new MemoryStore(t2)
+  s2.batch([
+    { action: 'add', layer: 'user', importance: 4, content: '一款超长到足以触发大小上限被跳过的用户画像内容一' },
+    { action: 'add', layer: 'user', importance: 4, content: '第二段也很长的用户画像内容同样应当被跳过二' },
+  ])
+  const cap = maintainUserIdentity(s2, s2.dir, { maxBytes: 30 })
+  const ufPath = join(s2.dir, 'user.md')
+  const uf = existsSync(ufPath) ? readFileSync(ufPath, 'utf8') : ''
+  assert('G22 size cap: overflowing entries skipped', cap.overflow >= 1)
+  assert('G22 file bytes stay at or under cap', Buffer.byteLength(uf, 'utf8') <= 30)
+  s2.close(); rmSync(t2, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

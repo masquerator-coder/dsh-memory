@@ -30,6 +30,7 @@ import { buildIdentitySection, buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
+import { autocreateIdentityFiles, IDENTITY_MAX_BYTES, maintainUserIdentity } from './identity.js'
 import type { ForgetDays } from './types.js'
 
 /**
@@ -112,6 +113,16 @@ export interface Config {
   timeZone?: string
   /** M9: inject constant soul.md / user.md identity sections. Default true. */
   enableIdentity?: boolean
+  /** R3-total: master memory switch. false → new sessions inject no memory
+   *  (clean sessions) and background condensation/forgetting stop; the memory /
+   *  memory_recall tools stay available for explicit use. Default true. */
+  enabled?: boolean
+  /** R3-i: auto-create + incrementally maintain user.md from user-layer memories. Default true. */
+  identityAuto?: boolean
+  /** R3-i: identity maintenance cadence (ms). Default 6h. */
+  identityIntervalMs?: number
+  /** R3-i: cap on the auto-maintained identity file (bytes). Default 2000. */
+  identityMaxBytes?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -157,6 +168,10 @@ export const Config: z<Config> = z.object({
   suppressLeadMinutes: z.number(),
   timeZone: z.string(),
   enableIdentity: z.boolean(),
+  enabled: z.boolean(),
+  identityAuto: z.boolean(),
+  identityIntervalMs: z.number(),
+  identityMaxBytes: z.number(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -206,12 +221,18 @@ export function apply(ctx: Context, config: Config = {}): void {
     suppressLeadMinutes: config.suppressLeadMinutes ?? 15,
     timeZone: config.timeZone ?? 'Asia/Shanghai',
   }
+  // R3-total / R3-i
+  const enabled = config.enabled ?? true
+  const identityAuto = config.identityAuto ?? true
+  const identityIntervalMs = config.identityIntervalMs ?? 6 * 3600_000
+  const identityMaxBytes = config.identityMaxBytes ?? IDENTITY_MAX_BYTES
 
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let refineTimer: ReturnType<typeof setTimeout> | undefined
   let refineKick: ReturnType<typeof setTimeout> | undefined
   let settleTimer: ReturnType<typeof setTimeout> | undefined
+  let identityTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): void => {
     if (disposed) return
@@ -237,7 +258,10 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   ctx.effect(() => {
-    if (enableInjection) {
+    // R3-i: ensure the auto-maintained identity files exist (empty shells).
+    if (enabled) autocreateIdentityFiles(store.dir)
+
+    if (enabled && enableInjection) {
       ctx.systemPrompt.section({
         name: 'memory:tier0',
         order: 10,
@@ -245,7 +269,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       })
     }
     // M9: constant identity blocks (soul.md / user.md) — mtime-cached, KV friendly.
-    if (enableIdentity) {
+    // Gated by the master `enabled` switch too: a disabled memory also drops identity.
+    if (enabled && enableIdentity) {
       ctx.systemPrompt.section({
         name: 'memory:soul',
         order: 11,
@@ -294,6 +319,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const l0Pending = new Map<string, { lastActivity: number; texts: string[] }>()
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
+      if (!enabled) return // R3-total: memory disabled → no auto condensation at all
       if (l0InFlight >= L0_MAX_INFLIGHT) return // P1-10: cap concurrent condensation
       const turn = (event.data as { turn?: number } | null | undefined)?.turn
       // Resolve the model route (plan 2: auto from the session's request header).
@@ -449,9 +475,32 @@ export function apply(ctx: Context, config: Config = {}): void {
       settleTimer.unref?.() // P1-11: don't hold the event loop
     }
 
-    scheduleForget(FORGET_FIRST_DELAY_MS)
-    scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
-    scheduleSettle() // M5: idle-settle loop (every checkMinutes)
+    // R3-i: identity-file maintenance pass — appends new user-layer memories into
+    // user.md. Pure-rule, zero LLM; skips entirely when there is no new content.
+    const runIdentity = (): void => {
+      if (disposed || !enabled || !identityAuto) return
+      try {
+        maintainUserIdentity(store, store.dir, { maxBytes: identityMaxBytes })
+      } catch (err) {
+        if (!disposed) console.warn('[dsh-memory] identity maintain failed:', err instanceof Error ? err.message : err)
+      }
+    }
+    const scheduleIdentity = (delay: number): void => {
+      if (disposed || !enabled || !identityAuto) return
+      identityTimer = setTimeout(() => {
+        identityTimer = undefined
+        runIdentity()
+        scheduleIdentity(identityIntervalMs)
+      }, delay)
+      identityTimer.unref?.()
+    }
+
+    if (enabled) {
+      scheduleForget(FORGET_FIRST_DELAY_MS)
+      scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
+      scheduleSettle() // M5: idle-settle loop (every checkMinutes)
+      scheduleIdentity(60 * 1000) // first identity pass 1 min after boot
+    }
     return () => {
       disposed = true
       l0Dispose()
@@ -459,6 +508,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (refineTimer) clearTimeout(refineTimer)
       if (refineKick) clearTimeout(refineKick)
       if (settleTimer) clearTimeout(settleTimer)
+      if (identityTimer) clearTimeout(identityTimer)
       store.close()
     }
   })

@@ -853,6 +853,28 @@ export class MemoryStore {
     ).run(topic, ts)
   }
 
+  // ---- identity-file sync ledger (R3-i, 2026-08-31) -------------------------
+
+  /** Content-ids already written into an auto-maintained identity file. */
+  identitySyncedIds(target: string): Set<string> {
+    const rows = this.db.prepare('SELECT content_id FROM identity_synced WHERE target = ?').all(target) as { content_id: string }[]
+    return new Set(rows.map(r => r.content_id))
+  }
+
+  /** Record that a memory content was written into an identity file (idempotent). */
+  markIdentitySynced(content: string, target: string, ts = Date.now()): void {
+    this.db.prepare('INSERT OR IGNORE INTO identity_synced(content_id, target, ts) VALUES (?,?,?)').run(contentId(content), target, ts)
+  }
+
+  identityMetaGet(key: string): number | undefined {
+    const r = this.db.prepare('SELECT value AS v FROM identity_meta WHERE key = ?').get(key) as { v: number } | undefined
+    return r ? Number(r.v) : undefined
+  }
+
+  identityMetaSet(key: string, value: number): void {
+    this.db.prepare('INSERT INTO identity_meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
+  }
+
   // ---- correction trail ----------------------------------------------------
 
   recordFailure(memoryId: string, oldContent: string, newContent: string): void {
