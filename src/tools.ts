@@ -12,7 +12,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolCallKind, type ToolCallView, type ToolResult, type ToolResultView } from '@deepseek-ai/dsh-tools'
 import type { MemoryStore } from './store.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './format.js'
-import type { Importance, Kind, Layer, MemoryOp, OpAction, Tier } from './types.js'
+import type { ApplyResult, Epistemic, Importance, Kind, Layer, MemoryOp, OpAction, Tier } from './types.js'
 
 const ACTION_VERBS: Record<OpAction, string> = {
   add: '记入',
@@ -23,8 +23,13 @@ const ACTION_VERBS: Record<OpAction, string> = {
 
 const LAYERS: readonly Layer[] = ['user', 'memory']
 const KINDS: readonly Kind[] = ['preference', 'env', 'lesson', 'decision', 'general']
+const EPISTEMICS: readonly Epistemic[] = ['observed', 'inferred', 'subjective']
 const ACTIONS: readonly OpAction[] = ['add', 'replace', 'remove', 'list']
 const SCOPES: readonly string[] = ['semantic', 'episodic', 'all']
+/** Upper bound on entries a model-facing listing can dump into context (P2-33). */
+const LIST_LIMIT = 50
+/** Recall topK clamp: 1..50 (P2-33). */
+const TOPK_MAX = 50
 
 /** Narrow an untrusted model-supplied string to a closed set; undefined = absent/invalid. */
 function pick<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
@@ -98,13 +103,14 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
       id: { type: 'string', description: 'replace/remove 必需' },
       content: { type: 'string', description: '事实正文' },
       importance: { type: 'number', description: '1-5,影响注入' },
+      epistemic: { type: 'string', description: 'observed|inferred|subjective(默认 observed)：inferred/subjective 在召回加权时降低' },
       force: { type: 'boolean', description: 'remove 时 true=物理删除,false=软归档' },
     },
     output: objectOutput,
     async execute(args, exec) {
       const rawAction = str(args.action) ?? ''
       if (rawAction === 'list') {
-        return { content: formatEntries(store.list({ includeLowQuality: false })) }
+        return { content: formatEntries(store.list({ includeLowQuality: false }).slice(0, LIST_LIMIT)) }
       }
       const action = pick(ACTIONS, rawAction)
       if (!action) return { content: `未知 action "${rawAction}";可选 list|add|replace|remove。${summarizeResult(store)}` }
@@ -118,13 +124,23 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
         id: str(args.id),
         content: str(args.content),
         importance: importanceOf(args.importance),
+        epistemic: pick(EPISTEMICS, args.epistemic),
         force: args.force === true,
       }
       const sid = str(exec.agent?.session?.id)
-      const res = store.batch([op], sid)
+      let res: ApplyResult
+      try {
+        res = store.batch([op], sid)
+      } catch (err) {
+        // P2-35: the write path shouldn't be allowed to throw past the tool surface.
+        return { content: `未完成: 记忆写入异常: ${err instanceof Error ? err.message : String(err)}。${summarizeResult(store)}` }
+      }
       if (res.overflowed) return { content: `记忆预算已满;本次未写入。当前核心(${res.usage.pct}%):\n${formatEntries(res.entries.filter(e => e.tier === 0))}\n请先用 memory replace/remove 整合后再写。` }
       if (res.rejected.length > 0) return { content: `未完成: ${res.rejected.map(r => r.reason).join('; ')}。${summarizeResult(store)}` }
-      return { content: `已${ACTION_VERBS[action]}。${summarizeResult(store)}` }
+      const demoteNote = res.demoted.length > 0
+        ? `（${res.demoted.length}条已有记忆因预算降级至 tier1：未注入常驻区，但可经 memory_recall 召回）`
+        : ''
+      return { content: `已${ACTION_VERBS[action]}。${demoteNote}${summarizeResult(store)}` }
     },
     presentCall(args) {
       const action = str(args.action) ?? ''
@@ -155,7 +171,8 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
     output: objectOutput,
     async execute(args, _exec) {
       const query = str(args.query) ?? ''
-      const topK = typeof args.topK === 'number' && args.topK > 0 ? Math.floor(args.topK) : 8
+      let topK = 8
+      if (typeof args.topK === 'number' && Number.isFinite(args.topK)) topK = Math.max(1, Math.min(TOPK_MAX, Math.floor(args.topK))) // P2-33: clamp
       const scope = pick(SCOPES, args.scope) ?? 'all'
       const parts: string[] = []
       if (scope === 'semantic' || scope === 'all') {
@@ -172,8 +189,11 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
       return callCard('检索记忆', 'search', str(args.query) ?? '')
     },
     presentResult(_args, result): ToolResultView | undefined {
-      const hit = result.content[0]?.type === 'text' && result.content[0].text.trim() !== ''
-      return resultCard(result.isError || !hit ? recallEmptyLabel() : '检索结果', { isError: result.isError })
+      const text = textOf(result)
+      // P2-32: a surface-level '无匹配记忆。' (or empty) is a genuine miss — it must
+      // reach the "no match" card branch, not always render as a hit.
+      const empty = text.trim() === '' || text.trim() === '无匹配记忆。'
+      return resultCard(result.isError || empty ? recallEmptyLabel() : '检索结果', { isError: result.isError })
     },
   })
 

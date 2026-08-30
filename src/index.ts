@@ -129,6 +129,9 @@ export const Config: z<Config> = z.object({
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
 const FORGET_FIRST_DELAY_MS = 5 * 60 * 1000 // 5 min after boot
+/** Cap on in-flight L0 condensation runs (P1-10): a slow LLM summary must not
+ *  stack unboundedly across turns. */
+const L0_MAX_INFLIGHT = 4
 
 export function apply(ctx: Context, config: Config = {}): void {
   const store = new MemoryStore(
@@ -185,6 +188,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       runForget()
       scheduleForget(FORGET_INTERVAL_MS)
     }, delay)
+    timer.unref() // P1-11: don't hold the Node event loop open for the daily forget
   }
 
   ctx.effect(() => {
@@ -225,8 +229,10 @@ export function apply(ctx: Context, config: Config = {}): void {
           },
         }
       : undefined
+    let l0InFlight = 0
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
+      if (l0InFlight >= L0_MAX_INFLIGHT) return // P1-10: cap concurrent condensation
       // Resolve the model route (plan 2: auto from the session's request header).
       const cfg = session.requestHeader()?.config
       if (cfg?.provider && cfg?.model) {
@@ -235,6 +241,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       const provider = config.l0Provider ?? cfg?.provider
       const model = config.l0Model ?? cfg?.model
+      l0InFlight += 1
       void runL0(store, {
         events: session.events as readonly unknown[],
         turn: (event.data as { turn?: number } | null | undefined)?.turn,
@@ -248,7 +255,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         sessionId: session.id,
         toolsUsed: undefined,
         topic: undefined,
-      }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
+      }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
     })
 
     // L1/L2 refinement: unified background timer (no per-turn cost). Runs on the
@@ -310,6 +317,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         refineTimer = undefined
         void runRefine().finally(() => scheduleRefine(refineIntervalMs))
       }, delay)
+      refineTimer.unref() // P1-11: don't hold the event loop for the background pass
     }
 
     scheduleForget(FORGET_FIRST_DELAY_MS)

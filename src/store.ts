@@ -45,6 +45,13 @@ export const DEFAULT_BUDGET: MemoryBudget = { tier0: 900, user: 400, memory: 500
 const DEFAULT_TOPIC = 'general'
 /** Topic labels are UI/index hints, not content — keep them short. */
 const TOPIC_MAX = 40
+/** Minimum length (chars) both sides must meet before an id-less `replace` will
+ * substring-match. Prevents a tiny fragment from silently overwriting a whole
+ * entry (P0-3). */
+const MIN_REPLACE_FRAGMENT = 8
+/** Cap on facts offered per L2 cluster — a giant untagged 'general' bucket must
+ * not be dumped whole into the LLM prompt (P2-29). */
+const MAX_FACTS_PER_CLUSTER = 25
 
 /** Episode recency half-life (days) for recall ranking. */
 const EPISODE_RECENCY_DAYS = 90
@@ -56,6 +63,11 @@ export function resolveDshHome(): string {
 /** Hard-content id: identical facts collapse instead of duplicating. */
 export function contentId(content: string): string {
   return createHash('sha256').update(content).digest('hex').slice(0, 16)
+}
+
+/** Escape SQL LIKE wildcards for use with an `ESCAPE '\'` clause. */
+function escapeLike(s: string): string {
+  return String(s).replace(/[\\%_]/g, '\\$&')
 }
 
 export interface ListFilter {
@@ -110,7 +122,15 @@ export class MemoryStore {
     this.budget = budget
     this.windowDays = windowDays
     this.forgetDays = forgetDays
-    this.db = new DatabaseSync(this.dbPath)
+    // P1-15: node:sqlite is experimental before Node 24 and unavailable before
+    // 22.5. Give a clear error (vs. a raw crash) and rely on `engines`/ability.
+    try {
+      this.db = new DatabaseSync(this.dbPath)
+    } catch (err) {
+      throw new Error(
+        `dsh-memory: cannot open SQLite store — node:sqlite requires Node >=22.5 (found ${process.version}). ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
     this.db.exec('PRAGMA journal_mode=WAL')
     this.db.exec('PRAGMA busy_timeout=3000')
     this.db.exec(DDL)
@@ -210,7 +230,7 @@ export class MemoryStore {
     if (filter.kind) { clauses.push('kind = ?'); params.push(filter.kind) }
     if (filter.includeArchived !== true) clauses.push('archived = 0')
     if (filter.includeLowQuality === false) clauses.push('low_quality = 0')
-    const rows = this.db.prepare(`SELECT * FROM memories WHERE ${clauses.join(' AND ')} ORDER BY updated DESC`).all(...params)
+    const rows = this.db.prepare(`SELECT * FROM memories WHERE ${clauses.join(' AND ')} ORDER BY updated DESC, rowid DESC`).all(...params)
     return rows.map(r => this.rowToEntry(r as Record<string, unknown>))
   }
 
@@ -220,6 +240,12 @@ export class MemoryStore {
 
   count(): number {
     const r = this.db.prepare('SELECT COUNT(*) AS c FROM memories WHERE archived = 0').get() as { c: number }
+    return Number(r.c)
+  }
+
+  /** Active (non-archived) episode count, without loading rows (P2-25). */
+  episodeCount(): number {
+    const r = this.db.prepare('SELECT COUNT(*) AS c FROM episodes WHERE archived = 0').get() as { c: number }
     return Number(r.c)
   }
 
@@ -240,6 +266,17 @@ export class MemoryStore {
       'SELECT topic, COUNT(*) AS c FROM memories WHERE tier = 1 AND archived = 0 GROUP BY topic ORDER BY c DESC',
     ).all() as { topic: string; c: number }[]
     return rows.map(r => ({ topic: String(r.topic), count: Number(r.c) }))
+  }
+
+  /** Bounded dedup candidate set (P2-16): only rows sharing the head of `content`
+   *  are compared for the duplicate penalty, so add/replace cost stops scaling with
+   *  library size. (Content-equality dedup — P0-2 — is exact and separate.) */
+  private nearCandidates(content: string, cap = 8): MemoryEntry[] {
+    const slice = content.slice(0, 12).trim()
+    if (!slice) return []
+    const like = `%${escapeLike(slice)}%`
+    const rows = this.db.prepare("SELECT * FROM memories WHERE archived = 0 AND content LIKE ? ESCAPE '\\' LIMIT ?").all(like, cap) as Record<string, unknown>[]
+    return rows.map(r => this.rowToEntry(r))
   }
 
   // ---- writes (memories) ---------------------------------------------------
@@ -279,9 +316,20 @@ export class MemoryStore {
       const topic = op.topic === '' ? '' : (op.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
 
       if (op.action === 'add') {
-        const id = contentId(content)
-        const existing = this.get(id)
-        const quality = existing ? existing.quality : qualityScore(content, this.activeEntries())
+        // P0-2: dedup on exact content (source of truth), not merely the
+        // content-hash id. `contentId(content)` can go stale after a `replace`
+        // (which keeps the row's original id), so a row might hold this content
+        // under a different id — re-adding that content must update it, never
+        // insert a duplicate. Keep the matched row's id stable (external handle).
+        const cid = contentId(content)
+        let existing = this.get(cid)
+        if (existing && existing.content !== content) existing = undefined // cid row belongs to a different fact (drift) — don't trust it
+        if (!existing) {
+          const dup = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(content) as Record<string, unknown> | undefined
+          if (dup) existing = this.rowToEntry(dup)
+        }
+        const id = existing ? existing.id : cid
+        const quality = existing ? existing.quality : qualityScore(content, this.nearCandidates(content))
         const low = isLowQuality(quality)
         const tier = existing ? (low ? 1 : (op.tier ?? existing.tier)) : (op.tier ?? this.autoTier(layer, importance, quality, kind, low))
         if (existing) {
@@ -306,11 +354,17 @@ export class MemoryStore {
       let target = op.id ? this.get(op.id) : undefined
       if (!target && op.id) return { ok: false, error: `no entry with id ${op.id}` }
       if (!target) {
-        target = this.activeEntries().find(e => e.content.includes(content) || content.includes(e.content)) ?? undefined
+        // P0-3: never silently match by a tiny fragment — a 1-char content could
+        // overwrite a whole entry with a fragment. Only substring-match when BOTH
+        // sides are ≥ MIN_REPLACE_FRAGMENT, else refuse and demand an explicit id.
+        if (content.length >= MIN_REPLACE_FRAGMENT) {
+          target = this.activeEntries().find(e => e.content.length >= MIN_REPLACE_FRAGMENT && (e.content.includes(content) || content.includes(e.content))) ?? undefined
+        }
+        if (!target) return { ok: false, error: `replace without id needs an unambiguous ≥${MIN_REPLACE_FRAGMENT}-char fragment to target; pass id for an exact replace` }
       }
       if (!target) return { ok: false, error: 'no entry matched for replace' }
       const oldContent = target.content
-      const quality = qualityScore(content, this.activeEntries())
+      const quality = qualityScore(content, this.nearCandidates(content))
       const low = isLowQuality(quality)
       const tier = low ? 1 : (op.tier ?? target.tier)
 
@@ -341,21 +395,46 @@ export class MemoryStore {
     return { ok: false, error: `unsupported action ${String(op.action)}` }
   }
 
-  private demoteToBudget(now: number): boolean {
-    const over = this.budgetOver()
-    if (!over) return false
-    const candidates = this.list({ tier: 0, includeArchived: false, includeLowQuality: false })
-      .filter(e => e.layer !== 'user') // user layer is immortal
+  /**
+   * Make the tier-0 injection budget fit by demoting the coldest eligible entries.
+   * Three budgets are enforced (P1-7): the memory layer, the user layer (user is
+   * immortal — never deleted, but CAN be pushed out of the resident injected set
+   * under pressure), and the whole-section cap. `importance >= 5` is the protected
+   * resident core and is never demoted — so if those alone overflow a bucket, the
+   * batch is rejected (overflow becomes truly reachable, P1-8). Returns the ids
+   * demoted and whether budget still exceeds after demotion (P1-9 surfaces them).
+   */
+  private enforceBudget(now: number): { demoted: string[]; over: boolean } {
+    const demoted: string[] = []
+    const done = new Set<string>()
+    // Single load (P2-19): all tier-0 residents once; importance >= 5 is the
+    // protected resident core (never demoted) but still counts toward usage.
+    const all = this.list({ tier: 0, includeArchived: false, includeLowQuality: false })
+    const demotable = all.filter(e => e.importance < 5)
       .sort((a, b) => heatOf(a, this.forgetDays, now) - heatOf(b, this.forgetDays, now) || a.importance - b.importance)
-    for (const e of candidates) {
-      this.db.prepare('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
-      if (!this.budgetOver()) return false
+    const totalOf = (pred: (e: MemoryEntry) => boolean): number => {
+      let n = 0
+      for (const e of all) { if (!done.has(e.id) && pred(e)) n += e.content.length }
+      return n
     }
-    return this.budgetOver()
-  }
-
-  private budgetOver(): boolean {
-    return this.usage().memory > this.budget.memory
+    const memUse = (): number => totalOf(e => e.layer !== 'user')
+    const usrUse = (): number => totalOf(e => e.layer === 'user')
+    const demote = (e: MemoryEntry): void => {
+      this.db.prepare('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
+      done.add(e.id)
+      demoted.push(e.id)
+    }
+    const squeeze = (pred: (e: MemoryEntry) => boolean, over: () => boolean): void => {
+      for (const e of demotable) {
+        if (done.has(e.id) || !pred(e) || !over()) continue
+        demote(e)
+      }
+    }
+    squeeze(e => e.layer !== 'user', () => memUse() > this.budget.memory)
+    squeeze(e => e.layer === 'user', () => usrUse() > this.budget.user)
+    squeeze(() => true, () => memUse() + usrUse() > this.budget.tier0)
+    const over = memUse() > this.budget.memory || usrUse() > this.budget.user || (memUse() + usrUse()) > this.budget.tier0
+    return { demoted, over }
   }
 
   /** Model-facing write batch; lands globally and immediately. */
@@ -373,14 +452,14 @@ export class MemoryStore {
         if (res.ok) applied.push(mapped)
         else rejected.push({ op: mapped, reason: res.error! })
       }
-      const stillOver = this.demoteToBudget(now)
-      if (stillOver) {
+      const { demoted, over } = this.enforceBudget(now)
+      if (over) {
         this.db.exec('ROLLBACK')
         const usage = this.usage()
-        return { applied: [], rejected: ops.map(o => ({ op: o, reason: 'memory budget exceeded' })), entries: before, overflowed: true, usage }
+        return { applied: [], rejected: ops.map(o => ({ op: o, reason: 'memory budget exceeded' })), entries: before, overflowed: true, demoted: [], usage }
       }
       this.db.exec('COMMIT')
-      return { applied, rejected, entries: this.activeEntries(), overflowed: false, usage: this.usage() }
+      return { applied, rejected, entries: this.activeEntries(), overflowed: false, demoted, usage: this.usage() }
     } catch (err) {
       try { this.db.exec('ROLLBACK') } catch { /* noop */ }
       throw err
@@ -413,12 +492,11 @@ export class MemoryStore {
   recall(query: string, opts: RecallOpts = {}): RecallHit[] {
     const topK = opts.topK ?? 8
     const weighting = opts.epistemicWeighting ?? true
-    const candidates = this.list({
-      includeArchived: opts.includeArchived,
-      includeLowQuality: opts.includeLowQuality === true,
-    })
-    if (candidates.length === 0) return []
+    const now = Date.now()
+    const qLower = query.toLowerCase()
+    const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
 
+    // FTS hit ids (optional first layer).
     const ftsIds = new Set<string>()
     try {
       const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
@@ -429,10 +507,43 @@ export class MemoryStore {
       }
     } catch { /* MATCH lex error → substring layer covers */ }
 
-    const qLower = query.toLowerCase()
-    const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
+    // P2-17: candidate pre-filter in SQL (FTS ∪ any-substring) so recall does NOT
+    // load + scan the whole library in JS. base>0 iff the row is FTS-hit OR its
+    // content/topic contains the raw query OR any keyword — all expressed below.
+    const seen = new Set<string>()
+    const candidates: MemoryEntry[] = []
+    const push = (e: MemoryEntry | undefined): void => {
+      if (!e || seen.has(e.id)) return
+      seen.add(e.id)
+      candidates.push(e)
+    }
+    for (const id of ftsIds) {
+      const e = this.get(id)
+      if (!e) continue
+      if (opts.includeArchived !== true && e.archived) continue
+      if (opts.includeLowQuality !== true && e.low_quality) continue
+      push(e)
+    }
+    // Substring candidates via SQL LIKE over content/topic.
+    const baseClauses: string[] = ['1=1']
+    if (opts.includeArchived !== true) baseClauses.push('archived = 0')
+    if (opts.includeLowQuality !== true) baseClauses.push('low_quality = 0')
+    const like = "(\"content\" LIKE ? ESCAPE '\\' OR \"topic\" LIKE ? ESCAPE '\\')"
+    const ors: string[] = []
+    const params: string[] = []
+    const addTerm = (s: string): void => {
+      const e = escapeLike(s)
+      ors.push(like)
+      params.push(`%${e}%`, `%${e}%`)
+    }
+    addTerm(qLower)
+    for (const k of keywords) addTerm(k)
+    const sql = `SELECT * FROM memories WHERE ${baseClauses.join(' AND ')} AND (${ors.join(' OR ')})`
+    for (const r of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEntry(r))
+
+    if (candidates.length === 0) return []
+
     const scored: RecallHit[] = []
-    const now = Date.now()
     for (const e of candidates) {
       let base = 0
       if (ftsIds.has(e.id)) base += 6
@@ -444,7 +555,7 @@ export class MemoryStore {
       const score = base * (weighting ? epiMult(e.epistemic) : 1) * (0.5 + 0.5 * heat)
       scored.push({ entry: e, score })
     }
-    scored.sort((a, b) => b.score - a.score || b.entry.updated - a.entry.updated)
+    scored.sort((a, b) => b.score - a.score || b.entry.updated - a.entry.updated || (a.entry.id < b.entry.id ? 1 : a.entry.id > b.entry.id ? -1 : 0))
     const top = scored.slice(0, topK)
     if (top.length > 0) this.touchAccess(top.map(h => h.entry.id))
     return top
@@ -453,13 +564,25 @@ export class MemoryStore {
   // ---- episodes ------------------------------------------------------------
 
   writeEpisode(id: string, fields: Omit<Episode, 'id'>): void {
-    this.upsertEpiStmt.run(
-      id, fields.session_id, fields.ts, fields.summary, fields.tools_used ?? null,
-      fields.topic, fields.extracted ? 1 : 0, fields.archived ? 1 : 0, fields.archived_at ?? null,
-      fields.created,
-    )
-    const rowid = Number(this.epiRowidStmt.get(id)!.r)
-    this.upsertEpiFtsStmt.run(rowid, fields.summary, fields.topic)
+    // P1-12: episode row + its FTS row must land atomically, or a crash between
+    // them leaves episodes/ep_fts inconsistent (recall silently drops rows).
+    // SAVEPOINT (not BEGIN) so this is safe both standalone and when the caller
+    // is already inside a transaction (e.g. an enclosing batch).
+    this.db.exec('SAVEPOINT ep_write')
+    try {
+      this.upsertEpiStmt.run(
+        id, fields.session_id, fields.ts, fields.summary, fields.tools_used ?? null,
+        fields.topic, fields.extracted ? 1 : 0, fields.archived ? 1 : 0, fields.archived_at ?? null,
+        fields.created,
+      )
+      const rowid = Number(this.epiRowidStmt.get(id)!.r)
+      this.upsertEpiFtsStmt.run(rowid, fields.summary, fields.topic)
+      this.db.exec('RELEASE ep_write')
+    } catch (err) {
+      try { this.db.exec('ROLLBACK TO ep_write') } catch { /* noop */ }
+      try { this.db.exec('RELEASE ep_write') } catch { /* noop */ }
+      throw err
+    }
   }
 
   addEpisode(fields: { sessionId: string; summary: string; toolsUsed?: string; topic?: string }): Episode {
@@ -483,7 +606,7 @@ export class MemoryStore {
   listEpisodes(filter: { includeArchived?: boolean } = {}): Episode[] {
     const clauses: string[] = ['1=1']
     if (filter.includeArchived !== true) clauses.push('archived = 0')
-    const rows = this.db.prepare(`SELECT * FROM episodes WHERE ${clauses.join(' AND ')} ORDER BY ts DESC`).all()
+    const rows = this.db.prepare(`SELECT * FROM episodes WHERE ${clauses.join(' AND ')} ORDER BY ts DESC, rowid DESC`).all()
     return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
   }
 
@@ -517,14 +640,24 @@ export class MemoryStore {
       const score = base * (0.5 + 0.5 * recency)
       scored.push({ episode: ep, score })
     }
-    scored.sort((a, b) => b.score - a.score || b.episode.ts - a.episode.ts)
+    scored.sort((a, b) => b.score - a.score || b.episode.ts - a.episode.ts || (a.episode.id < b.episode.id ? 1 : a.episode.id > b.episode.id ? -1 : 0))
     return scored.slice(0, topK)
   }
 
   private hardDeleteEpisode(id: string): void {
-    const row = this.epiRowidStmt.get(id) as { r: number } | undefined
-    const r = this.db.prepare('DELETE FROM episodes WHERE id = ?').run(id)
-    if (r.changes > 0 && row) this.db.prepare('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
+    // P1-12: delete episode + FTS atomically; SAVEPOINT stays safe when the
+    // caller (forgetRun) already holds a transaction.
+    this.db.exec('SAVEPOINT ep_delete')
+    try {
+      const row = this.epiRowidStmt.get(id) as { r: number } | undefined
+      const r = this.db.prepare('DELETE FROM episodes WHERE id = ?').run(id)
+      if (r.changes > 0 && row) this.db.prepare('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
+      this.db.exec('RELEASE ep_delete')
+    } catch (err) {
+      try { this.db.exec('ROLLBACK TO ep_delete') } catch { /* noop */ }
+      try { this.db.exec('RELEASE ep_delete') } catch { /* noop */ }
+      throw err
+    }
   }
 
   // ---- L1/L2 refine support (zero LLM — pure scheduling, reading, audit) ----
@@ -562,7 +695,7 @@ export class MemoryStore {
     }
     const out: { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance }[] }[] = []
     for (const [topic, facts] of byTopic) {
-      if (facts.length >= min) out.push({ seedId: facts[0].id, topic, facts })
+      if (facts.length >= min) out.push({ seedId: facts[0].id, topic, facts: facts.slice(0, MAX_FACTS_PER_CLUSTER) })
     }
     out.sort((a, b) => b.facts.length - a.facts.length)
     return (opts.limit && opts.limit > 0) ? out.slice(0, opts.limit) : out
@@ -647,10 +780,26 @@ export class MemoryStore {
           decisions.push(`archive:${e.id}`)
         }
       }
+      // P2-18: load the correction trail once outside the delete loop — it was
+      // re-querying the whole failure_memories table for every candidate entry.
+      const trail = this.failureTrail()
+      const pendingCorrection = (content: string): boolean => {
+        for (const f of trail) {
+          const oldC = f.oldContent.trim()
+          if (!oldC) continue
+          if (contentSimilarity(oldC, content) >= 0.5 || content.includes(oldC) || oldC.includes(content)) return true
+        }
+        return false
+      }
       // 3. hard-delete archived memories past observation
       for (const e of this.list({ includeArchived: true, includeLowQuality: true })) {
         if (!e.archived) continue
-        if (shouldDelete(e, observeDays, this.hasPendingCorrection(e.content), now)) {
+        if (shouldDelete(e, observeDays, pendingCorrection(e.content), now)) {
+          // P1-13: snapshot BEFORE physical delete — content is unrecoverable after
+          // hardDeleteMemory, so this row is the only durable evidence for rollback.
+          this.db.prepare(
+            'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
+          ).run(now, e.id, e.content, e.topic, e.importance, e.quality, heatOf(e, this.forgetDays, now), 'observed-observation-passed')
           this.hardDeleteMemory(e.id)
           deletedMem += 1
           decisions.push(`delete:${e.id}`)
@@ -674,6 +823,13 @@ export class MemoryStore {
         }
       }
 
+      // P1-14: bound audit-table growth (the "库只增不减" problem restated on the
+      // audit tables). Delete-snapshots are kept longer — they're the rollback window.
+      this.db.prepare('DELETE FROM failure_memories WHERE corrected_at < ?').run(now - 180 * DAY_MS)
+      this.db.prepare('DELETE FROM forget_runs WHERE ts < ?').run(now - 180 * DAY_MS)
+      this.db.prepare('DELETE FROM refine_runs WHERE ts < ?').run(now - 180 * DAY_MS)
+      this.db.prepare('DELETE FROM forget_deleted WHERE ts < ?').run(now - 365 * DAY_MS)
+
       const applied = demoted + archivedMem + deletedMem + archivedEpi + deletedEpi
       const sha = createHash('sha256').update(decisions.join('\n')).digest('hex').slice(0, 16)
       const run = this.db.prepare('INSERT INTO forget_runs(ts, candidate_sha, decisions, applied, status) VALUES (?,?,?,?,?)')
@@ -692,6 +848,6 @@ function inferKind(content: string): Kind {
   if (/(偏好|喜欢|prefer|风格|ppt|颜色|字体)/.test(c)) return 'preference'
   if (/(环境|配置|命令|安装|路径|端?口|host|url)/.test(c)) return 'env'
   if (/(教训|注意|坑|别|以后|avoid|pitfall)/.test(c)) return 'lesson'
-  if (/(决定|结论|方案|决策|选|用|采用)/.test(c)) return 'decision'
+  if (/(决定|结论|方案|决策|选用|采用|使用)/.test(c)) return 'decision'
   return 'general'
 }

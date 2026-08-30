@@ -47,7 +47,8 @@ dsh plugin --profile web add file:C:/abs/path/to/dsh-memory
     ├── episodes           # 情景会话摘要
     ├── ep_fts             # FTS5 情景索引
     ├── failure_memories   # 纠错留痕
-    └── forget_runs        # 遗忘审计
+    ├── forget_runs        # 遗忘审计
+    └── forget_deleted     # 真删快照（内容+原因，可回滚/可查，P1-13）
 ```
 
 ## 配置（可选）
@@ -69,14 +70,38 @@ forgetDays:                  # 期望遗忘时间（天）
 windowDays: 30               # frequency 滑动窗口（天）
 episodeRetentionDays: 180    # episodes 归档时间（天）
 forgetObserveDays: 30        # 归档→真删观察期（天）
+
+# --- 后台凝练 L0 / L1 / L2 ---
+l0Summarize: 'llm'           # 'llm' | 'rules'（L0 会话→情景摘要）
+l0Provider: ''               # L0 显式路由（缺省用会话 request-header）
+l0Model: ''
+l0MaxTokens: 400
+l0TimeoutMs: 8000            # L0 LLM 端到端超时（P1-10）
+l1Enabled: true              # L1 情景→稳定事实抽取（LLM 决策）
+l2Enabled: true              # L2 语义簇合并/仲裁（LLM 决策）
+l1Provider: ''               # L1/L2 显式路由（缺省：会话路由→宿主导航模型）
+l1Model: ''
+l1MaxTokens: 800
+l1TimeoutMs: 10000
+l2Provider: ''
+l2Model: ''
+l2MaxTokens: 800
+l2TimeoutMs: 10000
+refineIntervalMs: 3600000    # 后台整理扫描间隔
+l2MinCluster: 2              # L2 簇最小成员数
+l1RetryDegraded: false       # 是否重试 LLM 降级（extracted=2）的 episode
 ```
+
+> 运行时要求：Node **>=22.5**（`node:sqlite`；24 才稳定）。见 `package.json` 的 `engines`。
 
 ## 开发
 
 ```bash
-# 编译（对齐 dsh monorepo 类型；本项目无 tsc，须用 monorepo 的 tsc）
+# 编译（对齐 dsh monorepo 的类型；本项目未内置 @deepseek-ai 依赖，
+# 此处路径针对 D:/Apps/deepseek-harness 布局——独立安装请把 tsconfig 的
+# paths/typeRoots 改指向本地 node_modules 中已安装的 @deepseek-ai 包。）
 node "D:/Apps/deepseek-harness/node_modules/typescript/bin/tsc" -p tsconfig.json
-# 冒烟（无 dsh 也可跑，47 项断言）
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G17）
 node smoke.mjs
 ```
 
@@ -84,7 +109,7 @@ node smoke.mjs
 
 ## 状态
 
-- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫）——`smoke.mjs` 47 项断言全绿，`tsc` 零错误。
+- **M0-M3 完成**：幂等 schema、跨会话直写召回、情景层、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + user 免疫 + 真删快照）——`smoke.mjs` 全部断言组（120 项）全绿、稳定连跑通过，`tsc` 零错误。
 - **M4 真机装载**：待验证（需 dsh 环境 + 用户确认，dsh 是 RCE 面）。
 - **凝练 L1/L2（LLM 决策式整理）**：设计完成、v3 休眠，后续"先补护栏再接线"。
 

@@ -20,6 +20,9 @@
     "docs"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -39,8 +42,6 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=1",
-    "@deepseek-ai/dsh-agent": "*",
-    "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-session": "*",
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": ">=1"

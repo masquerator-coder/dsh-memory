@@ -113,6 +113,7 @@ export declare function summarizeLlm(llm: LlmStreamSeam, opts: {
     model: string;
     text: string;
     maxTokens?: number;
+    timeoutMs?: number;
     signal?: AbortSignal;
 }): Promise<string | null>;
 /**

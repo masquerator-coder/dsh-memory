@@ -263,11 +263,11 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
       let wrote = batchRes.applied.length
       if (batchRes.overflowed) {
         // tier-0 budget squeeze: persist what fits, fact-by-fact (nothing lost silently).
-        let any = false
+        let any = 0
         for (const op of ops) {
-          if (store.batch([op], input.sessionId).applied.length) any = true
+          if (store.batch([op], input.sessionId).applied.length) any += 1
         }
-        if (any) wrote = ops.length
+        if (any > 0) wrote = any // P2-31: report actual facts written, not the full batch size
       }
       if (wrote > 0) store.markEpisodeExtracted(ep.id, 1) // else leave extracted=0 to retry later
       const runId = store.writeRefineRun({ level: 1, sourceId: ep.id, promptSha: contentId(`${ep.id}\n${ep.summary}`), route, decisions: JSON.stringify(facts), status: 'ok' })
@@ -340,10 +340,10 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
         // keep → no-op
       }
       if (ops.length > 0) store.batch(ops, input.sessionId ?? 'l2-refine')
-      store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: JSON.stringify(applied), status: 'ok' })
+      const runId = store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: JSON.stringify(applied), status: 'ok' })
       stats.clusters += 1
       stats.verdictsApplied += applied.length
-      stats.runIds.push(0)
+      stats.runIds.push(runId) // P2-30: keep the real audit row id on the success path (was hard-coded 0)
     } catch {
       store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' })
       stats.clusters += 1

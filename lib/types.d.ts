@@ -86,6 +86,8 @@ export interface ApplyResult {
     entries: MemoryEntry[];
     /** true when the batch would exceed the tier-0 budget even after demotion. */
     overflowed: boolean;
+    /** Ids of entries demoted tier0→tier1 to fit the injection budget this batch. */
+    demoted: string[];
     usage: BudgetUsage;
 }
 export interface RecallHit {
@@ -102,28 +104,4 @@ export interface ForgetDays {
     lesson: number;
     decision: number;
     general: number;
-}
-/** Plugin configuration. Every field optional; defaults applied in apply(). */
-export interface Config {
-    /** Directory holding memory/memory.db. Default: $DSH_HOME or ~/.dsh. */
-    memoryHome?: string;
-    /** Register the Tier-0 system-prompt section. Default true. */
-    enableInjection?: boolean;
-    budgetTier0?: number;
-    budgetUser?: number;
-    budgetMemory?: number;
-    /** Minimum importance for a Tier-0 entry to be injected. Default 3. */
-    importanceThreshold?: number;
-    /** Weigh recall ranking by epistemic status. Default true. */
-    epistemicWeighting?: boolean;
-    /** Enable active forgetting (demote/archive/hard-delete). Default true. */
-    forgetEnabled?: boolean;
-    /** Expected time-to-forget per kind (days). */
-    forgetDays?: Partial<ForgetDays>;
-    /** Frequency sliding window (days). Default 30. */
-    windowDays?: number;
-    /** Episodes older than this (days) are archived. Default 180. */
-    episodeRetentionDays?: number;
-    /** Observation window (days) between archive and hard-delete. Default 30. */
-    forgetObserveDays?: number;
 }

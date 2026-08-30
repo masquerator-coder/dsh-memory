@@ -5,9 +5,11 @@
  * directly — untestable surfaces rot silently.
  */
 import type { Episode, MemoryEntry } from './types.js';
-/** Render semantic memories for every model-facing listing surface. */
+/** Render semantic memories for every model-facing listing surface.
+ *  (P0-6) content is untrusted model-written text; collapse newlines/control
+ *  chars so a single entry can never forge an extra list line. */
 export declare function formatEntries(entries: readonly MemoryEntry[]): string;
-/** Render episodic (session) memories. */
+/** Render episodic (session) memories. (P0-6) same one-line guard on summary. */
 export declare function formatEpisodes(episodes: readonly Episode[]): string;
 /** Completed-card verdict for a write. */
 export declare function writeVerdictLabel(action: string): string;

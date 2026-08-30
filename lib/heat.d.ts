@@ -38,6 +38,12 @@ export declare function shouldArchive(e: MemoryEntry, forgetDays: ForgetDays, no
  * Hard-delete gate (all conditions must hold — the importance gate is the real
  * "can we afford to delete this" check, heat only got it into the candidate set).
  *
+ * NOTE (P0-4): there is intentionally NO quality gate here. DESIGN §5.1's delete
+ * threshold is heat + importance + observation + non-user + no pending correction;
+ * `qualityScore` floors normal memories at 60+ (100 minus at most ~35), so a
+ * `quality < 60` gate made hard-delete unreachable for every real entry — the
+ * "库只增不减" goal would silently go unimplemented. Use heat/importance to gate.
+ *
  * @param hasPendingCorrection true when a failure_memories trail still references
  *   this entry's content (corrected-once → likely to change again → extend life).
  */

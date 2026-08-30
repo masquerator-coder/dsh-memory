@@ -46,18 +46,32 @@ export declare class MemoryStore {
     list(filter?: ListFilter): MemoryEntry[];
     activeEntries(): MemoryEntry[];
     count(): number;
+    /** Active (non-archived) episode count, without loading rows (P2-25). */
+    episodeCount(): number;
     /** Tier-0 (injectable, non-archived, non-low-quality) usage. */
     usage(): BudgetUsage;
     topicsIndex(): {
         topic: string;
         count: number;
     }[];
+    /** Bounded dedup candidate set (P2-16): only rows sharing the head of `content`
+     *  are compared for the duplicate penalty, so add/replace cost stops scaling with
+     *  library size. (Content-equality dedup — P0-2 — is exact and separate.) */
+    private nearCandidates;
     private autoTier;
     private writeMemory;
     private hardDeleteMemory;
     private applyOne;
-    private demoteToBudget;
-    private budgetOver;
+    /**
+     * Make the tier-0 injection budget fit by demoting the coldest eligible entries.
+     * Three budgets are enforced (P1-7): the memory layer, the user layer (user is
+     * immortal — never deleted, but CAN be pushed out of the resident injected set
+     * under pressure), and the whole-section cap. `importance >= 5` is the protected
+     * resident core and is never demoted — so if those alone overflow a bucket, the
+     * batch is rejected (overflow becomes truly reachable, P1-8). Returns the ids
+     * demoted and whether budget still exceeds after demotion (P1-9 surfaces them).
+     */
+    private enforceBudget;
     /** Model-facing write batch; lands globally and immediately. */
     batch(ops: MemoryOp[], sessionId?: string): ApplyResult;
     /** Refresh last_accessed + sliding-window frequency for recalled entries. */

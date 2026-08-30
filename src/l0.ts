@@ -185,32 +185,44 @@ export interface LlmStreamSeam {
  */
 export async function summarizeLlm(
   llm: LlmStreamSeam,
-  opts: { provider: string; model: string; text: string; maxTokens?: number; signal?: AbortSignal },
+  opts: { provider: string; model: string; text: string; maxTokens?: number; timeoutMs?: number; signal?: AbortSignal },
 ): Promise<string | null> {
   try {
     if (!opts.provider || !opts.model) return null
-    const system =
-      'You are the episodic summarizer of an AI memory system. ' +
-      'Condense the supplied conversation turn into a concise, factual session-summary episode ' +
-      '("what happened"), in the language of the conversation. Keep concrete facts, decisions, ' +
-      'and tool actions; drop chit-chat and filler. Output plain text only — no markdown, no preamble.'
-    const messages = [
-      { role: 'user', content: [{ type: 'text', text: opts.text }] },
-    ]
-    const chunks: string[] = []
-    for await (const chunk of llm.stream({
-      provider: opts.provider,
-      model: opts.model,
-      messages,
-      system,
-      maxTokens: opts.maxTokens ?? DEFAULT_L0_MAX_TOKENS,
-      signal: opts.signal,
-    })) {
-      const t = chunk?.text
-      if (typeof t === 'string' && t.length > 0) chunks.push(t)
+    // P1-10: enforce a real end-to-end timeout via AbortController (mirrors
+    // refine.ts llmText). An external signal is honored too — whichever fires
+    // first aborts the stream, so a runaway stream can never hang the process.
+    const ac = new AbortController()
+    const onAbort = (): void => ac.abort()
+    opts.signal?.addEventListener('abort', onAbort, { once: true })
+    const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? DEFAULT_L0_TIMEOUT_MS)
+    try {
+      const system =
+        'You are the episodic summarizer of an AI memory system. ' +
+        'Condense the supplied conversation turn into a concise, factual session-summary episode ' +
+        '("what happened"), in the language of the conversation. Keep concrete facts, decisions, ' +
+        'and tool actions; drop chit-chat and filler. Output plain text only — no markdown, no preamble.'
+      const messages = [
+        { role: 'user', content: [{ type: 'text', text: opts.text }] },
+      ]
+      const chunks: string[] = []
+      for await (const chunk of llm.stream({
+        provider: opts.provider,
+        model: opts.model,
+        messages,
+        system,
+        maxTokens: opts.maxTokens ?? DEFAULT_L0_MAX_TOKENS,
+        signal: ac.signal,
+      })) {
+        const t = chunk?.text
+        if (typeof t === 'string' && t.length > 0) chunks.push(t)
+      }
+      const text = chunks.join('').trim()
+      return text.length > 0 ? text : null
+    } finally {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', onAbort)
     }
-    const text = chunks.join('').trim()
-    return text.length > 0 ? text : null
   } catch {
     return null
   }
@@ -252,6 +264,7 @@ export async function runL0(
         model: input.model,
         text: texts.join('\n'),
         maxTokens: input.maxTokens,
+        timeoutMs: input.timeoutMs,
         signal: input.signal,
       })) ?? summarizeRules(texts)
     } else {
