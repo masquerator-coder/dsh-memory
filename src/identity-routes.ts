@@ -64,7 +64,12 @@ export function registerIdentityRoutes(ctx: Context, store: MemoryStore): () => 
       | { register?: (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }) => () => void }
       | undefined
     if (ws !== undefined && typeof ws.register === 'function') {
-      const register = ws.register
+      // 永远保留 ws 作为接收者：webServer.register 内部依赖 this 访问路由表，
+      // 直接解绑裸调（const r = ws.register; r(...)）会让 this 变 undefined，
+      // 触发 "Cannot read properties of undefined (reading 'exact')"。meow 用
+      // 的是 ctx.effect(() => ws.register(route)) 不解绑；这里为兼容 TS strict
+      // 的 optional-call 检查改 bind(ws)，行为等价。
+      const register = ws.register.bind(ws)
       try {
         ctx.effect(() => register({
           kind: 'exact',
