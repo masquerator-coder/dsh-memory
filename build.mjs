@@ -109,7 +109,7 @@ try {
   const esbuild = loadEsbuild()
   const BANNER = [
     'window.__ModuleLoader__.load({',
-    '  id: "memory",',
+    '  id: "dsh-memory",',
     '  factory: (require) => {',
     '    var module = { exports: {} };',
     '    var exports = module.exports;',
