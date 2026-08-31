@@ -41,7 +41,12 @@ export const memorySettingsSchema = z.object({
 export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   enabled: true,
   forgetEnabled: true,
-  identityAuto: true,
+  // 2026-08-31 (user.md 人写权威化): default OFF. user.md is a human-authored,
+  // decisive portrait like soul.md — the plugin must not auto-append user-layer
+  // memories into it (reintroduces the double-presentation + KV-prefix churn we
+  // removed from tier0 injection). User-layer memories still accumulate for
+  // recall; flipping this back on restores the old auto-maintenance behavior.
+  identityAuto: false,
   identityIntervalMs: 6 * 3600_000,
   refineIntervalMs: 3600_000,
   peakHourSuppress: true,

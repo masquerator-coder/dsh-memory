@@ -1,5 +1,11 @@
 import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Importance, Kind, Layer, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
 export declare const DEFAULT_BUDGET: MemoryBudget;
+/** Near-duplicate similarity threshold (contentSimilarity, 0=disjoint 1=id).
+ *  Writing a fact at or above this closeness to an existing active row merges
+ *  into that canonical row instead of inserting a duplicate (P2-dedup, 2026).
+ *  Kept conservative (0.85) so genuinely distinct facts sharing a long phrase
+ *  are not auto-merged; ambiguous cases go to replacement/待审, never auto. */
+export declare const SIM_DUP = 0.85;
 export declare function resolveDshHome(): string;
 /** Hard-content id: identical facts collapse instead of duplicating. */
 export declare function contentId(content: string): string;
@@ -63,6 +69,46 @@ export declare class MemoryStore {
      *  R4 (review 2026-08-30): the old `LIKE '%head%'` had a leading wildcard and
      *  full-scanned every row; this prefix-anchored range rides idx_mem_content. */
     private nearCandidates;
+    /** Return the single canonical active row already encoding the same fact as
+     *  `content` (contentSimilarity >= SIM_DUP, same layer), or null.
+     *
+     *  P2-dedup (2026-08-31): the shared near-duplicate primitive. Used by
+     *  `add` (merge instead of insert), the identity-write gate, and cross-cluster
+     *  L2 (periodic re-dedup) — one place decides "is this a new fact or a
+     *  rewording of an existing one", so those paths can't disagree.
+     *
+     *  Candidate generation is bounded via mem_fts MATCH on word tokens (the same
+     *  pattern recall uses), so RE-WORDED duplicates surface on shared tokens —
+     *  unlike the prefix-12 scan in nearCandidates, which an entry whose opening
+     *  was rewritten slips past. Exact-content always wins (authoritative). */
+    findCanonical(content: string, layer?: Layer): MemoryEntry | null;
+    /** All ACTIVE rows near-duplicate to `content` (same layer; exact match always
+     *  first). Uses the LOOSE `isNearDupCandidate` gate because it feeds candidate
+     *  GROUPING (cross-topic L2 fusion + one-shot migration) where a downstream
+     *  judge decides the real merge — not the write-time auto-merge, which stays
+     *  strict (SIM_DUP) in findCanonical. O(n) over active rows (personal scale). */
+    nearDuplicates(content: string, layer?: Layer): MemoryEntry[];
+    /** Cross-topic near-duplicate groups for L2 (P2-dedup, 2026-08-31).
+     *  `semanticClusters()` groups strictly by the `topic` string, so a fact
+     *  reworded into a different topic (approval-policy / approval policy /
+     *  审批策略) lands in separate clusters and is never co-adjudicated. This
+     *  pass assembles connected components of near-duplicates (BFS following
+     *  nearDuplicates) across topic boundaries, so L2 can merge/drop them.
+     *  Bounded: stops after `limit` groups. */
+    crossTopicNearDupGroups(opts?: {
+        min?: number;
+        limit?: number;
+    }): {
+        seedId: string;
+        topic: string;
+        facts: {
+            id: string;
+            content: string;
+            kind?: Kind;
+            importance?: Importance;
+            updated: number;
+        }[];
+    }[];
     private autoTier;
     private writeMemory;
     private hardDeleteMemory;

@@ -36,7 +36,7 @@ import type {
   Tier,
 } from './types.js'
 import { DAY_MS, heatOf, resolveForgetDays, shouldArchive, shouldDelete, shouldDemote } from './heat.js'
-import { contentSimilarity, isLowQuality, qualityScore } from './quality.js'
+import { contentSimilarity, isNearDupCandidate, isLowQuality, qualityScore } from './quality.js'
 import { DDL, migrateColumns, rebuildFts } from './schema.js'
 
 export const DEFAULT_BUDGET: MemoryBudget = { tier0: 900, user: 400, memory: 500 }
@@ -49,6 +49,12 @@ const TOPIC_MAX = 40
  * substring-match. Prevents a tiny fragment from silently overwriting a whole
  * entry (P0-3). */
 const MIN_REPLACE_FRAGMENT = 8
+/** Near-duplicate similarity threshold (contentSimilarity, 0=disjoint 1=id).
+ *  Writing a fact at or above this closeness to an existing active row merges
+ *  into that canonical row instead of inserting a duplicate (P2-dedup, 2026).
+ *  Kept conservative (0.85) so genuinely distinct facts sharing a long phrase
+ *  are not auto-merged; ambiguous cases go to replacement/待审, never auto. */
+export const SIM_DUP = 0.85
 /** Cap on facts offered per L2 cluster — a giant untagged 'general' bucket must
  * not be dumped whole into the LLM prompt (P2-29). */
 const MAX_FACTS_PER_CLUSTER = 25
@@ -294,6 +300,108 @@ export class MemoryStore {
     return rows.map(r => this.rowToEntry(r))
   }
 
+  /** Return the single canonical active row already encoding the same fact as
+   *  `content` (contentSimilarity >= SIM_DUP, same layer), or null.
+   *
+   *  P2-dedup (2026-08-31): the shared near-duplicate primitive. Used by
+   *  `add` (merge instead of insert), the identity-write gate, and cross-cluster
+   *  L2 (periodic re-dedup) — one place decides "is this a new fact or a
+   *  rewording of an existing one", so those paths can't disagree.
+   *
+   *  Candidate generation is bounded via mem_fts MATCH on word tokens (the same
+   *  pattern recall uses), so RE-WORDED duplicates surface on shared tokens —
+   *  unlike the prefix-12 scan in nearCandidates, which an entry whose opening
+   *  was rewritten slips past. Exact-content always wins (authoritative). */
+  findCanonical(content: string, layer?: Layer): MemoryEntry | null {
+    const c = (content ?? '').trim()
+    if (!c) return null
+    // Exact content is the source of truth — rejoins even a row whose id has
+    // drifted after a `replace`, and reactivates an archived fact (R1 contract).
+    const exact = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
+    if (exact) {
+      const e = this.rowToEntry(exact)
+      if (!layer || e.layer === layer) return e
+    }
+    // Near-duplicate: full bounded scan of ACTIVE rows with the STRICT
+    // SIM_DUP gate (write-time auto-merge must be conservative — never collapse
+    // two genuinely distinct facts that happen to share a long phrase). A
+    // personal dsh memory store is small (hundreds of rows), so an O(n) scan is
+    // microseconds and is far more reliable than FTS phrase-matching, which
+    // missed reworded entries containing path-like tokens (c:\users\...). Keep
+    // the highest-importance, earliest-created winner as canonical.
+    let best: MemoryEntry | null = null
+    for (const e of this.list({ includeArchived: false, includeLowQuality: false })) {
+      if (layer && e.layer !== layer) continue
+      if (contentSimilarity(e.content, c) < SIM_DUP) continue
+      if (!best || e.importance > best.importance || (e.importance === best.importance && e.created < best.created)) best = e
+    }
+    return best
+  }
+
+  /** All ACTIVE rows near-duplicate to `content` (same layer; exact match always
+   *  first). Uses the LOOSE `isNearDupCandidate` gate because it feeds candidate
+   *  GROUPING (cross-topic L2 fusion + one-shot migration) where a downstream
+   *  judge decides the real merge — not the write-time auto-merge, which stays
+   *  strict (SIM_DUP) in findCanonical. O(n) over active rows (personal scale). */
+  nearDuplicates(content: string, layer?: Layer): MemoryEntry[] {
+    const c = (content ?? '').trim()
+    if (!c) return []
+    const out: MemoryEntry[] = []
+    const seen = new Set<string>()
+    const exact = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
+    if (exact) {
+      const e = this.rowToEntry(exact)
+      if (!e.archived && (!layer || e.layer === layer)) { out.push(e); seen.add(e.id) }
+    }
+    for (const e of this.list({ includeArchived: false, includeLowQuality: false })) {
+      if (seen.has(e.id)) continue
+      if (layer && e.layer !== layer) continue
+      if (isNearDupCandidate(e.content, c)) { out.push(e); seen.add(e.id) }
+    }
+    return out
+  }
+
+  /** Cross-topic near-duplicate groups for L2 (P2-dedup, 2026-08-31).
+   *  `semanticClusters()` groups strictly by the `topic` string, so a fact
+   *  reworded into a different topic (approval-policy / approval policy /
+   *  审批策略) lands in separate clusters and is never co-adjudicated. This
+   *  pass assembles connected components of near-duplicates (BFS following
+   *  nearDuplicates) across topic boundaries, so L2 can merge/drop them.
+   *  Bounded: stops after `limit` groups. */
+  crossTopicNearDupGroups(
+    opts: { min?: number; limit?: number } = {},
+  ): { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance; updated: number }[] }[] {
+    const min = opts.min ?? 2
+    const limit = opts.limit ?? 8
+    const active = this.list({ includeArchived: false, includeLowQuality: false })
+    const consumed = new Set<string>()
+    const groups: { seedId: string; topic: string; facts: { id: string; content: string; kind?: Kind; importance?: Importance; updated: number }[] }[] = []
+    for (const probe of active) {
+      if (consumed.has(probe.id)) continue
+      const members: MemoryEntry[] = [probe]
+      consumed.add(probe.id)
+      const stack: MemoryEntry[] = [probe]
+      while (stack.length > 0) {
+        const cur = stack.pop()!
+        for (const nd of this.nearDuplicates(cur.content, cur.layer)) {
+          if (consumed.has(nd.id)) continue
+          consumed.add(nd.id); members.push(nd); stack.push(nd)
+        }
+      }
+      if (members.length >= min) {
+        const seed = [...members].sort((a, b) => b.importance - a.importance || a.created - b.created)[0]
+        groups.push({
+          seedId: seed.id,
+          topic: seed.topic,
+          facts: members.map(m => ({ id: m.id, content: m.content, kind: m.kind, importance: m.importance, updated: m.updated }))
+            .sort((a, b) => a.importance - b.importance || a.updated - b.updated).slice(0, MAX_FACTS_PER_CLUSTER),
+        })
+        if (groups.length >= limit) break
+      }
+    }
+    return groups
+  }
+
   // ---- writes (memories) ---------------------------------------------------
 
   private autoTier(layer: Layer, importance: Importance, quality: number, kind: Kind, low: boolean): Tier {
@@ -345,8 +453,13 @@ export class MemoryStore {
         let existing = this.get(cid)
         if (existing && existing.content !== content) existing = undefined // cid row belongs to a different fact (drift) — don't trust it
         if (!existing) {
-          const dup = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(content) as Record<string, unknown> | undefined
-          if (dup) existing = this.rowToEntry(dup)
+          // P2-dedup (2026-08-31): the exact-content lookup below was only able
+          // to catch byte-identical duplicates (P0-2). findCanonical extends it
+          // one step further — a RE-WORDED near-duplicate (contentSimilarity >=
+          // SIM_DUP) also merges into the canonical row instead of inserting a
+          // new one, which is what let approval-policy / workspace / file-policy
+          // bloat into 6-9 near-identical rows. Exact-content still wins first.
+          existing = this.findCanonical(content, layer) ?? undefined
         }
         const id = existing ? existing.id : cid
         const quality = existing ? existing.quality : qualityScore(content, this.nearCandidates(content))

@@ -36,6 +36,44 @@ export function contentSimilarity(a: string, b: string): number {
   return longestCommonSubstr(a, b) / Math.min(a.length, b.length)
 }
 
+/** Tokenize into significant tokens: alphanumeric runs (English) + CJK chars
+ *  and bigrams (the gap unicode61 leaves for CJK). Shared tokens are what make
+ *  a RE-WORDED duplicate recognizable even when its openers diverge. */
+export function tokenize(s: string): Set<string> {
+  const t = new Set<string>()
+  const low = s.toLowerCase()
+  for (const m of low.matchAll(/[a-z0-9]+/g)) t.add(m[0])
+  for (const m of low.matchAll(/[\u4e00-\u9fff]+/g)) {
+    const seq = m[0]
+    if (seq.length === 1) t.add(seq)
+    for (let i = 0; i < seq.length - 1; i++) t.add(seq.slice(i, i + 2))
+  }
+  return t
+}
+
+/** Token containment: |a∩b| / min(|a|,|b|) — the fraction of the shorter
+ *  entry's vocabulary the other one shares. 0 = nothing shared, 1 = subset. */
+export function tokenContain(a: string, b: string): number {
+  const A = tokenize(a), B = tokenize(b)
+  if (A.size === 0 || B.size === 0) return 0
+  let inter = 0
+  for (const t of A) if (B.has(t)) inter++
+  return inter / Math.min(A.size, B.size)
+}
+
+/** Aperture gate for CANDIDATE grouping only (L2 cross-topic + one-shot
+ *  migration): treat two rows as "possibly the same fact reworded" on a shared
+ *  token mass AND a contiguous run. Loose by design — the downstream judge
+ *  (LLM via L2, or the human reviewing an archive manifest) decides the actual
+ *  merge. Never used for the write-time auto-merge, which stays strict
+ *  (SIM_DUP / contentSimilarity) so distinct facts are not collapsed blindly. */
+export function isNearDupCandidate(a: string, b: string): boolean {
+  const l = contentSimilarity(a, b)
+  if (l >= 0.85) return true
+  if (l >= 0.55 && tokenContain(a, b) >= 0.55) return true
+  return false
+}
+
 export function qualityScore(content: string, existing: readonly MemoryEntry[]): number {
   const c = content.trim()
   let s = 100

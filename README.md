@@ -106,7 +106,7 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 |---|---|---|
 | 记忆总开关 | `enabled` | 关 → 清洁会话（不注入任何记忆），后台整理/遗忘/维护全停 |
 | 主动遗忘 | `forgetEnabled` | 关 → 暂停降级/归档/硬删，**不清理已有记忆** |
-| user.md 自动进化 | `identityAuto` | 关 → 停止自动维护 user.md |
+| user.md 自动进化 | `identityAuto` | 关（default）→ user.md 人写权威，插件不自动 append；开 → 恢复自动维护 |
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
 | 身份维护扫描间隔 | `identityIntervalMs` | user.md 自动同步周期 |
 | soul.md / user.md 内联编辑 | — | 直接读写身份文件（文件仍为真相源） |
@@ -114,7 +114,7 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 ### 2.3 身份文件（soul.md / user.md）
 
 - **soul.md**：AI 人格 / 行为准则，**只由人写**，插件永不自动改写。
-- **user.md**：用户长期画像，**自动维护**——把 `layer=user` 稳定记忆增量写入（内容哈希去重、无新增不写、超 `identityMaxBytes` 跳过不截断）。
+- **user.md**：用户长期画像，**人写权威（2026-08-31 起）**——与 soul.md 同机制，由人维护，插件不再自动 append（`identityAuto` 默认关）。`layer=user` 稳定记忆继续在库中积累、供 `memory_recall` 召回，但**不注入 Tier0**（画像只经 user.md 呈现，避免双份 + KV-prefix 抖动）。
 
 两者作为恒定 section 注入（mtime 变化才重读，KV 缓存友好），不与 memories 表混管（不该被热度/遗忘管）。Windows 写入无 BOM UTF-8。
 
@@ -129,6 +129,8 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 ### 2.5 关于 KV Cache（配置注意事项）
 
 Tier0 section 每次装配现算。写入路径会按"从第一个变动的 token 起复用失效"影响前缀缓存命中：**append-only** 代价最小；**replace/remove** 位置之后的 token 全量重算。因此建议：跨会话稳定的记忆尽量在会话早期写入；频繁检索走 `memory_recall`（不落盘、不动 section）；不要在会话中途反复改预算/开关。
+
+**2026-08-31 去重改造对 KV 的影响（正向）**：`layer=user` 记忆已移出 Tier0 注入（画像只经 user.md 恒定 section 呈现），Tier0 段落在会话间趋于稳定；新增"写时近重复合并"（`findCanonical`，严格门 `SIM_DUP=0.85`）与"跨 topic 分组"（L2 周期用 LLM 判断歧义），重复事实被合并/收敛而不是反复 INSERT——两者都让 Tier0 内容更少变动，前缀命中更稳。
 
 ---
 
@@ -225,7 +227,7 @@ enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section
 
 # --- R3-total / R3-i：记忆总开关 & 身份维护 ---
 enabled: true                # false → 清洁会话，后台全部停；memory 工具保留
-identityAuto: true           # 自动把 layer=user 稳定记忆增量写入 user.md
+identityAuto: false            # default: user.md 人写权威，插件不自动 append（开=true 恢复自动维护）
 identityIntervalMs: 21600000 # 默认 6h
 identityMaxBytes: 2000       # user.md 自动追加上限，达到后跳过不截断
 ```
@@ -290,6 +292,7 @@ node smoke.mjs
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
 - **后台凝练 L1/L2**：v3 休眠（仅零 LLM 骨架 + 纯规则降级/归档），为后续接线预留、遵循先护栏后接线纪律。
 - **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.5）。
+- **去重 + 身份权威化（2026-08-31）**：① 写时近重复合并 `findCanonical`（严格门）+ L1 同通道受益；② `isNearDupCandidate` token 宽松门支撑跨 topic 分组；③ `crossTopicNearDupGroups` 接入 L2 周期，破除按 topic 聚类边界；④ `layer=user` 移出 Tier0 注入、`identityAuto` 默认 false —— user.md 转人写权威（画像只经 user.md 呈现）。迁移：活库一键归档无歧义重复 + 修错误路径，歧义交 L2。
 
 ---
 

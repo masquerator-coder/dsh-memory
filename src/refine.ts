@@ -367,7 +367,14 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
   const stats = { clusters: 0, degraded: 0, verdictsApplied: 0, runIds: [] as number[] }
   if (!input.llm || !input.provider || !input.model) return stats
   const route = `${input.provider}/${input.model}`
-  const clusters = store.semanticClusters({ min: input.minCluster ?? 2, limit: input.limit ?? REFINE_BATCH_LIMIT, incremental: input.incremental === true })
+  // P2-dedup (2026-08-31): beyond the by-topic clusters, also adjudicate
+  // cross-topic near-duplicate groups (a fact reworded into a different topic
+  // string would otherwise never be co-audited). Dead ids from prior merges are
+  // filtered when verdicts are applied, so overlap is safe (idempotent).
+  const clusters = [
+    ...store.semanticClusters({ min: input.minCluster ?? 2, limit: input.limit ?? REFINE_BATCH_LIMIT, incremental: input.incremental === true }),
+    ...store.crossTopicNearDupGroups({ min: 2, limit: 4 }),
+  ]
   for (const cluster of clusters) {
     try {
       const prompt = buildL2Prompt(cluster.facts)
