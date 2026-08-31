@@ -63,7 +63,7 @@ budgetUser: 400
 budgetMemory: 500
 importanceThreshold: 3
 epistemicWeighting: true
-forgetEnabled: true          # 主动遗忘开关
+forgetEnabled: true          # 主动遗忘开关（设置页可切换；false → 暂停热度衰减记忆的降级/归档/硬删，不清理已有记忆）
 forgetDays:                  # 期望遗忘时间（天）；0 = 立即过冷（下一次遗忘扫描即降级/归档，仍受重要性与观察期门槛保护）
   env: 365
   lesson: 180
@@ -152,7 +152,7 @@ node smoke.mjs
 - **P2-37（replace 保持 topic）**：`memory` 工具 replace 未显式传 `topic` 时保留原条目 topic，不再回落 `general`——避免拆散同 topic 的 L2 簇。
 - **R3-total（记忆开关）**：`enabled=false` 时新会话为不注入任何记忆的清洁会话（tier0 / 身份 section 均不注入），后台整理/遗忘/身份维护全停；`memory`/`memory_recall` 工具保留供主动使用。
 - **R3-i（身份文件自动进化）**：`autocreateIdentityFiles` 启动即自动建空白 soul.md/user.md；`maintainUserIdentity` 纯规则 pass（零 LLM）把 `layer=user` 稳定记忆增量写入 user.md——用 `identity_synced` 表按 `contentId` 去重，**无新增内容则不写入**（先扫描的守卫），文件超过 `identityMaxBytes` 后跳过追加、绝不截断。soul.md 保留人工维护（AI 人格是设计决策，不由凝练自动生成）。
-- **R3-ui（设置页面板）**：在 dsh 设置页左侧新增「记忆」设置项（官方 `settings.section` slot）——记忆总开关、user.md 自动进化开关、身份维护扫描间隔、忙闲时段抑制开关、soul.md/user.md 内联编辑。前端 client 入口（`exports["./client"]` + esbuild 打包成 ModuleLoader 格式、`id:"dsh-memory"`=包名），通过 `ctx.settingsScope.bind({namespace:'memory'})` 读写 `memory` 设置命名空间（后端 `ctx.settings.register` + `scope.watch` live 热生效）；soul/user 文件经 `/memory/identity` HTTP 路由读写（文件仍为真相源，可人工手编；路由注册用 `bind(ws)` 保留 webServer 接收者）。
+- **R3-ui（设置页面板）**：在 dsh 设置页左侧新增「记忆」设置项（官方 `settings.section` slot）——记忆总开关、主动遗忘开关、user.md 自动进化开关、身份维护扫描间隔、忙闲时段抑制开关、soul.md/user.md 内联编辑。前端 client 入口（`exports["./client"]` + esbuild 打包成 ModuleLoader 格式、`id:"dsh-memory"`=包名），通过 `ctx.settingsScope.bind({namespace:'memory'})` 读写 `memory` 设置命名空间（后端 `ctx.settings.register` + `scope.watch` live 热生效）；soul/user 文件经 `/memory/identity` HTTP 路由读写（文件仍为真相源，可人工手编；路由注册用 `bind(ws)` 保留 webServer 接收者）。
 - **真机联调通过（2026-08-31）**：dsh web 重启后「记忆」设置项出现、面板五控件渲染正常；`curl /memory/identity` 返回 soul 全量（路由通）；设置页关「记忆总开关」→ 新会话 agent 不记得自己（live 生效铁证），打开恢复。R3 记忆总开关 + R3-ui 设置页全通。
 
 ## soul.md / user.md（M9）

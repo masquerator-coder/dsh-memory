@@ -9,6 +9,7 @@
  *
  * Fields are the ones a user can reasonably toggle on a settings page:
  *   enabled              master memory switch (clean sessions when false)
+ *   forgetEnabled        active-forgetting switch (pause demote/archive/hard-delete)
  *   identityAuto         auto-maintain user.md from user-layer memories
  *   identityIntervalMs   identity maintenance cadence (ms)
  *   refineIntervalMs     L1/L2 condensation scan cadence (ms)
@@ -18,6 +19,7 @@ import z from '@deepseek-ai/schemastery';
 /** Memory settings exposed to the settings UI (subset of the full Config). */
 export interface MemorySettings {
     enabled: boolean;
+    forgetEnabled: boolean;
     identityAuto: boolean;
     identityIntervalMs: number;
     refineIntervalMs: number;
@@ -25,12 +27,14 @@ export interface MemorySettings {
 }
 export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     enabled: z<boolean, boolean>;
+    forgetEnabled: z<boolean, boolean>;
     identityAuto: z<boolean, boolean>;
     identityIntervalMs: z<number, number>;
     refineIntervalMs: z<number, number>;
     peakHourSuppress: z<boolean, boolean>;
 }>, Schemastery.ObjectT<{
     enabled: z<boolean, boolean>;
+    forgetEnabled: z<boolean, boolean>;
     identityAuto: z<boolean, boolean>;
     identityIntervalMs: z<number, number>;
     refineIntervalMs: z<number, number>;

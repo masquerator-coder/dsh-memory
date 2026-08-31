@@ -17,8 +17,32 @@
  */
 import { useEffect, useState, type JSX } from 'react'
 
+/**
+ * Memory/nav glyph — a neuron (soma + radiating dendrites + synapse nodes),
+ * drawn standalone so the plugin carries its own settings icon without
+ * importing any harness UI package. `currentColor` inherits the nav text
+ * colour; the shell renders it ahead of its built-in gear fallback.
+ */
+function MemoryIcon(): JSX.Element {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="8" cy="8" r="2.1" fill="currentColor" />
+      <path d="M8 5.9V3.2 M8 10.1V12.8 M5.9 8H3.2 M10.1 8H12.8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <circle cx="8" cy="3.2" r="0.9" fill="currentColor" />
+      <circle cx="8" cy="12.8" r="0.9" fill="currentColor" />
+      <circle cx="3.2" cy="8" r="0.9" fill="currentColor" />
+      <circle cx="12.8" cy="8" r="0.9" fill="currentColor" />
+      <circle cx="4.7" cy="4.7" r="0.8" fill="currentColor" />
+      <circle cx="11.3" cy="4.7" r="0.8" fill="currentColor" />
+      <circle cx="4.7" cy="11.3" r="0.8" fill="currentColor" />
+      <circle cx="11.3" cy="11.3" r="0.8" fill="currentColor" />
+    </svg>
+  )
+}
+
 interface MemorySettingsValue {
   enabled?: boolean
+  forgetEnabled?: boolean
   identityAuto?: boolean
   identityIntervalMs?: number
   refineIntervalMs?: number
@@ -130,6 +154,13 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         disabled={!ready}
         onChange={(next) => set('peakHourSuppress', next)}
       />
+      <Toggle
+        label="主动遗忘"
+        hint="关闭后暂停热度衰减记忆的降级/归档/硬删（仅暂停，不清理已有记忆）"
+        checked={value.forgetEnabled ?? true}
+        disabled={!ready}
+        onChange={(next) => set('forgetEnabled', next)}
+      />
       <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0' }}>
         <span style={{ flex: 1 }}>
           <div>身份维护扫描间隔（小时）</div>
@@ -185,6 +216,7 @@ export function apply(ctx: any): () => void {
       id: 'memory',
       order: 50,
       label: () => '记忆',
+      icon: <MemoryIcon />,
       inject: () => ({ scope, loadIdentity, saveIdentity }),
     },
     MemorySettingsPanel,

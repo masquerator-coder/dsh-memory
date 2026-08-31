@@ -241,6 +241,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   const identityMaxBytes = config.identityMaxBytes ?? IDENTITY_MAX_BYTES
   const settingsBase: MemorySettings = {
     enabled: config.enabled ?? MEMORY_SETTINGS_DEFAULTS.enabled,
+    forgetEnabled: config.forgetEnabled ?? MEMORY_SETTINGS_DEFAULTS.forgetEnabled,
     identityAuto: config.identityAuto ?? MEMORY_SETTINGS_DEFAULTS.identityAuto,
     identityIntervalMs: config.identityIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.identityIntervalMs,
     refineIntervalMs: config.refineIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.refineIntervalMs,
@@ -258,12 +259,14 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (settingsScope) {
     const seed = settingsScope.get()
     runtime.enabled = seed.enabled
+    runtime.forgetEnabled = seed.forgetEnabled
     runtime.identityAuto = seed.identityAuto
     runtime.identityIntervalMs = seed.identityIntervalMs
     runtime.refineIntervalMs = seed.refineIntervalMs
     runtime.peakHourSuppress = seed.peakHourSuppress
     settingsScope.watch((next) => {
       runtime.enabled = next.enabled
+      runtime.forgetEnabled = next.forgetEnabled
       runtime.identityAuto = next.identityAuto
       runtime.identityIntervalMs = next.identityIntervalMs
       runtime.refineIntervalMs = next.refineIntervalMs
@@ -279,7 +282,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   let identityTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): void => {
-    if (disposed || !runtime.enabled) return
+    if (disposed || !runtime.enabled || !runtime.forgetEnabled) return
     try {
       store.forgetRun({
         forgetDays: config.forgetDays,

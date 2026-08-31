@@ -9,6 +9,7 @@
  *
  * Fields are the ones a user can reasonably toggle on a settings page:
  *   enabled              master memory switch (clean sessions when false)
+ *   forgetEnabled        active-forgetting switch (pause demote/archive/hard-delete)
  *   identityAuto         auto-maintain user.md from user-layer memories
  *   identityIntervalMs   identity maintenance cadence (ms)
  *   refineIntervalMs     L1/L2 condensation scan cadence (ms)
@@ -19,6 +20,7 @@ import z from '@deepseek-ai/schemastery'
 /** Memory settings exposed to the settings UI (subset of the full Config). */
 export interface MemorySettings {
   enabled: boolean
+  forgetEnabled: boolean
   identityAuto: boolean
   identityIntervalMs: number
   refineIntervalMs: number
@@ -27,6 +29,7 @@ export interface MemorySettings {
 
 export const memorySettingsSchema = z.object({
   enabled: z.boolean(),
+  forgetEnabled: z.boolean(),
   identityAuto: z.boolean(),
   identityIntervalMs: z.number(),
   refineIntervalMs: z.number(),
@@ -37,6 +40,7 @@ export const memorySettingsSchema = z.object({
  *  then the settings user layer overrides cordis config). */
 export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   enabled: true,
+  forgetEnabled: true,
   identityAuto: true,
   identityIntervalMs: 6 * 3600_000,
   refineIntervalMs: 3600_000,
