@@ -141,13 +141,6 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         onChange={(next) => set('enabled', next)}
       />
       <Toggle
-        label="user.md 自动进化"
-        hint="自动把稳定用户记忆增量写入 user.md（无新增内容则不写）"
-        checked={value.identityAuto ?? true}
-        disabled={!ready}
-        onChange={(next) => set('identityAuto', next)}
-      />
-      <Toggle
         label="忙闲时段抑制扫描"
         hint="峰时（默认北京 09–12 / 14–18）跳过后台 LLM 凝练，省 API 费用"
         checked={value.peakHourSuppress ?? true}
@@ -164,7 +157,7 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
       <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0' }}>
         <span style={{ flex: 1 }}>
           <div>身份维护扫描间隔（小时）</div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>user.md 自动同步的周期</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>身份维护扫描周期（在配置中开启 identityAuto 后生效）</div>
         </span>
         <input
           type="number"
@@ -180,7 +173,7 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         />
       </label>
       <FileEditor label="soul.md（AI 人格/行为准则，人写）" value={identity.soul} onSave={(content) => props.saveIdentity('soul', content)} />
-      <FileEditor label="user.md（用户画像，自动同步 + 可编辑）" value={identity.user} onSave={(content) => props.saveIdentity('user', content)} />
+      <FileEditor label="user.md（用户画像，可编辑）" value={identity.user} onSave={(content) => props.saveIdentity('user', content)} />
     </div>
   )
 }
