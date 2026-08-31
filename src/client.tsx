@@ -180,8 +180,23 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
 
 export const inject = ['slots', 'settingsScope']
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function apply(ctx: any): () => void {
+/**
+ * P3-10 (review 2026-08-31): minimal structural types for the host seams the
+ * client entry consumes — replaced the old `apply(ctx: any)` + eslint-disable,
+ * so client-side checking stays on without importing any harness package.
+ * (Same idea as the server entry's `declare module` augmentation.)
+ */
+interface ClientSlots {
+  inject(slot: string, factory: () => unknown): () => void
+  register(registration: Record<string, unknown>, component: (props: PanelProps) => JSX.Element): unknown
+}
+
+interface ClientContext {
+  settingsScope: { bind(opts: { namespace: string }): MemoryScope }
+  slots: ClientSlots
+}
+
+export function apply(ctx: ClientContext): () => void {
   const scope: MemoryScope = ctx.settingsScope.bind({ namespace: 'memory' })
 
   const loadIdentity = async (): Promise<IdentityFiles> => {

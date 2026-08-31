@@ -45,8 +45,16 @@ export declare class MemoryStore {
     private readonly rowidStmt;
     private readonly epiRowidStmt;
     private readonly getMemStmt;
+    /** P3-1 (review 2026-08-31): prepared-statement cache keyed by SQL text —
+     *  `list()`, the exact-content dedup lookups, and the forget/audit updates
+     *  re-prepared on every call (the same 3.5x gap P3-11 fixed for `get()`),
+     *  and they sit on the add / enforceBudget / forgetRun hot paths. Clause-
+     *  combination SQL (list/recall) yields a bounded, structural key set. */
+    private readonly stmtCache;
     constructor(home?: string, budget?: MemoryBudget, windowDays?: number, forgetDays?: ForgetDays);
     close(): void;
+    /** P3-1: cached prepare — see {@link stmtCache}. */
+    private stmt;
     private rowToEntry;
     private rowToEpisode;
     get(id: string): MemoryEntry | undefined;
@@ -223,6 +231,11 @@ export declare class MemoryStore {
         newContent: string;
         correctedAt: number;
     }[];
+    /** P3-2 (review 2026-08-31): shared pending-correction predicate — this was
+     *  duplicated verbatim between hasPendingCorrection and forgetRun's inline
+     *  closure (P2-18). One place decides "is this content still referenced by a
+     *  correction trail (corrected-once → extend life)". */
+    private pendingCorrectionIn;
     /** True when a failure trail still references this content (corrected-once → extend life). */
     hasPendingCorrection(content: string): boolean;
     forgetRun(cfg: {

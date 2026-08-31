@@ -858,6 +858,87 @@ group('G23 R3-ui identity file read/write')
   rmSync(t, { recursive: true, force: true })
 }
 
+// G24 — review fixes 2026-08-31 (P1-1 near-dup merge survival / P2-1 metadata
+// preservation on near-dup re-add / P2-3 empty topic / P3-4 composite PK)
+group('G24 review fixes 2026-08-31 (P1-1 / P2-1 / P2-3 / P3-4)')
+{
+  // P1-1: an L2 merge whose content is a NEAR-duplicate (not byte-identical)
+  // of one of its own targets must NOT archive that target — store.add merges
+  // the text INTO the canonical row (keeping its id), so the old
+  // `id !== contentId(merged)` guard removed the very row it had just updated.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-f1-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', topic: 'fixdup', content: '数据库连接串在环境变量DB_URL里' }])
+    s.batch([{ action: 'add', topic: 'fixdup', content: '会议室的投影仪需要提前一天预约登记' }])
+    const cl = s.semanticClusters({ min: 2 })
+    assert('G24 P1-1 cluster assembled', cl.length >= 1 && cl[0].facts.length === 2)
+    const idA = s.activeEntries().find(e => e.content.includes('DB_URL')).id
+    const idB = s.activeEntries().find(e => e.content.includes('投影仪')).id
+    // merged text is a prefix-substring of target A → contentSimilarity = 1 ≥ SIM_DUP
+    const mergedContent = '数据库连接串在环境变量DB_URL'
+    const seam = { stream: async function* () { yield { type: 'text-delta', text: JSON.stringify([{ action: 'merge', targetIds: [idA, idB], content: mergedContent, kind: 'env' }]) } } }
+    const st = await runRefineL2(s, { llm: seam, provider: 'p', model: 'm', minCluster: 2 })
+    assert('G24 P1-1 near-dup merge verdict applied', st.verdictsApplied >= 1)
+    const active = s.activeEntries()
+    assert('G24 P1-1 exactly one active row survives the merge', active.length === 1)
+    assert('G24 P1-1 surviving row carries the merged content', active[0].content === mergedContent)
+    assert('G24 P1-1 canonical target NOT self-archived', s.get(idA).archived === false)
+    assert('G24 P1-1 the other target WAS archived', s.get(idB).archived === true)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P2-1: re-adding a near-worded fact WITHOUT explicit importance must keep
+  // the canonical row's importance — a default 3 used to pierce the
+  // importance>=5 never-hard-delete immunity.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-f2-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'memory', kind: 'env', importance: 5, topic: 'imm', content: '最高保护级别的关键环境事实正文内容保持唯一' }])
+    s.batch([{ action: 'add', layer: 'memory', content: '最高保护级别的关键环境事实正文内容保持唯一性' }]) // near-dup, no importance/kind
+    const rows = s.activeEntries().filter(e => e.content.includes('关键环境事实'))
+    assert('G24 P2-1 near-dup re-add merged into one row', rows.length === 1)
+    assert('G24 P2-1 importance=5 preserved (immunity not pierced)', rows[0].importance === 5)
+    assert('G24 P2-1 kind preserved on near-dup merge', rows[0].kind === 'env')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P2-3: an explicit empty-string topic falls back to 'general' — no '' bucket.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-f3-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', topic: '', content: '显式空话题的条目应当回落到默认分组去' }])
+    const e = s.activeEntries().find(x => x.content.includes('显式空话题'))
+    assert('G24 P2-3 empty topic → DEFAULT_TOPIC (no empty bucket)', e && e.topic === 'general')
+    assert('G24 P2-3 topicsIndex shows no empty label', s.topicsIndex().every(ti => ti.topic !== ''))
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // P3-4: identity_synced carries the composite PK (content_id, target); a
+  // legacy single-PK table is migrated in place with data preserved.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-f4-'))
+    const s = new MemoryStore(t)
+    const db = new DatabaseSync(s.dbPath)
+    const pk = db.prepare('PRAGMA table_info(identity_synced)').all().filter(c => c.pk > 0).map(c => c.name).sort().join(',')
+    db.close()
+    assert('G24 P3-4 new install: composite PK (content_id,target)', pk === 'content_id,target')
+    s.close()
+    // simulate a legacy install: single-column PK + one row
+    const db2 = new DatabaseSync(join(t, 'memory', 'memory.db'))
+    db2.exec("DROP TABLE identity_synced; CREATE TABLE identity_synced (content_id TEXT PRIMARY KEY, target TEXT NOT NULL, ts INTEGER NOT NULL); INSERT INTO identity_synced VALUES ('abc123', 'user', 1);")
+    db2.close()
+    const s2 = new MemoryStore(t) // constructor runs migrateColumns → rebuild
+    const db3 = new DatabaseSync(s2.dbPath)
+    const pk2 = db3.prepare('PRAGMA table_info(identity_synced)').all().filter(c => c.pk > 0).map(c => c.name).sort().join(',')
+    const kept = db3.prepare("SELECT COUNT(*) AS c FROM identity_synced WHERE content_id = 'abc123' AND target = 'user'").get()
+    db3.close()
+    assert('G24 P3-4 legacy single-PK table migrated to composite PK', pk2 === 'content_id,target')
+    assert('G24 P3-4 migration preserved the row', Number(kept.c) === 1)
+    s2.close(); rmSync(t, { recursive: true, force: true })
+  }
+}
+
 // ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(50)}`)
 console.log(`passed: ${passed}  failed: ${failed}`)

@@ -165,6 +165,8 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
+**`/memory/identity` 路由的信任模型（安全，2026-08-31）**：该路由的 POST 会写入 soul.md / user.md——两者作为恒定 section 注入 system prompt，属于持久化 prompt 注入面。因此**写操作仅接受 loopback 来源**（校验 `Host` 为 `127.0.0.1` / `localhost` / `::1`，浏览器跨站写携带的 `Origin` 也必须为 loopback；GET 只读不限）。若你把宿主 webServer 绑定到局域网地址，设置面板的 soul/user 编辑器将得到 403——请保持绑定 loopback，或在宿主侧为该路由前置你自己的鉴权。
+
 ---
 
 ## 四、配置说明
@@ -278,8 +280,8 @@ memory_recall  query="上周关于部署的讨论"    scope=episodic
 # 自动探测 esbuild / @types/react / typescript 最高语义版本（不硬编码），
 # 随后 tsc 类型检查（Node + client）+ esbuild 打包 client。
 node build.mjs
-# 冒烟（无 dsh 也可跑，全量断言组 G1–G23）
-node smoke.mjs
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G24）
+npm run smoke   # 等价于 node smoke.mjs
 ```
 
 提交的 `tsconfig.json` / `tsconfig.client.json` 仅为开发机 IDE 默认；构建不用其中的硬编码路径。前端 client 入口为 `exports["./client"]`（`dsh.client.platform: "web"`），esbuild 打包成 `window.__ModuleLoader__.load` 格式（react 走 shell 单例，不打进 bundle）。

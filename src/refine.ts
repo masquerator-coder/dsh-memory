@@ -394,12 +394,19 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
       for (const v of verdicts) {
         const ids = (v.targetIds ?? []).filter(id => store.get(id))
         if (v.action === 'merge' && v.content && ids.length > 0) {
-          // Add the merged fact; if its content dedups onto one of the source
-          // ids (contentId collide), that source IS the merged entry after the
-          // upsert — remove only the OTHER sources so the merged fact survives.
-          const mergedId = contentId(v.content)
+          // P1-1 (review 2026-08-31): probe WHERE the add will actually land
+          // BEFORE deciding who gets removed. store.add merges a near-duplicate
+          // (contentSimilarity >= SIM_DUP) into the canonical row and keeps THAT
+          // row's id — the merged fact survives AS the canonical row, not under
+          // contentId(v.content). The old `id !== mergedId` guard only covered
+          // the exact-collision case, so a near-duplicate merge archived the
+          // very row it had just updated (merge result silently lost).
+          // Survivors = the canonical row the add will upsert + exact-content id.
+          const canonical = store.findCanonical(v.content, 'memory')
+          const survivors = new Set<string>([contentId(v.content)])
+          if (canonical) survivors.add(canonical.id)
           ops.push({ action: 'add', layer: 'memory', content: v.content, topic: cluster.topic, ...(v.kind ? { kind: v.kind } : {}) })
-          for (const id of ids) if (id !== mergedId) ops.push({ action: 'remove', id })
+          for (const id of ids) if (!survivors.has(id)) ops.push({ action: 'remove', id })
           applied.push(v)
         } else if (v.action === 'drop' && ids.length > 0) {
           for (const id of ids) ops.push({ action: 'remove', id })

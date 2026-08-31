@@ -34,7 +34,8 @@
     "forgetting"
   ],
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "smoke": "node smoke.mjs"
   },
   "dsh": {
     "bundle": {

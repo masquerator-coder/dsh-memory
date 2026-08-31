@@ -17,7 +17,7 @@
 import { createRequire } from 'node:module'
 import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { execSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
@@ -100,11 +100,14 @@ try {
   emitTsconfig(join(ROOT, 'tsconfig.json'), nodeTsconfig, {})
   emitTsconfig(join(ROOT, 'tsconfig.client.json'), clientTsconfig, { reactVersion: reactVer })
 
-  const run = (cmd) => execSync(cmd, { cwd: ROOT, stdio: 'inherit' })
+  // P3-5 (review 2026-08-31): execFileSync with an argv array — the old
+  // template-string execSync let a tsc path containing a quote inject shell
+  // syntax. No shell is spawned now, so paths are inert data.
+  const runTsc = (cfg) => execFileSync(process.execPath, [tscBin, '-p', cfg], { cwd: ROOT, stdio: 'inherit' })
   console.log(`[dsh-memory build] harness=${harness} esbuild=${esbuildPkg ?? '(local)'} react=${reactVer ?? '(none)'}`)
 
-  run(`node "${tscBin}" -p tsconfig.build.json`)
-  run(`node "${tscBin}" -p tsconfig.client.build.json`)
+  runTsc('tsconfig.build.json')
+  runTsc('tsconfig.client.build.json')
 
   const esbuild = loadEsbuild()
   const BANNER = [

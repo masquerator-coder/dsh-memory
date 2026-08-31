@@ -124,6 +124,12 @@ export class MemoryStore {
   // (23.6µs vs 6.7µs pre-compiled, 3.5x) and sits on the recall/touchAccess
   // hot path — prepare once here.
   private readonly getMemStmt: ReturnType<DatabaseSync['prepare']>
+  /** P3-1 (review 2026-08-31): prepared-statement cache keyed by SQL text —
+   *  `list()`, the exact-content dedup lookups, and the forget/audit updates
+   *  re-prepared on every call (the same 3.5x gap P3-11 fixed for `get()`),
+   *  and they sit on the add / enforceBudget / forgetRun hot paths. Clause-
+   *  combination SQL (list/recall) yields a bounded, structural key set. */
+  private readonly stmtCache = new Map<string, ReturnType<DatabaseSync['prepare']>>()
 
   constructor(home = resolveDshHome(), budget: MemoryBudget = DEFAULT_BUDGET, windowDays = 30, forgetDays: ForgetDays = resolveForgetDays()) {
     this.dir = join(home, 'memory')
@@ -147,7 +153,7 @@ export class MemoryStore {
     migrateColumns(this.db)
     rebuildFts(this.db)
 
-    this.upsertMemStmt = this.db.prepare(`
+    this.upsertMemStmt = this.stmt(`
       INSERT INTO memories
         (id, layer, kind, tier, topic, content, importance, quality, epistemic, heat,
          created, updated, last_accessed, archived, low_quality, window_freq, window_start,
@@ -164,10 +170,10 @@ export class MemoryStore {
     `)
     // FTS5 virtual tables reject UPSERT — use INSERT OR REPLACE keyed by the
     // content table's implicit rowid (id TEXT PRIMARY KEY still has one).
-    this.upsertFtsStmt = this.db.prepare('INSERT OR REPLACE INTO mem_fts(rowid, content, topic) VALUES (?,?,?)')
-    this.rowidStmt = this.db.prepare('SELECT rowid AS r FROM memories WHERE id = ?')
+    this.upsertFtsStmt = this.stmt('INSERT OR REPLACE INTO mem_fts(rowid, content, topic) VALUES (?,?,?)')
+    this.rowidStmt = this.stmt('SELECT rowid AS r FROM memories WHERE id = ?')
 
-    this.upsertEpiStmt = this.db.prepare(`
+    this.upsertEpiStmt = this.stmt(`
       INSERT INTO episodes
         (id, session_id, ts, summary, tools_used, topic, extracted, archived, archived_at, created)
       VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -176,13 +182,23 @@ export class MemoryStore {
         tools_used=excluded.tools_used, topic=excluded.topic, extracted=excluded.extracted,
         archived=excluded.archived, archived_at=excluded.archived_at, created=excluded.created
     `)
-    this.upsertEpiFtsStmt = this.db.prepare('INSERT OR REPLACE INTO ep_fts(rowid, summary, topic) VALUES (?,?,?)')
-    this.epiRowidStmt = this.db.prepare('SELECT rowid AS r FROM episodes WHERE id = ?')
-    this.getMemStmt = this.db.prepare('SELECT * FROM memories WHERE id = ?')
+    this.upsertEpiFtsStmt = this.stmt('INSERT OR REPLACE INTO ep_fts(rowid, summary, topic) VALUES (?,?,?)')
+    this.epiRowidStmt = this.stmt('SELECT rowid AS r FROM episodes WHERE id = ?')
+    this.getMemStmt = this.stmt('SELECT * FROM memories WHERE id = ?')
   }
 
   close(): void {
     this.db.close()
+  }
+
+  /** P3-1: cached prepare — see {@link stmtCache}. */
+  private stmt(sql: string): ReturnType<DatabaseSync['prepare']> {
+    let s = this.stmtCache.get(sql)
+    if (s === undefined) {
+      s = this.db.prepare(sql)
+      this.stmtCache.set(sql, s)
+    }
+    return s
   }
 
   // ---- row mapping ---------------------------------------------------------
@@ -243,7 +259,7 @@ export class MemoryStore {
     if (filter.kind) { clauses.push('kind = ?'); params.push(filter.kind) }
     if (filter.includeArchived !== true) clauses.push('archived = 0')
     if (filter.includeLowQuality === false) clauses.push('low_quality = 0')
-    const rows = this.db.prepare(`SELECT * FROM memories WHERE ${clauses.join(' AND ')} ORDER BY updated DESC, rowid DESC`).all(...params)
+    const rows = this.stmt(`SELECT * FROM memories WHERE ${clauses.join(' AND ')} ORDER BY updated DESC, rowid DESC`).all(...params)
     return rows.map(r => this.rowToEntry(r as Record<string, unknown>))
   }
 
@@ -252,13 +268,13 @@ export class MemoryStore {
   }
 
   count(): number {
-    const r = this.db.prepare('SELECT COUNT(*) AS c FROM memories WHERE archived = 0').get() as { c: number }
+    const r = this.stmt('SELECT COUNT(*) AS c FROM memories WHERE archived = 0').get() as { c: number }
     return Number(r.c)
   }
 
   /** Active (non-archived) episode count, without loading rows (P2-25). */
   episodeCount(): number {
-    const r = this.db.prepare('SELECT COUNT(*) AS c FROM episodes WHERE archived = 0').get() as { c: number }
+    const r = this.stmt('SELECT COUNT(*) AS c FROM episodes WHERE archived = 0').get() as { c: number }
     return Number(r.c)
   }
 
@@ -266,7 +282,7 @@ export class MemoryStore {
    *  R4 (review 2026-08-30): SQL aggregate — the old version loaded and JS-mapped
    *  every tier-0 row on each call (batch/tools both call this per write). */
   usage(): BudgetUsage {
-    const rows = this.db.prepare(
+    const rows = this.stmt(
       'SELECT layer AS l, SUM(LENGTH(content)) AS n FROM memories WHERE tier = 0 AND archived = 0 AND low_quality = 0 GROUP BY layer',
     ).all() as { l: string; n: number | null }[]
     let user = 0
@@ -280,7 +296,7 @@ export class MemoryStore {
   }
 
   topicsIndex(): { topic: string; count: number }[] {
-    const rows = this.db.prepare(
+    const rows = this.stmt(
       'SELECT topic, COUNT(*) AS c FROM memories WHERE tier = 1 AND archived = 0 GROUP BY topic ORDER BY c DESC',
     ).all() as { topic: string; c: number }[]
     return rows.map(r => ({ topic: String(r.topic), count: Number(r.c) }))
@@ -294,7 +310,7 @@ export class MemoryStore {
   private nearCandidates(content: string, cap = 8): MemoryEntry[] {
     const slice = content.slice(0, 12).trim()
     if (!slice) return []
-    const rows = this.db.prepare(
+    const rows = this.stmt(
       "SELECT * FROM memories WHERE archived = 0 AND content >= ? AND content < ? LIMIT ?",
     ).all(slice, `${slice}\uffff`, cap) as Record<string, unknown>[]
     return rows.map(r => this.rowToEntry(r))
@@ -317,7 +333,7 @@ export class MemoryStore {
     if (!c) return null
     // Exact content is the source of truth — rejoins even a row whose id has
     // drifted after a `replace`, and reactivates an archived fact (R1 contract).
-    const exact = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
+    const exact = this.stmt('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
     if (exact) {
       const e = this.rowToEntry(exact)
       if (!layer || e.layer === layer) return e
@@ -348,7 +364,7 @@ export class MemoryStore {
     if (!c) return []
     const out: MemoryEntry[] = []
     const seen = new Set<string>()
-    const exact = this.db.prepare('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
+    const exact = this.stmt('SELECT * FROM memories WHERE content = ? LIMIT 1').get(c) as Record<string, unknown> | undefined
     if (exact) {
       const e = this.rowToEntry(exact)
       if (!e.archived && (!layer || e.layer === layer)) { out.push(e); seen.add(e.id) }
@@ -424,13 +440,13 @@ export class MemoryStore {
 
   private hardDeleteMemory(id: string): void {
     const row = this.rowidStmt.get(id) as { r: number } | undefined
-    const r = this.db.prepare('DELETE FROM memories WHERE id = ?').run(id)
-    if (r.changes > 0 && row) this.db.prepare('DELETE FROM mem_fts WHERE rowid = ?').run(Number(row.r))
+    const r = this.stmt('DELETE FROM memories WHERE id = ?').run(id)
+    if (r.changes > 0 && row) this.stmt('DELETE FROM mem_fts WHERE rowid = ?').run(Number(row.r))
     // P3-15 (review 2026-08-30): cascade the correction trail — the memory row is
     // physically gone, so leaving failure_memories rows only extends other
     // entries' observation windows with references to a dead id. (remove force
     // and forgetRun's hard-delete both land here.)
-    if (r.changes > 0) this.db.prepare('DELETE FROM failure_memories WHERE memory_id = ?').run(id)
+    if (r.changes > 0) this.stmt('DELETE FROM failure_memories WHERE memory_id = ?').run(id)
   }
 
   private applyOne(op: MemoryOp, now: number): { ok: boolean; error?: string; lowQualityId?: string } {
@@ -441,7 +457,10 @@ export class MemoryStore {
       const kind: Kind = op.kind ?? inferKind(content)
       const importance: Importance = op.importance ?? 3
       const epistemic: Epistemic = op.epistemic ?? 'observed'
-      const topic = op.topic === '' ? '' : (op.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
+      // P2-3 (review 2026-08-31): no `op.topic === ''` special case — an
+      // explicit empty string and other blank forms both fall back to
+      // DEFAULT_TOPIC, so no '' clustering bucket can appear in topicsIndex.
+      const topic = (op.topic ?? '').trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
 
       if (op.action === 'add') {
         // P0-2: dedup on exact content (source of truth), not merely the
@@ -466,8 +485,20 @@ export class MemoryStore {
         const low = isLowQuality(quality)
         const tier = existing ? (low ? 1 : (op.tier ?? existing.tier)) : (op.tier ?? this.autoTier(layer, importance, quality, kind, low))
         if (existing) {
+          // P2-1 (review 2026-08-31): merging into a canonical row must NOT
+          // clobber its metadata with op defaults — a near-worded re-add without
+          // an explicit importance used to reset it to 3, piercing the
+          // importance>=5 never-hard-delete immunity. Unspecified fields keep
+          // the existing values (same semantics as the replace path, P2-37).
           this.writeMemory(id, {
-            layer, kind, tier, topic, content, importance, quality, epistemic,
+            layer,
+            kind: op.kind ?? existing.kind,
+            tier,
+            topic: op.topic !== undefined && op.topic.trim() !== '' ? topic : existing.topic,
+            content,
+            importance: op.importance ?? existing.importance,
+            quality,
+            epistemic: op.epistemic ?? existing.epistemic,
             heat: heatOf(existing, this.forgetDays), created: existing.created, updated: now,
             // R1 (review 2026-08-30): re-adding content that matches an ARCHIVED
             // entry reactivates it — the tool says "已记入", so the fact must become
@@ -533,7 +564,7 @@ export class MemoryStore {
       if (op.force) {
         this.hardDeleteMemory(target.id)
       } else {
-        this.db.prepare('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, target.id)
+        this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, target.id)
       }
       return { ok: true }
     }
@@ -566,7 +597,7 @@ export class MemoryStore {
     const memUse = (): number => totalOf(e => e.layer !== 'user')
     const usrUse = (): number => totalOf(e => e.layer === 'user')
     const demote = (e: MemoryEntry): void => {
-      this.db.prepare('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
+      this.stmt('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
       done.add(e.id)
       demoted.push(e.id)
     }
@@ -640,7 +671,7 @@ export class MemoryStore {
   private touchAccess(ids: string[]): void {
     const now = Date.now()
     const windowMs = this.windowDays * DAY_MS
-    const upd = this.db.prepare('UPDATE memories SET last_accessed = ?, window_freq = ?, window_start = ? WHERE id = ?')
+    const upd = this.stmt('UPDATE memories SET last_accessed = ?, window_freq = ?, window_start = ? WHERE id = ?')
     for (const id of ids) {
       const e = this.get(id)
       if (!e) continue
@@ -664,9 +695,12 @@ export class MemoryStore {
     const qLower = query.toLowerCase()
     const keywords = query.split(/[\s,，。;；、]+/).map(k => k.toLowerCase()).filter(Boolean)
 
-    // P2-17: candidate pre-filter in SQL (FTS ∪ any-substring) so recall does NOT
-    // load + scan the whole library in JS. base>0 iff the row is FTS-hit OR its
-    // content/topic contains the raw query OR any keyword — all expressed below.
+    // P2-17: candidate pre-filter in SQL (FTS ∪ any-substring) so recall does
+    // NOT load + scan the whole library in JS. NB (P3-9, review 2026-08-31):
+    // the LIKE '%term%' leading-wildcard branches still scan inside SQLite's C
+    // layer (no index) — bounded by personal-scale row counts, not by JS cost.
+    // base>0 iff the row is FTS-hit OR its content/topic contains the raw query
+    // OR any keyword — all expressed below.
     const seen = new Set<string>()
     const candidates: MemoryEntry[] = []
     const push = (e: MemoryEntry | undefined): void => {
@@ -680,7 +714,7 @@ export class MemoryStore {
     try {
       const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
       if (q) {
-        for (const row of this.db.prepare('SELECT * FROM memories WHERE rowid IN (SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
+        for (const row of this.stmt('SELECT * FROM memories WHERE rowid IN (SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
           const e = this.rowToEntry(row)
           ftsIds.add(e.id)
           if (opts.includeArchived !== true && e.archived) continue
@@ -704,7 +738,7 @@ export class MemoryStore {
     addTerm(qLower)
     for (const k of keywords) addTerm(k)
     const sql = `SELECT * FROM memories WHERE ${baseClauses.join(' AND ')} AND (${ors.join(' OR ')})`
-    for (const r of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEntry(r))
+    for (const r of this.stmt(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEntry(r))
 
     if (candidates.length === 0) return []
 
@@ -769,14 +803,14 @@ export class MemoryStore {
   }
 
   getEpisode(id: string): Episode | undefined {
-    const r = this.db.prepare('SELECT * FROM episodes WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    const r = this.stmt('SELECT * FROM episodes WHERE id = ?').get(id) as Record<string, unknown> | undefined
     return r ? this.rowToEpisode(r) : undefined
   }
 
   /** M5: freshest episode of a session (for session-level LLM consolidation to
    *  overwrite the last pending rule summary, avoiding per-turn episode pileup). */
   lastEpisodeForSession(sessionId: string): Episode | undefined {
-    const r = this.db.prepare(
+    const r = this.stmt(
       'SELECT * FROM episodes WHERE session_id = ? AND archived = 0 ORDER BY ts DESC, rowid DESC LIMIT 1',
     ).get(sessionId) as Record<string, unknown> | undefined
     return r ? this.rowToEpisode(r) : undefined
@@ -795,7 +829,7 @@ export class MemoryStore {
   listEpisodes(filter: { includeArchived?: boolean } = {}): Episode[] {
     const clauses: string[] = ['1=1']
     if (filter.includeArchived !== true) clauses.push('archived = 0')
-    const rows = this.db.prepare(`SELECT * FROM episodes WHERE ${clauses.join(' AND ')} ORDER BY ts DESC, rowid DESC`).all()
+    const rows = this.stmt(`SELECT * FROM episodes WHERE ${clauses.join(' AND ')} ORDER BY ts DESC, rowid DESC`).all()
     return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
   }
 
@@ -818,7 +852,7 @@ export class MemoryStore {
     try {
       const q = query.split(/\s+/).filter(Boolean).map(t => `"${t.replaceAll('"', '""')}"`).join(' ')
       if (q) {
-        for (const row of this.db.prepare('SELECT * FROM episodes WHERE rowid IN (SELECT rowid FROM ep_fts WHERE ep_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
+        for (const row of this.stmt('SELECT * FROM episodes WHERE rowid IN (SELECT rowid FROM ep_fts WHERE ep_fts MATCH ?)').all(q) as Record<string, unknown>[]) {
           const ep = this.rowToEpisode(row)
           ftsIds.add(ep.id)
           if (ep.archived) continue
@@ -841,7 +875,7 @@ export class MemoryStore {
     addTerm(qLower)
     for (const k of keywords) addTerm(k)
     const sql = `SELECT * FROM episodes WHERE archived = 0 AND (${ors.join(' OR ')})`
-    for (const r of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEpisode(r))
+    for (const r of this.stmt(sql).all(...params) as Record<string, unknown>[]) push(this.rowToEpisode(r))
 
     if (candidates.length === 0) return []
 
@@ -868,8 +902,8 @@ export class MemoryStore {
     this.db.exec('SAVEPOINT ep_delete')
     try {
       const row = this.epiRowidStmt.get(id) as { r: number } | undefined
-      const r = this.db.prepare('DELETE FROM episodes WHERE id = ?').run(id)
-      if (r.changes > 0 && row) this.db.prepare('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
+      const r = this.stmt('DELETE FROM episodes WHERE id = ?').run(id)
+      if (r.changes > 0 && row) this.stmt('DELETE FROM ep_fts WHERE rowid = ?').run(Number(row.r))
       this.db.exec('RELEASE ep_delete')
     } catch (err) {
       try { this.db.exec('ROLLBACK TO ep_delete') } catch { /* noop */ }
@@ -890,7 +924,7 @@ export class MemoryStore {
   listEpisodesForRefine(opts: { retryDegraded?: boolean; limit?: number } = {}): Episode[] {
     const status = opts.retryDegraded ? 'extracted IN (0, 2)' : 'extracted = 0'
     const limit = opts.limit && opts.limit > 0 ? `LIMIT ${Math.floor(opts.limit)}` : ''
-    const rows = this.db.prepare(
+    const rows = this.stmt(
       `SELECT * FROM episodes WHERE archived = 0 AND ${status} ORDER BY ts ASC ${limit}`,
     ).all()
     return rows.map(r => this.rowToEpisode(r as Record<string, unknown>))
@@ -898,7 +932,7 @@ export class MemoryStore {
 
   /** Record L1 processing state on an episode (0 untouched → 1 extracted → 2 degraded-skip). */
   markEpisodeExtracted(id: string, status: 1 | 2): void {
-    this.db.prepare('UPDATE episodes SET extracted = ? WHERE id = ?').run(status, id)
+    this.stmt('UPDATE episodes SET extracted = ? WHERE id = ?').run(status, id)
   }
 
   /** Semantic clusters (same topic, ≥ min members) as L2 merge candidates.
@@ -938,7 +972,7 @@ export class MemoryStore {
     decisions: string
     status: string
   }): number {
-    const r = this.db.prepare(
+    const r = this.stmt(
       'INSERT INTO refine_runs(ts, level, source_id, prompt_sha, llm_route, decisions, status) VALUES (?,?,?,?,?,?,?)',
     ).run(Date.now(), fields.level, fields.sourceId ?? null, fields.promptSha ?? null, fields.route ?? null,
       fields.decisions, fields.status)
@@ -949,19 +983,19 @@ export class MemoryStore {
    *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
    *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
   refineAttemptCount(sourceId: string): number {
-    const r = this.db.prepare('SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ?').get(sourceId) as { c: number }
+    const r = this.stmt('SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ?').get(sourceId) as { c: number }
     return Number(r.c)
   }
 
   /** M7: last LLM-audit timestamp for a topic cluster (undefined = never audited → audit). */
   l2RefinedTs(topic: string): number | undefined {
-    const r = this.db.prepare('SELECT refined_at AS r FROM l2_refined WHERE topic = ?').get(topic) as { r: number } | undefined
+    const r = this.stmt('SELECT refined_at AS r FROM l2_refined WHERE topic = ?').get(topic) as { r: number } | undefined
     return r ? Number(r.r) : undefined
   }
 
   /** M7: record that a topic cluster was LLM-audited at `ts` (idempotent upsert). */
   upsertL2Refined(topic: string, ts = Date.now()): void {
-    this.db.prepare(
+    this.stmt(
       'INSERT INTO l2_refined(topic, refined_at) VALUES (?, ?) ON CONFLICT(topic) DO UPDATE SET refined_at = excluded.refined_at',
     ).run(topic, ts)
   }
@@ -970,33 +1004,33 @@ export class MemoryStore {
 
   /** Content-ids already written into an auto-maintained identity file. */
   identitySyncedIds(target: string): Set<string> {
-    const rows = this.db.prepare('SELECT content_id FROM identity_synced WHERE target = ?').all(target) as { content_id: string }[]
+    const rows = this.stmt('SELECT content_id FROM identity_synced WHERE target = ?').all(target) as { content_id: string }[]
     return new Set(rows.map(r => r.content_id))
   }
 
   /** Record that a memory content was written into an identity file (idempotent). */
   markIdentitySynced(content: string, target: string, ts = Date.now()): void {
-    this.db.prepare('INSERT OR IGNORE INTO identity_synced(content_id, target, ts) VALUES (?,?,?)').run(contentId(content), target, ts)
+    this.stmt('INSERT OR IGNORE INTO identity_synced(content_id, target, ts) VALUES (?,?,?)').run(contentId(content), target, ts)
   }
 
   identityMetaGet(key: string): number | undefined {
-    const r = this.db.prepare('SELECT value AS v FROM identity_meta WHERE key = ?').get(key) as { v: number } | undefined
+    const r = this.stmt('SELECT value AS v FROM identity_meta WHERE key = ?').get(key) as { v: number } | undefined
     return r ? Number(r.v) : undefined
   }
 
   identityMetaSet(key: string, value: number): void {
-    this.db.prepare('INSERT INTO identity_meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
+    this.stmt('INSERT INTO identity_meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
   }
 
   // ---- correction trail ----------------------------------------------------
 
   recordFailure(memoryId: string, oldContent: string, newContent: string): void {
-    this.db.prepare('INSERT INTO failure_memories(memory_id, old_content, new_content, corrected_at) VALUES (?,?,?,?)')
+    this.stmt('INSERT INTO failure_memories(memory_id, old_content, new_content, corrected_at) VALUES (?,?,?,?)')
       .run(memoryId, oldContent, newContent, Date.now())
   }
 
   failureTrail(): { memoryId: string; oldContent: string; newContent: string; correctedAt: number }[] {
-    const rows = this.db.prepare('SELECT memory_id, old_content, new_content, corrected_at FROM failure_memories').all() as Record<string, unknown>[]
+    const rows = this.stmt('SELECT memory_id, old_content, new_content, corrected_at FROM failure_memories').all() as Record<string, unknown>[]
     return rows.map(r => ({
       memoryId: String(r.memory_id),
       oldContent: String(r.old_content ?? ''),
@@ -1005,14 +1039,22 @@ export class MemoryStore {
     }))
   }
 
-  /** True when a failure trail still references this content (corrected-once → extend life). */
-  hasPendingCorrection(content: string): boolean {
-    for (const f of this.failureTrail()) {
+  /** P3-2 (review 2026-08-31): shared pending-correction predicate — this was
+   *  duplicated verbatim between hasPendingCorrection and forgetRun's inline
+   *  closure (P2-18). One place decides "is this content still referenced by a
+   *  correction trail (corrected-once → extend life)". */
+  private pendingCorrectionIn(trail: { oldContent: string }[], content: string): boolean {
+    for (const f of trail) {
       const oldC = f.oldContent.trim()
       if (!oldC) continue
       if (contentSimilarity(oldC, content) >= 0.5 || content.includes(oldC) || oldC.includes(content)) return true
     }
     return false
+  }
+
+  /** True when a failure trail still references this content (corrected-once → extend life). */
+  hasPendingCorrection(content: string): boolean {
+    return this.pendingCorrectionIn(this.failureTrail(), content)
   }
 
   // ---- active forgetting (three-level ladder + two faces) ------------------
@@ -1040,7 +1082,7 @@ export class MemoryStore {
       // 1. demote cold tier-0 memories
       for (const e of this.list({ tier: 0, includeArchived: false, includeLowQuality: true })) {
         if (shouldDemote(e, forgetDays, now)) {
-          this.db.prepare('UPDATE memories SET tier = 1, updated = ? WHERE id = ?').run(now, e.id)
+          this.stmt('UPDATE memories SET tier = 1, updated = ? WHERE id = ?').run(now, e.id)
           demoted += 1
           decisions.push(`demote:${e.id}`)
         }
@@ -1048,29 +1090,23 @@ export class MemoryStore {
       // 2. archive cold memories
       for (const e of this.activeEntries()) {
         if (shouldArchive(e, forgetDays, now)) {
-          this.db.prepare('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, e.id)
+          this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, e.id)
           archivedMem += 1
           decisions.push(`archive:${e.id}`)
         }
       }
       // P2-18: load the correction trail once outside the delete loop — it was
       // re-querying the whole failure_memories table for every candidate entry.
+      // P3-2: the predicate itself is the shared pendingCorrectionIn helper.
       const trail = this.failureTrail()
-      const pendingCorrection = (content: string): boolean => {
-        for (const f of trail) {
-          const oldC = f.oldContent.trim()
-          if (!oldC) continue
-          if (contentSimilarity(oldC, content) >= 0.5 || content.includes(oldC) || oldC.includes(content)) return true
-        }
-        return false
-      }
+      const pendingCorrection = (content: string): boolean => this.pendingCorrectionIn(trail, content)
       // 3. hard-delete archived memories past observation
       for (const e of this.list({ includeArchived: true, includeLowQuality: true })) {
         if (!e.archived) continue
         if (shouldDelete(e, observeDays, pendingCorrection(e.content), now)) {
           // P1-13: snapshot BEFORE physical delete — content is unrecoverable after
           // hardDeleteMemory, so this row is the only durable evidence for rollback.
-          this.db.prepare(
+          this.stmt(
             'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
           ).run(now, e.id, e.content, e.topic, e.importance, e.quality, heatOf(e, this.forgetDays, now), 'observed-observation-passed')
           this.hardDeleteMemory(e.id)
@@ -1081,7 +1117,7 @@ export class MemoryStore {
       // 4. archive old episodes (time-driven)
       for (const ep of this.listEpisodes({ includeArchived: false })) {
         if (now - ep.ts > retentionDays * DAY_MS) {
-          this.db.prepare('UPDATE episodes SET archived = 1, archived_at = ? WHERE id = ?').run(now, ep.id)
+          this.stmt('UPDATE episodes SET archived = 1, archived_at = ? WHERE id = ?').run(now, ep.id)
           archivedEpi += 1
           decisions.push(`ep-archive:${ep.id}`)
         }
@@ -1093,7 +1129,7 @@ export class MemoryStore {
           // R7 (review 2026-08-30, P2-10): snapshot BEFORE physical delete —
           // same contract as memories (P1-13): "删了能查、误删能回滚" now holds
           // for BOTH forgetting faces (DESIGN §5.2).
-          this.db.prepare(
+          this.stmt(
             'INSERT INTO forget_deleted_episodes(ts, episode_id, session_id, summary, topic, tools_used, reason) VALUES (?,?,?,?,?,?,?)',
           ).run(now, ep.id, ep.session_id, ep.summary, ep.topic, ep.tools_used ?? null, 'episode-observation-passed')
           this.hardDeleteEpisode(ep.id)
@@ -1104,15 +1140,15 @@ export class MemoryStore {
 
       // P1-14: bound audit-table growth (the "库只增不减" problem restated on the
       // audit tables). Delete-snapshots are kept longer — they're the rollback window.
-      this.db.prepare('DELETE FROM failure_memories WHERE corrected_at < ?').run(now - 180 * DAY_MS)
-      this.db.prepare('DELETE FROM forget_runs WHERE ts < ?').run(now - 180 * DAY_MS)
-      this.db.prepare('DELETE FROM refine_runs WHERE ts < ?').run(now - 180 * DAY_MS)
-      this.db.prepare('DELETE FROM forget_deleted WHERE ts < ?').run(now - 365 * DAY_MS)
-      this.db.prepare('DELETE FROM forget_deleted_episodes WHERE ts < ?').run(now - 365 * DAY_MS)
+      this.stmt('DELETE FROM failure_memories WHERE corrected_at < ?').run(now - 180 * DAY_MS)
+      this.stmt('DELETE FROM forget_runs WHERE ts < ?').run(now - 180 * DAY_MS)
+      this.stmt('DELETE FROM refine_runs WHERE ts < ?').run(now - 180 * DAY_MS)
+      this.stmt('DELETE FROM forget_deleted WHERE ts < ?').run(now - 365 * DAY_MS)
+      this.stmt('DELETE FROM forget_deleted_episodes WHERE ts < ?').run(now - 365 * DAY_MS)
 
       const applied = demoted + archivedMem + deletedMem + archivedEpi + deletedEpi
       const sha = createHash('sha256').update(decisions.join('\n')).digest('hex').slice(0, 16)
-      const run = this.db.prepare('INSERT INTO forget_runs(ts, candidate_sha, decisions, applied, status) VALUES (?,?,?,?,?)')
+      const run = this.stmt('INSERT INTO forget_runs(ts, candidate_sha, decisions, applied, status) VALUES (?,?,?,?,?)')
         .run(now, sha, JSON.stringify(decisions), applied, 'ok')
       this.db.exec('COMMIT')
       return { demoted, archivedMem, deletedMem, archivedEpi, deletedEpi, runId: Number(run.lastInsertRowid), status: 'ok' }

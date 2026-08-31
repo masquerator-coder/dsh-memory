@@ -192,6 +192,11 @@ const FORGET_FIRST_DELAY_MS = 5 * 60 * 1000 // 5 min after boot
 /** Cap on in-flight L0 condensation runs (P1-10): a slow LLM summary must not
  *  stack unboundedly across turns. */
 const L0_MAX_INFLIGHT = 4
+/** P2-5 (review 2026-08-31): bounds on the pending-settle session map — max
+ *  tracked sessions (LRU-evicted) and a staleness horizon after which a
+ *  buffered-but-never-settled session is dropped. */
+const L0_PENDING_MAX_SESSIONS = 64
+const L0_PENDING_STALE_MS = 24 * 60 * 60 * 1000
 /** M6: fresh-episode refine kick delay (ms) — near-immediate, not the 1h timer. */
 const REFINE_KICK_DELAY_MS = 10_000
 
@@ -209,7 +214,6 @@ export function apply(ctx: Context, config: Config = {}): void {
   const enableInjection = config.enableInjection ?? true
   const importanceThreshold = config.importanceThreshold ?? 3
   const epistemicWeighting = config.epistemicWeighting ?? true
-  const forgetEnabled = config.forgetEnabled ?? true
   const episodeRetentionDays = config.episodeRetentionDays ?? 180
   const forgetObserveDays = config.forgetObserveDays ?? 30
   const l0Summarize = config.l0Summarize ?? 'llm'
@@ -256,6 +260,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     base: settingsBase,
     applies: 'live',
   })
+  let unwatchSettings: (() => void) | undefined
   if (settingsScope) {
     const seed = settingsScope.get()
     runtime.enabled = seed.enabled
@@ -264,7 +269,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.identityIntervalMs = seed.identityIntervalMs
     runtime.refineIntervalMs = seed.refineIntervalMs
     runtime.peakHourSuppress = seed.peakHourSuppress
-    settingsScope.watch((next) => {
+    // P3-6 (review 2026-08-31): keep the unsubscribe and call it on dispose —
+    // relying on the host scope's lifetime silently leaked the watcher across
+    // hot reloads.
+    unwatchSettings = settingsScope.watch((next) => {
       runtime.enabled = next.enabled
       runtime.forgetEnabled = next.forgetEnabled
       runtime.identityAuto = next.identityAuto
@@ -272,6 +280,16 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.refineIntervalMs = next.refineIntervalMs
       runtime.peakHourSuppress = next.peakHourSuppress
     })
+  }
+
+  // P2-4 (review 2026-08-31): in-flight background tasks (L0 condensation,
+  // idle settle, refine passes) are fire-and-forget async and write to the
+  // store — dispose must not close the DB under them. Track them here and
+  // close the store only after they all settle.
+  const inFlightTasks = new Set<Promise<unknown>>()
+  const track = (p: Promise<unknown>): void => {
+    inFlightTasks.add(p)
+    void p.finally(() => { inFlightTasks.delete(p) }).catch(() => { /* tracked tasks never reject out */ })
   }
 
   let disposed = false
@@ -295,7 +313,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   const scheduleForget = (delay: number): void => {
-    if (!forgetEnabled) return
+    // P1-2 (review 2026-08-31): no static config gate here — the timer stays
+    // resident so a runtime toggle off→on (settings panel) revives the daily
+    // runForget without a restart, honoring the README "live-toggle" promise.
+    // runForget itself already double-gates on runtime.enabled &&
+    // runtime.forgetEnabled, so a disabled config only skips work, not the loop.
     timer = setTimeout(() => {
       timer = undefined
       runForget()
@@ -369,6 +391,10 @@ export function apply(ctx: Context, config: Config = {}): void {
 
     // M5: per-session pending LLM settle bookkeeping (activity timestamp + buffered
     // turn texts). Idle-settle upgrades the freshest rule episode with one LLM call.
+    // P2-5 (review 2026-08-31): the map itself is bounded — long-running hosts
+    // with many short-lived sessions (never idle-settled) would otherwise grow
+    // it forever. Cap the session count (evict the least-recently-active) and
+    // let runSettle drop entries stale beyond L0_PENDING_STALE_MS.
     const l0Pending = new Map<string, { lastActivity: number; texts: string[] }>()
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
@@ -386,19 +412,26 @@ export function apply(ctx: Context, config: Config = {}): void {
       const provider = config.l0Provider ?? cfg?.provider
       const model = config.l0Model ?? cfg?.model
       l0InFlight += 1
-      void runL0(store, {
+      track(runL0(store, {
         events: session.events as readonly unknown[],
         turn,
         summarize: 'rules', // M5: turn-end never burns LLM — settle does
         sessionId: session.id,
         // P2-7: program errors (disk full, closed DB) must leave a trace.
         onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
-      }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ })
+      }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ }))
 
       // Buffer this turn's texts for the idle LLM settle (bounded to last 200).
       if (session.id) {
         const texts = collectTurnTexts(session.events, turn)
         const prev = l0Pending.get(session.id)
+        if (!prev && l0Pending.size >= L0_PENDING_MAX_SESSIONS) {
+          // P2-5: evict the least-recently-active session's buffer.
+          let oldestKey: string | undefined
+          let oldestTs = Infinity
+          for (const [k, v] of l0Pending) if (v.lastActivity < oldestTs) { oldestTs = v.lastActivity; oldestKey = k }
+          if (oldestKey !== undefined) l0Pending.delete(oldestKey)
+        }
         l0Pending.set(session.id, {
           lastActivity: Date.now(),
           texts: (prev ? prev.texts : []).concat(texts).slice(-200),
@@ -413,7 +446,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed || refineKick) return
       refineKick = setTimeout(() => {
         refineKick = undefined
-        void runRefine()
+        track(runRefine())
       }, REFINE_KICK_DELAY_MS)
       refineKick.unref?.()
     }
@@ -479,7 +512,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed) return
       refineTimer = setTimeout(() => {
         refineTimer = undefined
-        void runRefine().finally(() => scheduleRefine(runtime.refineIntervalMs))
+        track(runRefine().finally(() => scheduleRefine(runtime.refineIntervalMs)))
       }, delay)
       refineTimer.unref() // P1-11: don't hold the event loop for the background pass
     }
@@ -492,8 +525,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       const idleMs = l0IdleMinutes * 60 * 1000
       for (const [sid, p] of l0Pending) {
         if (now - p.lastActivity < idleMs) continue
-        l0Pending.delete(sid)
-        if (l0Summarize !== 'llm') continue // pure-rule mode: rule summary already live
+        // P2-5: a buffered session that never reached a settle (route down
+        // forever, host restarted mid-idle) is dropped after the stale horizon
+        // instead of pinning map memory forever.
+        if (now - p.lastActivity > L0_PENDING_STALE_MS) { l0Pending.delete(sid); continue }
+        if (l0Summarize !== 'llm') { l0Pending.delete(sid); continue } // pure-rule mode: rule summary already live
         const route = resolveRefineRoute(
           (config.l0Provider && config.l0Model)
             ? { provider: config.l0Provider, model: config.l0Model }
@@ -501,10 +537,15 @@ export function apply(ctx: Context, config: Config = {}): void {
           learned,
           hostDefault,
         )
-        if (!route) continue
-        if (l0InFlight >= L0_MAX_INFLIGHT) continue
+        // P2-2 (review 2026-08-31): DO NOT delete the pending entry until a
+        // condenseSession is actually dispatched — the old order dropped the
+        // buffered turn texts forever whenever the route was momentarily
+        // unresolvable or the in-flight cap was full.
+        if (!route) continue // retried next check cycle
+        if (l0InFlight >= L0_MAX_INFLIGHT) continue // deferred one cycle, buffer kept
+        l0Pending.delete(sid)
         l0InFlight += 1
-        void condenseSession(store, {
+        track(condenseSession(store, {
           texts: p.texts,
           llm: llmSeam,
           provider: route.provider,
@@ -515,7 +556,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }).finally(() => {
           l0InFlight -= 1
           kickRefine() // M6: a settled session-level episode → L1 extraction soon
-        }).catch(() => { /* never breaks the idle loop */ })
+        }).catch(() => { /* never breaks the idle loop */ }))
       }
     }
     const scheduleSettle = (): void => {
@@ -558,12 +599,20 @@ export function apply(ctx: Context, config: Config = {}): void {
       disposed = true
       l0Dispose()
       disposeIdentityRoutes()
+      unwatchSettings?.() // P3-6: stop the settings watcher on dispose
       if (timer) clearTimeout(timer)
       if (refineTimer) clearTimeout(refineTimer)
       if (refineKick) clearTimeout(refineKick)
       if (settleTimer) clearTimeout(settleTimer)
       if (identityTimer) clearTimeout(identityTimer)
-      store.close()
+      // P2-4 (review 2026-08-31): close the store only after every in-flight
+      // background task (L0 / settle / refine) has settled — they are
+      // fire-and-forget async and would otherwise write to a closed DB.
+      // allSettled never rejects; LLM calls are deadline-bounded so the wait
+      // is bounded too.
+      void Promise.allSettled([...inFlightTasks]).finally(() => {
+        try { store.close() } catch { /* already closed */ }
+      })
     }
   })
 }
