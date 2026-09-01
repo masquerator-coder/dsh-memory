@@ -43,7 +43,8 @@ export function recallEmptyLabel(): string {
   return '无匹配记忆'
 }
 
-/** Whether an execute text signals a non-write outcome (rejected / overflow / unknown action). */
+/** Whether an execute text signals a non-write outcome (rejected / overflow / unknown action).
+ *  A6 (2026-09-01): uses structured prefix instead of fragile string matching. */
 export function writeFailed(text: string): boolean {
-  return text.includes('未完成') || text.includes('预算已满') || text.includes('未知 action')
+  return text.startsWith('[FAIL]')
 }

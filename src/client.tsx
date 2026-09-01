@@ -66,11 +66,16 @@ interface IdentityFiles {
   user: string
 }
 
+interface SaveResult {
+  ok: boolean
+  error?: string
+}
+
 interface PanelProps {
   close?: () => void
   scope: MemoryScope
   loadIdentity: () => Promise<IdentityFiles>
-  saveIdentity: (file: 'soul' | 'user', content: string) => Promise<boolean>
+  saveIdentity: (file: 'soul' | 'user', content: string) => Promise<SaveResult>
 }
 
 /** Reactive snapshot value via the framework seat (scope.getSnapshot/subscribe). */
@@ -93,16 +98,22 @@ function Toggle(props: { label: string; hint: string; checked: boolean; disabled
   )
 }
 
-/** A textarea editor with a save button; save is optimistic-free (revert on error). */
-function FileEditor(props: { label: string; value: string; onSave: (content: string) => Promise<boolean> }): JSX.Element {
+/** A textarea editor with a save button; save is optimistic-free (revert on error).
+ *  A8 (2026-09-01): show error feedback when save fails (e.g. 403 on LAN bind). */
+function FileEditor(props: { label: string; value: string; onSave: (content: string) => Promise<{ ok: boolean; error?: string }> }): JSX.Element {
   const [draft, setDraft] = useState(props.value)
   const [saving, setSaving] = useState(false)
-  useEffect(() => setDraft(props.value), [props.value])
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { setDraft(props.value); setError(null) }, [props.value])
   const save = async (): Promise<void> => {
     setSaving(true)
-    const ok = await props.onSave(draft)
+    setError(null)
+    const result = await props.onSave(draft)
     setSaving(false)
-    if (!ok) setDraft(props.value) // rollback on failure
+    if (!result.ok) {
+      setDraft(props.value) // rollback on failure
+      setError(result.error ?? '保存失败，请检查网络或权限')
+    }
   }
   return (
     <div style={{ marginTop: 12 }}>
@@ -116,6 +127,7 @@ function FileEditor(props: { label: string; value: string; onSave: (content: str
       <button type="button" disabled={saving} onClick={() => { void save() }} style={{ marginTop: 6 }}>
         {saving ? '保存中…' : '保存'}
       </button>
+      {error && <div style={{ marginTop: 6, color: '#c00', fontSize: 12 }}>{error}</div>}
     </div>
   )
 }
@@ -205,16 +217,18 @@ export function apply(ctx: ClientContext): () => void {
     const data = await resp.json() as Partial<IdentityFiles>
     return { soul: typeof data.soul === 'string' ? data.soul : '', user: typeof data.user === 'string' ? data.user : '' }
   }
-  const saveIdentity = async (file: 'soul' | 'user', content: string): Promise<boolean> => {
+  const saveIdentity = async (file: 'soul' | 'user', content: string): Promise<SaveResult> => {
     try {
       const resp = await fetch('/memory/identity', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ file, content }),
       })
-      return resp.ok
-    } catch {
-      return false
+      if (resp.ok) return { ok: true }
+      const data = await resp.json().catch(() => ({}))
+      return { ok: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '网络错误' }
     }
   }
 

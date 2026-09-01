@@ -38,10 +38,10 @@ export const DEFAULT_FORGET_DAYS: ForgetDays = {
 export function resolveForgetDays(partial?: Partial<ForgetDays>): ForgetDays {
   const out: ForgetDays = { ...DEFAULT_FORGET_DAYS }
   if (partial) {
-    if (partial.env !== undefined) out.env = partial.env
-    if (partial.lesson !== undefined) out.lesson = partial.lesson
-    if (partial.decision !== undefined) out.decision = partial.decision
-    if (partial.general !== undefined) out.general = partial.general
+    if (partial.env !== undefined) out.env = Math.max(1, partial.env)
+    if (partial.lesson !== undefined) out.lesson = Math.max(1, partial.lesson)
+    if (partial.decision !== undefined) out.decision = Math.max(1, partial.decision)
+    if (partial.general !== undefined) out.general = Math.max(1, partial.general)
   }
   return out
 }

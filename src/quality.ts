@@ -33,7 +33,11 @@ export function longestCommonSubstr(a: string, b: string): number {
 export function contentSimilarity(a: string, b: string): number {
   if (!a || !b) return 0
   if (a === b) return 1
-  return longestCommonSubstr(a, b) / Math.min(a.length, b.length)
+  const lcs = longestCommonSubstr(a, b)
+  const maxLen = Math.max(a.length, b.length)
+  const minLen = Math.min(a.length, b.length)
+  if (maxLen / minLen > 2) return 0
+  return lcs / maxLen
 }
 
 /** Tokenize into significant tokens: alphanumeric runs (English) + CJK chars

@@ -471,6 +471,11 @@ export class MemoryStore {
         const cid = contentId(content)
         let existing = this.get(cid)
         if (existing && existing.content !== content) existing = undefined // cid row belongs to a different fact (drift) — don't trust it
+        // G4 (2026-09-01): cid hit must also match layer — otherwise a user-layer
+        // fact could be silently overwritten as memory-layer (losing immortality)
+        // or vice versa (gaining immortality incorrectly). Fall back to
+        // findCanonical which respects layer.
+        if (existing && existing.layer !== layer) existing = undefined
         if (!existing) {
           // P2-dedup (2026-08-31): the exact-content lookup below was only able
           // to catch byte-identical duplicates (P0-2). findCanonical extends it
@@ -490,12 +495,19 @@ export class MemoryStore {
           // an explicit importance used to reset it to 3, piercing the
           // importance>=5 never-hard-delete immunity. Unspecified fields keep
           // the existing values (same semantics as the replace path, P2-37).
+          // S1 (2026-09-01): prevent short fragment from overwriting longer content.
+          // Only overwrite content if new content is at least 50% of existing length.
+          const shouldOverwriteContent = content.length >= existing.content.length * 0.5
+          const finalContent = shouldOverwriteContent ? content : existing.content
+          if (!shouldOverwriteContent && content !== existing.content) {
+            this.recordFailure(existing.id, existing.content, content)
+          }
           this.writeMemory(id, {
             layer,
             kind: op.kind ?? existing.kind,
             tier,
             topic: op.topic !== undefined && op.topic.trim() !== '' ? topic : existing.topic,
-            content,
+            content: finalContent,
             importance: op.importance ?? existing.importance,
             quality,
             epistemic: op.epistemic ?? existing.epistemic,
@@ -527,8 +539,15 @@ export class MemoryStore {
         // P0-3: never silently match by a tiny fragment — a 1-char content could
         // overwrite a whole entry with a fragment. Only substring-match when BOTH
         // sides are ≥ MIN_REPLACE_FRAGMENT, else refuse and demand an explicit id.
+        // G5 (2026-09-01): require unambiguous match — collect all candidates and
+        // reject if more than one matches the fragment.
         if (content.length >= MIN_REPLACE_FRAGMENT) {
-          target = this.activeEntries().find(e => e.content.length >= MIN_REPLACE_FRAGMENT && (e.content.includes(content) || content.includes(e.content))) ?? undefined
+          const matches = this.activeEntries().filter(e => e.content.length >= MIN_REPLACE_FRAGMENT && (e.content.includes(content) || content.includes(e.content)))
+          if (matches.length === 1) {
+            target = matches[0]
+          } else if (matches.length > 1) {
+            return { ok: false, error: `fragment matches ${matches.length} entries; pass id for an exact replace` }
+          }
         }
         if (!target) return { ok: false, error: `replace without id needs an unambiguous ≥${MIN_REPLACE_FRAGMENT}-char fragment to target; pass id for an exact replace` }
       }
@@ -1010,11 +1029,12 @@ export class MemoryStore {
     return Number(r.lastInsertRowid)
   }
 
-  /** Prior audit rows for one refine source — bounded-retry accounting for L1
-   *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
-   *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
+/** Prior audit rows for one refine source — bounded-retry accounting for L1
+    *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
+    *  refine_runs rows with status 'ok' or 'ok-noop' (degraded/error not counted);
+    *  the 180-day audit pruning also bounds this counter. */
   refineAttemptCount(sourceId: string): number {
-    const r = this.stmt('SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ?').get(sourceId) as { c: number }
+    const r = this.stmt("SELECT COUNT(*) AS c FROM refine_runs WHERE source_id = ? AND status IN ('ok','ok-noop')").get(sourceId) as { c: number }
     return Number(r.c)
   }
 

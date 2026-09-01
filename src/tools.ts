@@ -30,6 +30,9 @@ const SCOPES: readonly string[] = ['semantic', 'episodic', 'all']
 const LIST_LIMIT = 50
 /** Recall topK clamp: 1..50 (P2-33). */
 const TOPK_MAX = 50
+/** A4 (2026-09-01): max content length for memory add/replace — prevents single
+ *  huge entries from bloating DB + FTS and slowing findCanonical full scans. */
+const MAX_CONTENT_LENGTH = 2000
 
 /** Narrow an untrusted model-supplied string to a closed set; undefined = absent/invalid. */
 function pick<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
@@ -113,7 +116,7 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
         return { content: formatEntries(store.list({ includeLowQuality: false }).slice(0, LIST_LIMIT)) }
       }
       const action = pick(ACTIONS, rawAction)
-      if (!action) return { content: `未知 action "${rawAction}";可选 list|add|replace|remove。${summarizeResult(store)}` }
+      if (!action) return { content: `[FAIL] 未知 action "${rawAction}";可选 list|add|replace|remove。${summarizeResult(store)}` }
 
       const op: MemoryOp = {
         action,
@@ -127,16 +130,21 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
         epistemic: pick(EPISTEMICS, args.epistemic),
         force: args.force === true,
       }
+      // A4 (2026-09-01): clamp content length at tool boundary to prevent
+      // single huge entries from bloating DB + FTS and slowing findCanonical.
+      if ((action === 'add' || action === 'replace') && op.content && op.content.length > MAX_CONTENT_LENGTH) {
+        return { content: `[FAIL] 未完成: 记忆内容过长（最多 ${MAX_CONTENT_LENGTH} 字符）。${summarizeResult(store)}` }
+      }
       const sid = str(exec.agent?.session?.id)
       let res: ApplyResult
       try {
         res = store.batch([op], sid)
       } catch (err) {
         // P2-35: the write path shouldn't be allowed to throw past the tool surface.
-        return { content: `未完成: 记忆写入异常: ${err instanceof Error ? err.message : String(err)}。${summarizeResult(store)}` }
+        return { content: `[FAIL] 未完成: 记忆写入异常: ${err instanceof Error ? err.message : String(err)}。${summarizeResult(store)}` }
       }
-      if (res.overflowed) return { content: `记忆预算已满;本次未写入。当前核心(${res.usage.pct}%):\n${formatEntries(res.entries.filter(e => e.tier === 0))}\n请先用 memory replace/remove 整合后再写。` }
-      if (res.rejected.length > 0) return { content: `未完成: ${res.rejected.map(r => r.reason).join('; ')}。${summarizeResult(store)}` }
+      if (res.overflowed) return { content: `[FAIL] 记忆预算已满;本次未写入。当前核心(${res.usage.pct}%):\n${formatEntries(res.entries.filter(e => e.tier === 0))}\n请先用 memory replace/remove 整合后再写。` }
+      if (res.rejected.length > 0) return { content: `[FAIL] 未完成: ${res.rejected.map(r => r.reason).join('; ')}。${summarizeResult(store)}` }
       const demoteNote = res.demoted.length > 0
         ? `（${res.demoted.length}条已有记忆因预算降级至 tier1：未注入常驻区，但可经 memory_recall 召回）`
         : ''

@@ -426,7 +426,11 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
       // record, so the cluster stays eligible once the LLM recovers.
       store.upsertL2Refined(cluster.topic)
     } catch {
-      stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' }))
+      // A3 (2026-09-01): writeRefineRun may throw if DB is closed — don't let
+      // audit failure escape and break the "Never throws" contract.
+      try {
+        stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: '[]', status: 'error' }))
+      } catch { /* audit write failed, count only */ }
       stats.clusters += 1
       stats.degraded += 1
     }

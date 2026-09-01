@@ -9,13 +9,10 @@
  *   GET  /memory/identity        → { ok: true, soul, user }
  *   POST /memory/identity        → { ok: true }  body: { file: 'soul'|'user', content }
  *
- * SECURITY (P1-3, review 2026-08-31): the POST target feeds soul.md / user.md,
- * which are injected into the system prompt as identity sections — a persistent
- * prompt-injection surface. Writes are therefore accepted ONLY from loopback
- * callers: the Host header must resolve to 127.0.0.1 / localhost / ::1, and an
- * Origin header (sent by browsers on cross-site writes) must also be loopback.
- * GET is read-only and unrestricted. Hosts that bind the webServer beyond
- * loopback should front this route with their own auth (see README §3.3).
+ * SECURITY (P1-3/G2/G3, review 2026-09-01): both GET and POST require loopback
+ * source. The check uses socket.remoteAddress (transport-layer fact, cannot be
+ * spoofed via Host/Origin headers). This blocks LAN clients and DNS-rebinding
+ * pages even when the webServer is bound beyond loopback.
  *
  * `webServer` is an optional host service that may come up after this plugin
  * (fiber startup race), so registration retries once a second (≤20 attempts)

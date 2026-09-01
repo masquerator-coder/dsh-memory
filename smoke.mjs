@@ -1,18 +1,33 @@
 /**
  * dsh-memory smoke test — runs without dsh, drives the compiled lib/.
  * Assertion groups mirror the v3 milestones:
- *   G1  idempotent schema      (M0)
- *   G2  global direct-write + cross-session recall  (M1)
- *   G3  content dedup          (M0)
- *   G4  quality filter         (M0)
- *   G5  failure_memories trail (M3)
- *   G6  exponential heat decay (M2)
- *   G7  frequency sliding window (M2)
- *   G8  episodes + recall      (M1)
- *   G9  three-level forgetting (M3)
- *   G10 user-layer immortality (M3)
- *   G11 episodic forgetting    (M3)
- *   G12 formatting (pure)      (M0)
+ *   G1   idempotent schema                   (M0)
+ *   G2   global direct-write + cross-session recall  (M1)
+ *   G3   content dedup                       (M0)
+ *   G4   quality filter                      (M0)
+ *   G5   failure_memories trail              (M3)
+ *   G6   exponential heat decay              (M2)
+ *   G7   frequency sliding window            (M2)
+ *   G8   episodes + recall                   (M1)
+ *   G8.5 L0 episodic condensation            (M1, new)
+ *   G8.6 tools_used collection               (tools_used column realism)
+ *   G9   three-level forgetting              (M3)
+ *   G10  user-layer immortality              (M3)
+ *   G11  episodic forgetting                 (M3)
+ *   G12  formatting (pure)                   (M0)
+ *   G13  L1 episodic → semantic extraction   (LLM-decided)
+ *   G14  L2 semantic merge/arbitration       (LLM-decided)
+ *   G15  refine_runs audit schema + isolation
+ *   G16  auto-route resolution               (explicit → learned → host default)
+ *   G17  budget enforcement + delete snapshot
+ *   G17b review fixes 2026-08-30 (P1-5/P2-7/P2-9/P2-10/P3)
+ *   G18  M5 session-level LLM settle         (idle consolidation)
+ *   G19  M7 L2 incremental fingerprint       (zero-LLM stable clusters)
+ *   G20  M8 peak-hour LLM suppression        (isSuppressedRaw)
+ *   G21  M9 identity sections                (soul.md / user.md)
+ *   G22  R3-i identity file auto-maintenance
+ *   G23  R3-ui identity file read/write
+ *   G24  review fixes 2026-08-31 (P1-1/P2-1/P2-3/P3-4)
  *
  * Run: node smoke.mjs
  */
@@ -384,7 +399,8 @@ group('G12 formatting (pure, M0)')
 {
   assert('writeVerdictLabel add → 已记入', writeVerdictLabel('add') === '已记入')
   assert('writeVerdictLabel replace → 已纠正', writeVerdictLabel('replace') === '已纠正')
-  assert('writeFailed detects 预算已满', writeFailed('记忆预算已满') === true)
+  assert('writeFailed detects [FAIL] prefix', writeFailed('[FAIL] 记忆预算已满') === true)
+  assert('writeFailed rejects normal text', writeFailed('已记入') === false)
   assert('recallEmptyLabel', recallEmptyLabel() === '无匹配记忆')
   assert('formatEntries exposes id', formatEntries([{ id: 'abc123', layer: 'memory', tier: 1, low_quality: false, importance: 3, topic: 't', content: 'c' }]).includes('abc123'))
   assert('formatEpisodes renders summary', formatEpisodes([{ id: 'e1', session_id: 's', ts: 1, summary: '摘要', topic: 't', extracted: false, archived: false, created: 1 }]).includes('摘要'))

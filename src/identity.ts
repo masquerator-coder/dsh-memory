@@ -79,6 +79,7 @@ export function maintainUserIdentity(store: MemoryStore, dir: string, opts: { ma
   let base = Buffer.byteLength(buf, 'utf8')
   let wrote = 0
   let overflow = 0
+  const toSync: string[] = []
 
   for (const e of todo) {
     if (base >= maxBytes) { overflow += todo.length - wrote; break }
@@ -87,11 +88,18 @@ export function maintainUserIdentity(store: MemoryStore, dir: string, opts: { ma
     if (base + add > maxBytes) { overflow += 1; continue }
     buf += line
     base += add
-    store.markIdentitySynced(e.content, target)
+    toSync.push(e.content)
     wrote += 1
   }
 
-  if (wrote > 0) writeFileSync(file, buf, 'utf8') // UTF-8, no BOM
+  if (wrote > 0) {
+    // G6 (2026-09-01): write file FIRST, then mark synced — if write fails,
+    // the ledger stays clean and the next run will retry.
+    writeFileSync(file, buf, 'utf8') // UTF-8, no BOM
+    for (const content of toSync) {
+      store.markIdentitySynced(content, target)
+    }
+  }
   return { candidates: todo.length, wrote, overflow }
 }
 

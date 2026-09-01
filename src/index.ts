@@ -227,7 +227,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l2MaxTokens = config.l2MaxTokens ?? 800
   const l2TimeoutMs = config.l2TimeoutMs ?? 10000
   const l2MinCluster = config.l2MinCluster ?? 2
-  const l1RetryDegraded = config.l1RetryDegraded ?? true
+  const l1RetryDegraded = config.l1RetryDegraded ?? false
   // M5 / M8 / M9
   const l0IdleMinutes = config.l0IdleMinutes ?? 30
   const checkMinutes = config.checkMinutes ?? 5
@@ -395,7 +395,13 @@ export function apply(ctx: Context, config: Config = {}): void {
     // with many short-lived sessions (never idle-settled) would otherwise grow
     // it forever. Cap the session count (evict the least-recently-active) and
     // let runSettle drop entries stale beyond L0_PENDING_STALE_MS.
-    const l0Pending = new Map<string, { lastActivity: number; texts: string[] }>()
+    // A5 (2026-09-01): add eventCursor for incremental event scanning.
+    interface L0PendingEntry {
+      lastActivity: number
+      texts: string[]
+      eventCursor: number
+    }
+    const l0Pending = new Map<string, L0PendingEntry>()
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
       if (!runtime.enabled) return // R3-total: memory disabled → no auto condensation at all
@@ -422,9 +428,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ }))
 
       // Buffer this turn's texts for the idle LLM settle (bounded to last 200).
+      // A5: incremental scan — only process events since last cursor.
       if (session.id) {
-        const texts = collectTurnTexts(session.events, turn)
         const prev = l0Pending.get(session.id)
+        const cursor = prev?.eventCursor ?? 0
+        const newEvents = (session.events as readonly unknown[]).slice(cursor)
+        const texts = collectTurnTexts(newEvents, turn)
         if (!prev && l0Pending.size >= L0_PENDING_MAX_SESSIONS) {
           // P2-5: evict the least-recently-active session's buffer.
           let oldestKey: string | undefined
@@ -435,6 +444,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         l0Pending.set(session.id, {
           lastActivity: Date.now(),
           texts: (prev ? prev.texts : []).concat(texts).slice(-200),
+          eventCursor: session.events.length,
         })
       }
       kickRefine() // M6: a fresh realtime episode → L1 extraction in ~10s

@@ -15,5 +15,6 @@ export declare function formatEpisodes(episodes: readonly Episode[]): string;
 export declare function writeVerdictLabel(action: string): string;
 /** Empty recall outcome gives the card a "no match" header. */
 export declare function recallEmptyLabel(): string;
-/** Whether an execute text signals a non-write outcome (rejected / overflow / unknown action). */
+/** Whether an execute text signals a non-write outcome (rejected / overflow / unknown action).
+ *  A6 (2026-09-01): uses structured prefix instead of fragile string matching. */
 export declare function writeFailed(text: string): boolean;

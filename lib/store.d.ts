@@ -211,8 +211,9 @@ export declare class MemoryStore {
         status: string;
     }): number;
     /** Prior audit rows for one refine source — bounded-retry accounting for L1
-     *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
-     *  refine_runs rows; the 180-day audit pruning also bounds this counter. */
+        *  episodes whose facts were rejected (e.g. tier-0 budget overflow). Counts
+        *  refine_runs rows with status 'ok' or 'ok-noop' (degraded/error not counted);
+        *  the 180-day audit pruning also bounds this counter. */
     refineAttemptCount(sourceId: string): number;
     /** M7: last LLM-audit timestamp for a topic cluster (undefined = never audited → audit). */
     l2RefinedTs(topic: string): number | undefined;
