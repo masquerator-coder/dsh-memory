@@ -16,6 +16,17 @@ export interface ListFilter {
     includeArchived?: boolean;
     includeLowQuality?: boolean;
 }
+/** Result of {@link MemoryStore.exportSnapshot} or an import validation pass. */
+export interface BackupStats {
+    /** Snapshot file size in bytes. */
+    size: number;
+    /** Active (non-archived) memory rows in the snapshot. */
+    memories: number;
+    /** Active (non-archived) episode rows in the snapshot. */
+    episodes: number;
+    /** Monotonic ms timestamp captured when the snapshot was taken. */
+    exportedAt: number;
+}
 export interface RecallOpts {
     topK?: number;
     includeArchived?: boolean;
@@ -38,13 +49,13 @@ export declare class MemoryStore {
     readonly windowDays: number;
     readonly forgetDays: ForgetDays;
     private db;
-    private readonly upsertMemStmt;
-    private readonly upsertFtsStmt;
-    private readonly upsertEpiStmt;
-    private readonly upsertEpiFtsStmt;
-    private readonly rowidStmt;
-    private readonly epiRowidStmt;
-    private readonly getMemStmt;
+    private upsertMemStmt;
+    private upsertFtsStmt;
+    private upsertEpiStmt;
+    private upsertEpiFtsStmt;
+    private rowidStmt;
+    private epiRowidStmt;
+    private getMemStmt;
     /** P3-1 (review 2026-08-31): prepared-statement cache keyed by SQL text —
      *  `list()`, the exact-content dedup lookups, and the forget/audit updates
      *  re-prepared on every call (the same 3.5x gap P3-11 fixed for `get()`),
@@ -52,7 +63,49 @@ export declare class MemoryStore {
      *  combination SQL (list/recall) yields a bounded, structural key set. */
     private readonly stmtCache;
     constructor(home?: string, budget?: MemoryBudget, windowDays?: number, forgetDays?: ForgetDays);
+    /**
+     * (Re-)prepare every hot-path prepared statement. Called from the constructor
+     * and from {@link replaceWithBackup} after the underlying DB connection is
+     * swapped — the 7 named statements are the only ones the store keeps across
+     * calls; everything else goes through the {@link stmtCache} (cleared on swap).
+     */
+    private prepareStatements;
     close(): void;
+    /**
+     * Export a consistent, self-contained snapshot of the ENTIRE store (all
+     * tables: memories, episodes, FTS, forget/refine/lesson audit trails) to
+     * `destPath` using SQLite's `VACUUM INTO`. The output is a single,
+     * WAL-independent .db file (safe even while the live store is in WAL mode),
+     * restorable later via {@link replaceWithBackup}. Zero dependency.
+     */
+    exportSnapshot(destPath: string): BackupStats;
+    /**
+     * Validate that `path` is a readable SQLite file carrying the dsh-memory
+     * schema (memories + episodes tables). Used to refuse a bogus/unrelated file
+     * BEFORE touching the live store during {@link replaceWithBackup}. Read-only
+     * open — never mutates the candidate file.
+     */
+    static validateBackup(path: string): {
+        ok: true;
+        memories: number;
+        episodes: number;
+    } | {
+        ok: false;
+        error: string;
+    };
+    /**
+     * Restore the store from a dsh-memory backup .db file (`srcPath`), replacing
+     * ALL current data. Validates the candidate first (refuses to clobber on a
+     * bogus file), then hot-swaps the underlying connection so every already-held
+     * closure (routes, tools, refine/l0 passes, systemPrompt sections) keeps
+     * working against the restored data — only the store's internal db handle
+     * changes. A safety snapshot of the pre-import state is written to
+     * `memory.db.pre-import.bak` so a regretful import can be undone manually.
+     */
+    replaceWithBackup(srcPath: string): {
+        memories: number;
+        episodes: number;
+    };
     /** P3-1: cached prepare — see {@link stmtCache}. */
     private stmt;
     private rowToEntry;

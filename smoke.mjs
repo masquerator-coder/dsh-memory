@@ -1070,6 +1070,72 @@ group('G32/G33 lessonUseLlm=false → 纯规则模板升格, 无 seam 调用')
 }
 
 // ---------------------------------------------------------------------------
+group('G34 备份导出/导入 往返 (VACUUM INTO + 连接热切换)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g34-'))
+  const s1 = new MemoryStore(t)
+  s1.batch([{ action: 'add', layer: 'user', content: '备份测试：用户偏好简洁备份内容一', importance: 5, topic: '偏好' }])
+  s1.batch([{ action: 'add', layer: 'memory', kind: 'env', content: '备份测试：某环境配置内容二', importance: 4 }])
+  s1.addEpisode({ sessionId: 'sess-B1', summary: '备份会话摘要内容', topic: '会话' })
+  s1.recordFailure('mX', '旧备份', '新备份') // lesson_drafts / failure_memories 审计轨也要随备份走
+  const snap = join(t, 'snap.db')
+  const stats = s1.exportSnapshot(snap)
+  assert('exportSnapshot 统计（2 记忆 + 1 会话 + 快照非空）', stats.memories === 2 && stats.episodes === 1 && stats.size > 0)
+  s1.close()
+
+  const check = MemoryStore.validateBackup(snap)
+  assert('validateBackup 认可合法备份', check.ok === true && check.memories === 2 && check.episodes === 1)
+
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-mem-g34b-'))
+  const s2 = new MemoryStore(t2)
+  assert('新库初始为空', s2.count() === 0)
+  const imported = s2.replaceWithBackup(snap)
+  assert('导入返回记忆/会话计数', imported.memories === 2 && imported.episodes === 1)
+  assert('导入后 memories 恢复', s2.count() === 2)
+  assert('导入后 episodes 恢复', s2.listEpisodes().length === 1)
+  const entries = s2.list()
+  assert('导入后内容一致', entries.length === 2 && entries.some((e) => e.content.includes('备份测试')))
+  assert('导入后 lesson_drafts/审计轨恢复', s2.listLessonDrafts().length === 1 && s2.failureTrail().length === 1)
+  // 热切换后写路径仍可用（语句已重准备）
+  s2.batch([{ action: 'add', layer: 'user', content: '备份测试：导入后新写入内容仍正常', importance: 5 }])
+  assert('导入后仍可写（语句重准备）', s2.count() === 3)
+  assert('导入前状态已留回滚备份', existsSync(join(t2, 'memory', 'memory.db.pre-import.bak')))
+  s2.close()
+  rmSync(t, { recursive: true, force: true })
+  rmSync(t2, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G35 备份导入拒绝非法文件（不清空现有数据）')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g35-'))
+  const junk = join(t, 'junk.db')
+  writeFileSync(junk, 'this is not a sqlite file at all')
+  const r1 = MemoryStore.validateBackup(junk)
+  assert('非 SQLite 文件被拒', r1.ok === false)
+
+  const noSchema = join(t, 'no-schema.db')
+  {
+    const db = new DatabaseSync(noSchema)
+    db.exec('CREATE TABLE foo(bar TEXT)')
+    db.close()
+  }
+  const r2 = MemoryStore.validateBackup(noSchema)
+  assert('缺 memories/episodes 表的库被拒', r2.ok === false)
+
+  // 用合法备份替换时应先拒绝（不会清空当前库）
+  const s = new MemoryStore(t)
+  s.batch([{ action: 'add', layer: 'user', content: '导入前应保住的记忆内容正文', importance: 5 }])
+  assert('导入前 1 条', s.count() === 1)
+  let threw = false
+  try { s.replaceWithBackup(junk) } catch { threw = true }
+  assert('replaceWithBackup 拒绝非法并抛错', threw === true)
+  assert('拒绝后现有数据未被清空', s.count() === 1)
+  s.close()
+  rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(50)}`)
 console.log(`passed: ${passed}  failed: ${failed}`)
 try { rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }

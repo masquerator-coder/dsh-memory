@@ -117,6 +117,10 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 - **立即整理记忆** —— 点按即触发 `POST /memory/trigger`，不等定时扫描，立即执行 **L1/L2 凝练 + 主动遗忘**（绕过忙闲时段抑制，因为是你主动要求），并回显本次结果（凝练是否执行、遗忘降级/归档/删除各多少）。
 - **查看记忆** —— 打开一个弹窗（`GET /memory/view`），只读展示当前有效记忆摘要：有效记忆/会话摘要/主题计数 + 表格（层级、类型、主题、内容、重要性）。
 
+面板底部的**备份区**（`/memory/backup/*`，同受 loopback 信任模型约束）：
+- **导出备份** —— 下载一个「整库」一致快照 `.db`（`VACUUM INTO`，含记忆、会话摘要、FTS 与全部审计轨，WAL 无关），可离线保存/迁移。
+- **导入备份** —— 选择一个 `.db` 快照**替换全部**现有数据；导入前先读-only 校验（非 SQLite 或缺 `memories`/`episodes` 表直接拒绝、不清空现有数据），成功后热切换连接——既有路由/工具/后台 pass 无需重启即针对恢复后数据继续工作，同时把导入前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚。
+
 ### 2.3 身份文件（soul.md / user.md）
 
 - **soul.md**：AI 人格 / 行为准则，**只由人写**，插件永不自动改写。
@@ -170,7 +174,7 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
-**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
+**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
 
 ---
 
@@ -281,7 +285,7 @@ memory_recall  query="上周关于部署的讨论"    scope=episodic
 # 自动探测 esbuild / @types/react / typescript 最高语义版本（不硬编码），
 # 随后 tsc 类型检查（Node + client）+ esbuild 打包 client。
 node build.mjs
-# 冒烟（无 dsh 也可跑，全量断言组 G1–G33）
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G35）
 npm run smoke   # 等价于 node smoke.mjs
 ```
 
@@ -291,7 +295,7 @@ npm run smoke   # 等价于 node smoke.mjs
 
 ## 八、状态与兼容性
 
-- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）——`smoke.mjs` 全部断言组（204 项，G1–G33）全绿、稳定连跑，`tsc` 零错误。
+- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）、教训沉淀管道、整库备份导出/导入——`smoke.mjs` 全部断言组（219 项，G1–G35）全绿、稳定连跑，`tsc` 零错误。
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
 - **后台凝练 L1/L2**：周期性运行（默认 1h，面板可自定义间隔），情景→事实抽取 + 语义簇合并/去重，受忙闲时段抑制；新会话落库 10 秒内即时触发一次；亦可面板「立即整理记忆」手动触发。LLM 降级时不退化为纯规则硬抽（标记 degraded）。
 - **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.5）。
@@ -300,6 +304,7 @@ npm run smoke   # 等价于 node smoke.mjs
 - **设置面板控制面（2026-09-02）**：soul/user 编辑器新增「打开编辑」（`/memory/identity/open` 默认编辑器打开磁盘文件）；新增「立即整理记忆」（`/memory/trigger`，绕过忙闲时段立即执行凝练+遗忘并回显结果）与「查看记忆」（`/memory/view` 只读弹窗）；「凝练整理时间间隔」可在面板自定义（`refineIntervalMs`），改动 live 生效。新增路由全部 loopback 校验。
 - **教训沉淀管道（2026-09-02，DESIGN docs/lesson-pipeline.md）**：`replace/合并冲突` 触发 `recordFailure` 时，零 LLM 即时双写 `lesson_drafts` 草案（同 memory 纠正聚合 draft_count）；后台周期（默认 1h）+ replace 现场即时（`lessonInstantJudge`）两条通道经 LLM 判定（wrong-original / stale → 升格 `kind=lesson`；trivial → drop；LLM 失败保留待下次），纯规则模板兜底（`lessonUseLlm=false`）。全旁路：独立 seam、非阻塞、只落库不回流、输入最小化。新增 `smoke.mjs` 断言 G26–G33 全绿。
 - **user.md 自动维护彻底移除（2026-09-02）**：`maintainUserIdentity`、`identityAuto`/`identityIntervalMs`/`identityMaxBytes`、`identity_synced`/`identity_meta` 表及 G22/P3-4 测试全部删除；user.md 与 soul.md 一样完全由人维护。旧库残留的 `identity_synced`/`identity_meta` 表为惰性孤儿，不再被引用、无害。
+- **记忆备份导出/导入（2026-09-02）**：设置面板「记忆」项新增「导出备份」与「导入备份」。导出走 SQLite `VACUUM INTO` 生成**整库**一致快照（.db，含记忆、会话摘要、FTS、forget/refine/lesson 审计轨，WAL 无关），浏览器下载保存；导入先读-only 校验再**热切换连接**（`replaceWithBackup` 重准备全部语句，既有路由/tools/后台 pass 无需重启即针对恢复后数据继续工作），导入前自动把当前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚，非法文件（非 SQLite / 缺 memories+episodes 表）直接拒绝、不清空现有数据。两条新路由（`/memory/backup/export`、`/memory/backup/import`）同受 loopback 信任模型约束。新增 `smoke.mjs` 断言 G34–G35 全绿。
 
 ---
 

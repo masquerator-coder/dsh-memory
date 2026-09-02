@@ -3,9 +3,10 @@
  *
  * Registers one `settings.section` entry ("记忆") in the dsh settings page, and
  * renders a restrained panel: master memory switch, user.md auto-maintenance
- * switch, condensation/maintenance cadence, peak-hour suppression switch, and
+ * switch, condensation/maintenance cadence, peak-hour suppression switch,
  * inline editors for soul.md / user.md (files stay the source of truth — the
- * editor talks to the host over /memory/identity).
+ * editor talks to the host over /memory/identity), and whole-store backup
+ * export/import (下载/恢复 .db 快照).
  *
  * The panel reads/writes the `memory` settings namespace through
  * `ctx.settingsScope.bind({ namespace: 'memory' })`; toggles are live-applied by
@@ -15,7 +16,7 @@
  * Kept intentionally minimal (克制): no custom chrome, no icons beyond native
  * inputs — the necessary information only.
  */
-import { useEffect, useState, type JSX, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
 
 /**
  * Memory/nav glyph — a neuron (soma + radiating dendrites + synapse nodes),
@@ -112,6 +113,10 @@ interface PanelProps {
   runNow: () => Promise<RunNowResult>
   /** Fetch the memory digest for the viewer window. */
   loadMemoryView: () => Promise<ViewPayload>
+  /** Download a full store snapshot (.db) — triggers a browser download. */
+  exportBackup: () => Promise<SaveResult>
+  /** Restore the store from a backup .db file (REPLACES all current data). */
+  importBackup: (file: File) => Promise<{ ok: boolean; memories: number; episodes: number; error?: string }>
 }
 
 /** Reactive snapshot value via the framework seat (scope.getSnapshot/subscribe). */
@@ -229,6 +234,12 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const [viewLoading, setViewLoading] = useState(false)
   const [view, setView] = useState<ViewPayload | null>(null)
   const [viewError, setViewError] = useState<string | null>(null)
+  // 备份
+  const [exporting, setExporting] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [backupNote, setBackupNote] = useState<string | null>(null)
+  const [backupError, setBackupError] = useState<string | null>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
     props.loadIdentity().then(setIdentity).catch(() => { /* route absent: keep empty */ })
   }, [props.loadIdentity])
@@ -262,6 +273,37 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
       setViewError(e instanceof Error ? e.message : '读取记忆失败')
     } finally {
       setViewLoading(false)
+    }
+  }
+
+  const doExport = async (): Promise<void> => {
+    setExporting(true)
+    setBackupNote(null)
+    setBackupError(null)
+    try {
+      const r = await props.exportBackup()
+      if (r.ok) setBackupNote('备份已导出（完整 .db 快照），请妥善保存。')
+      else setBackupError(r.error ?? '导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const doImport = async (f: File | undefined): Promise<void> => {
+    if (!f) return
+    setImporting(true)
+    setBackupNote(null)
+    setBackupError(null)
+    try {
+      const r = await props.importBackup(f)
+      if (r.ok) {
+        setBackupNote(`已从备份恢复：${r.memories} 条记忆、${r.episodes} 条会话摘要。导入前的状态已存为 memory.db.pre-import.bak 以便回滚。`)
+      } else {
+        setBackupError(r.error ?? '导入失败')
+      }
+    } finally {
+      setImporting(false)
+      if (fileRef.current) fileRef.current.value = ''
     }
   }
 
@@ -334,6 +376,25 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         onSave={(content) => props.saveIdentity('user', content)}
         onOpen={() => props.openEditor('user')}
       />
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '10px 0', borderTop: '1px solid rgba(128,128,128,0.25)', marginTop: 4 }}>
+        <button type="button" disabled={exporting} onClick={() => { void doExport() }} style={{ padding: '6px 10px' }}>
+          {exporting ? '导出中…' : '导出备份'}
+        </button>
+        <button type="button" disabled={importing} onClick={() => fileRef.current?.click()} style={{ padding: '6px 10px' }}>
+          {importing ? '导入中…' : '导入备份'}
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".db,.sqlite,.sqlite3"
+          style={{ display: 'none' }}
+          onChange={(e) => { void doImport(e.target.files?.[0]) }}
+        />
+        <span style={{ fontSize: 12, opacity: 0.7 }}>导出为完整 .db 快照（含记忆、会话摘要、审计与纠错轨迹）；导入将<b>替换</b>全部现有数据，导入前自动存回滚备份。</span>
+      </div>
+      {backupNote && <div style={{ fontSize: 12, color: '#0a7a2f' }}>{backupNote}</div>}
+      {backupError && <div style={{ fontSize: 12, color: '#c00' }}>{backupError}</div>}
 
       {viewOpen && (
         <PanelModal title="记忆查看" onClose={() => setViewOpen(false)}>
@@ -471,6 +532,47 @@ export function apply(ctx: ClientContext): () => void {
     }
   }
 
+  /** Download a full store snapshot as a .db attachment (browser download). */
+  const exportBackup = async (): Promise<SaveResult> => {
+    try {
+      const resp = await fetch('/memory/backup/export', { cache: 'no-store' })
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        return { ok: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      }
+      const blob = await resp.blob()
+      const name = (resp.headers.get('content-disposition')?.match(/filename="?([^";]+)"?/)?.[1]) ?? 'dsh-memory-backup.db'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '网络错误' }
+    }
+  }
+
+  /** Restore the store from an uploaded backup .db — REPLACES all current data. */
+  const importBackup = async (file: File): Promise<{ ok: boolean; memories: number; episodes: number; error?: string }> => {
+    try {
+      const buf = await file.arrayBuffer()
+      const resp = await fetch('/memory/backup/import', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: buf,
+      })
+      const data = await resp.json().catch(() => ({})) as { ok?: boolean; memories?: number; episodes?: number; error?: string }
+      if (!resp.ok || !data.ok) return { ok: false, memories: 0, episodes: 0, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      return { ok: true, memories: data.memories ?? 0, episodes: data.episodes ?? 0 }
+    } catch (e) {
+      return { ok: false, memories: 0, episodes: 0, error: e instanceof Error ? e.message : '网络错误' }
+    }
+  }
+
   const dispose = ctx.slots.inject('settings.section', () => ctx.slots.register(
     {
       name: 'settings.section',
@@ -478,7 +580,7 @@ export function apply(ctx: ClientContext): () => void {
       order: 50,
       label: () => '记忆',
       icon: <MemoryIcon />,
-      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView }),
+      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView, exportBackup, importBackup }),
     },
     MemorySettingsPanel,
   ))

@@ -11,6 +11,8 @@
  *   POST /memory/identity/open   → { ok: true, path }    body: { file: 'soul'|'user' }  — open in a local editor
  *   POST /memory/trigger         → { ok: true, result }  — run an immediate condensation/identity/forget pass
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
+ *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
+ *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
  *
  * SECURITY (P1-3/G2/G3, review 2026-09-01): every route requires a loopback
  * source. The check uses socket.remoteAddress (transport-layer fact, cannot be
@@ -23,10 +25,12 @@
  * inside a ctx.effect so a hot reload un-registers them (no duplicate residue).
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { MemoryStore } from './store.js'
+import { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 import { readIdentityFiles, writeIdentityFile } from './identity.js'
 import { exec } from 'node:child_process'
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, basename } from 'node:path'
 
 /** Loopback IP addresses (transport-layer fact, cannot be spoofed via headers). */
@@ -165,6 +169,50 @@ function readJsonBody(req: unknown, maxBytes = 65_536): Promise<unknown> {
   })
 }
 
+/** Read a raw (binary) POST body into a Buffer, for backup import. Capped at
+ *  `maxBytes` (default 100 MiB — a memory .db snapshot stays far below this,
+ *  but FTS + audit trails can push a long-lived store into the multi-MB range)
+ *  and drained with the same slow-loris idle timeout as {@link readJsonBody}. */
+function readRawBody(req: unknown, maxBytes = 100 * 1024 * 1024): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const r = req as {
+      on?: (ev: 'data' | 'end' | 'error', cb: (...a: unknown[]) => void) => void
+      destroy?: () => void
+      setTimeout?: (ms: number) => void
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        reject(new Error('request body idle timeout'))
+        r.destroy?.()
+      }, 10_000)
+    }
+    resetIdleTimer()
+    r.on?.('data', (chunk: unknown) => {
+      resetIdleTimer()
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk ?? ''))
+      size += buf.length
+      if (size > maxBytes) {
+        reject(new Error('backup file too large'))
+        r.destroy?.()
+        return
+      }
+      chunks.push(buf)
+    })
+    r.on?.('end', () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      resolve(Buffer.concat(chunks))
+    })
+    r.on?.('error', (e: unknown) => {
+      if (idleTimer) clearTimeout(idleTimer)
+      reject(e instanceof Error ? e : new Error(String(e)))
+    })
+  })
+}
+
 /** Build the viewer digest from the store (active memories + episode count +
  *  topic index). Pure read — never mutates the store. */
 function buildViewPayload(store: MemoryStore): ViewPayload {
@@ -273,11 +321,69 @@ export function registerControlRoutes(
     })()
   }
 
+  /** Download a full store snapshot (VACUUM INTO .db) as an attachment. */
+  const backupExport: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'GET') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        // VACUUM INTO writes a consistent, self-contained snapshot to a temp
+        // file; read it fully (a memory store is KB–low-MB), then clean up.
+        const tmpFile = join(tmpdir(), `dsh-memory-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`)
+        let buf: Buffer
+        try {
+          store.exportSnapshot(tmpFile)
+          buf = readFileSync(tmpFile)
+        } finally {
+          try { unlinkSync(tmpFile) } catch { /* best-effort cleanup */ }
+        }
+        const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+        const r = res as { writeHead?: (code: number, headers: Record<string, string>) => void; end?: (chunk?: Buffer | string) => void }
+        r.writeHead?.(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': `attachment; filename="dsh-memory-backup-${stamp}.db"`,
+        })
+        r.end?.(buf)
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
+  /** Restore the store from an uploaded backup .db — REPLACES all current data.
+   *  Body is the raw .db bytes (not JSON). */
+  const backupImport: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'POST') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const body = await readRawBody(req)
+        if (body.length === 0) { writeJson(res, 400, { ok: false, error: '未收到备份文件内容' }); return }
+        const tmpFile = join(tmpdir(), `dsh-memory-import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`)
+        try {
+          writeFileSync(tmpFile, body)
+          // Validate first (400 on a bogus file) so we never clobber on garbage;
+          // replaceWithBackup re-validates as its own gate before the swap.
+          const check = MemoryStore.validateBackup(tmpFile)
+          if (!check.ok) { writeJson(res, 400, { ok: false, error: check.error }); return }
+          const result = store.replaceWithBackup(tmpFile)
+          writeJson(res, 200, { ok: true, memories: result.memories, episodes: result.episodes })
+        } finally {
+          try { unlinkSync(tmpFile) } catch { /* best-effort cleanup */ }
+        }
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
   const routes: { path: string; handler: RouteHandler }[] = [
     { path: '/memory/identity', handler: identityEditor },
     { path: '/memory/identity/open', handler: identityOpen },
     { path: '/memory/trigger', handler: trigger },
     { path: '/memory/view', handler: view },
+    { path: '/memory/backup/export', handler: backupExport },
+    { path: '/memory/backup/import', handler: backupImport },
   ]
 
   const tryRegister = (attempt: number): void => {

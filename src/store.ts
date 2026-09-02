@@ -15,7 +15,7 @@
  * an OS file lock — declared out of scope, not silently assumed.
  */
 import { createHash } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { copyFileSync, mkdirSync, rmSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -85,6 +85,18 @@ export interface ListFilter {
   includeLowQuality?: boolean
 }
 
+/** Result of {@link MemoryStore.exportSnapshot} or an import validation pass. */
+export interface BackupStats {
+  /** Snapshot file size in bytes. */
+  size: number
+  /** Active (non-archived) memory rows in the snapshot. */
+  memories: number
+  /** Active (non-archived) episode rows in the snapshot. */
+  episodes: number
+  /** Monotonic ms timestamp captured when the snapshot was taken. */
+  exportedAt: number
+}
+
 export interface RecallOpts {
   topK?: number
   includeArchived?: boolean
@@ -115,16 +127,18 @@ export class MemoryStore {
   readonly windowDays: number
   readonly forgetDays: ForgetDays
   private db: DatabaseSync
-  private readonly upsertMemStmt: ReturnType<DatabaseSync['prepare']>
-  private readonly upsertFtsStmt: ReturnType<DatabaseSync['prepare']>
-  private readonly upsertEpiStmt: ReturnType<DatabaseSync['prepare']>
-  private readonly upsertEpiFtsStmt: ReturnType<DatabaseSync['prepare']>
-  private readonly rowidStmt: ReturnType<DatabaseSync['prepare']>
-  private readonly epiRowidStmt: ReturnType<DatabaseSync['prepare']>
+  // P3-1: these statements are (re)assigned by prepareStatements() — not readonly
+  // so a backup import can hot-swap the connection (see replaceWithBackup).
+  private upsertMemStmt!: ReturnType<DatabaseSync['prepare']>
+  private upsertFtsStmt!: ReturnType<DatabaseSync['prepare']>
+  private upsertEpiStmt!: ReturnType<DatabaseSync['prepare']>
+  private upsertEpiFtsStmt!: ReturnType<DatabaseSync['prepare']>
+  private rowidStmt!: ReturnType<DatabaseSync['prepare']>
+  private epiRowidStmt!: ReturnType<DatabaseSync['prepare']>
   // P3-11 (review 2026-08-30): `get()` re-prepared its statement on every call
   // (23.6µs vs 6.7µs pre-compiled, 3.5x) and sits on the recall/touchAccess
   // hot path — prepare once here.
-  private readonly getMemStmt: ReturnType<DatabaseSync['prepare']>
+  private getMemStmt!: ReturnType<DatabaseSync['prepare']>
   /** P3-1 (review 2026-08-31): prepared-statement cache keyed by SQL text —
    *  `list()`, the exact-content dedup lookups, and the forget/audit updates
    *  re-prepared on every call (the same 3.5x gap P3-11 fixed for `get()`),
@@ -153,6 +167,16 @@ export class MemoryStore {
     this.db.exec(DDL)
     rebuildFts(this.db)
 
+    this.prepareStatements()
+  }
+
+  /**
+   * (Re-)prepare every hot-path prepared statement. Called from the constructor
+   * and from {@link replaceWithBackup} after the underlying DB connection is
+   * swapped — the 7 named statements are the only ones the store keeps across
+   * calls; everything else goes through the {@link stmtCache} (cleared on swap).
+   */
+  private prepareStatements(): void {
     this.upsertMemStmt = this.stmt(`
       INSERT INTO memories
         (id, layer, kind, tier, topic, content, importance, quality, epistemic, heat,
@@ -189,6 +213,118 @@ export class MemoryStore {
 
   close(): void {
     this.db.close()
+  }
+
+  // ---- backup / restore (SQLite-level whole-DB snapshot) ------------------
+
+  /**
+   * Export a consistent, self-contained snapshot of the ENTIRE store (all
+   * tables: memories, episodes, FTS, forget/refine/lesson audit trails) to
+   * `destPath` using SQLite's `VACUUM INTO`. The output is a single,
+   * WAL-independent .db file (safe even while the live store is in WAL mode),
+   * restorable later via {@link replaceWithBackup}. Zero dependency.
+   */
+  exportSnapshot(destPath: string): BackupStats {
+    // Single-quote SQL string literal escaping; forward-slash the path so it
+    // parses cleanly on every platform (backslashes are not SQL escapes).
+    const abs = destPath.replace(/\\/g, '/').replace(/'/g, "''")
+    this.db.exec(`VACUUM INTO '${abs}'`)
+    const st = statSync(destPath)
+    return {
+      size: st.size,
+      memories: this.count(),
+      episodes: this.episodeCount(),
+      exportedAt: Date.now(),
+    }
+  }
+
+  /**
+   * Validate that `path` is a readable SQLite file carrying the dsh-memory
+   * schema (memories + episodes tables). Used to refuse a bogus/unrelated file
+   * BEFORE touching the live store during {@link replaceWithBackup}. Read-only
+   * open — never mutates the candidate file.
+   */
+  static validateBackup(
+    path: string,
+  ): { ok: true; memories: number; episodes: number } | { ok: false; error: string } {
+    let db: DatabaseSync
+    try {
+      db = new DatabaseSync(path, { readOnly: true })
+    } catch (e) {
+      return { ok: false, error: `不是可读取的 SQLite 文件：${e instanceof Error ? e.message : String(e)}` }
+    }
+    try {
+      const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]
+      const names = new Set(rows.map((r) => r.name))
+      if (!names.has('memories') || !names.has('episodes')) {
+        return { ok: false, error: '不是 dsh-memory 备份（缺少 memories / episodes 表）' }
+      }
+      const mc = db.prepare('SELECT COUNT(*) AS c FROM memories').get() as { c: number }
+      const ec = db.prepare('SELECT COUNT(*) AS c FROM episodes').get() as { c: number }
+      return { ok: true, memories: Number(mc.c), episodes: Number(ec.c) }
+    } catch (e) {
+      return { ok: false, error: `备份结构读取失败：${e instanceof Error ? e.message : String(e)}` }
+    } finally {
+      try { db.close() } catch { /* already closed */ }
+    }
+  }
+
+  /**
+   * Restore the store from a dsh-memory backup .db file (`srcPath`), replacing
+   * ALL current data. Validates the candidate first (refuses to clobber on a
+   * bogus file), then hot-swaps the underlying connection so every already-held
+   * closure (routes, tools, refine/l0 passes, systemPrompt sections) keeps
+   * working against the restored data — only the store's internal db handle
+   * changes. A safety snapshot of the pre-import state is written to
+   * `memory.db.pre-import.bak` so a regretful import can be undone manually.
+   */
+  replaceWithBackup(srcPath: string): { memories: number; episodes: number } {
+    const check = MemoryStore.validateBackup(srcPath)
+    if (!check.ok) throw new Error(`无法导入：${check.error}`)
+    // 1. Safety net: snapshot the current state before clobbering it.
+    const bakPath = join(this.dir, 'memory.db.pre-import.bak')
+    try {
+      const bak = bakPath.replace(/\\/g, '/').replace(/'/g, "''")
+      this.db.exec(`VACUUM INTO '${bak}'`)
+    } catch (e) {
+      // Non-fatal: import proceeds, but surface so the user knows rollback is unavailable.
+      console.warn('[dsh-memory] pre-import safety backup failed:', e instanceof Error ? e.message : e)
+    }
+    // 2. Close the live connection (SQLite checkpoints WAL on close) and drop
+    //    any stale -wal/-shm so the swap opens clean.
+    this.db.close()
+    rmSync(this.dbPath + '-wal', { force: true })
+    rmSync(this.dbPath + '-shm', { force: true })
+    const reopen = (): void => {
+      this.db = new DatabaseSync(this.dbPath)
+      this.db.exec('PRAGMA journal_mode=WAL')
+      this.db.exec('PRAGMA busy_timeout=3000')
+      // CREATE TABLE IF NOT EXISTS is a no-op on an already-schema'd backup;
+      // keeps the restore resilient to minor flag changes without rebuilding FTS.
+      this.db.exec(DDL)
+      rebuildFts(this.db)
+      this.stmtCache.clear()
+      this.prepareStatements()
+    }
+    // 3. Overwrite the live file with the backup and reopen.
+    try {
+      copyFileSync(srcPath, this.dbPath)
+      reopen()
+    } catch (e) {
+      // The live connection is already closed — don't leave the store broken.
+      // The pre-import backup is a complete (VACUUM INTO) stand-in for memory.db,
+      // so restore it and reopen before rethrowing.
+      try {
+        rmSync(this.dbPath + '-wal', { force: true })
+        rmSync(this.dbPath + '-shm', { force: true })
+        copyFileSync(bakPath, this.dbPath)
+        reopen()
+      } catch {
+        /* restore failed too — the store stays closed; data survives in .bak */
+      }
+      throw e
+    }
+    return { memories: check.memories, episodes: check.episodes }
   }
 
   /** P3-1: cached prepare — see {@link stmtCache}. */

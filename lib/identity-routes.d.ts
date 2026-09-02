@@ -11,6 +11,8 @@
  *   POST /memory/identity/open   → { ok: true, path }    body: { file: 'soul'|'user' }  — open in a local editor
  *   POST /memory/trigger         → { ok: true, result }  — run an immediate condensation/identity/forget pass
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
+ *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
+ *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
  *
  * SECURITY (P1-3/G2/G3, review 2026-09-01): every route requires a loopback
  * source. The check uses socket.remoteAddress (transport-layer fact, cannot be
@@ -23,7 +25,7 @@
  * inside a ctx.effect so a hot reload un-registers them (no duplicate residue).
  */
 import type { Context } from '@deepseek-ai/cordis';
-import type { MemoryStore } from './store.js';
+import { MemoryStore } from './store.js';
 /** Result of an immediate "整理记忆" pass, returned by the trigger route. */
 export interface RunNowResult {
     refined: boolean;
