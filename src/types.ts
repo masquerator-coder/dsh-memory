@@ -110,6 +110,24 @@ export interface RecallHit {
   score: number
 }
 
+/** One row of the lesson_drafts staging table (DESIGN docs/lesson-pipeline.md §2.2).
+ *  A correction (replace / merge-conflict) writes a draft here via recordFailure;
+ *  the background lesson-promote pass (or an instant judge) later turns it into a
+ *  `kind=lesson` memory or drops it. */
+export interface LessonDraft {
+  id: number
+  memory_id: string
+  topic: string
+  old_content: string | null
+  new_content: string | null
+  /** Pre-assembled lesson template / LLM-rewritten natural language. */
+  lesson: string
+  source: string
+  status: 'draft' | 'promoted' | 'dropped'
+  draft_count: number
+  drafted_at: number
+}
+
 export interface EpisodeHit {
   episode: Episode
   score: number

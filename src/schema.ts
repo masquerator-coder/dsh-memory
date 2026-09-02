@@ -110,6 +110,24 @@ CREATE TABLE IF NOT EXISTS l2_refined (
   topic      TEXT PRIMARY KEY,
   refined_at INTEGER NOT NULL
 );
+
+-- Lesson pipeline (DESIGN docs/lesson-pipeline.md §2.2): staged corrections
+-- awaiting a background/instant LLM judgement that promotes them into
+-- "memories kind=lesson" or drops them. Written idempotently beside every
+-- recordFailure (zero-LLM, immediate), promoted/dropped by refine.ts.
+CREATE TABLE IF NOT EXISTS lesson_drafts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id    TEXT NOT NULL,               -- 被纠正的源记忆
+  topic        TEXT NOT NULL DEFAULT 'general',
+  old_content  TEXT,
+  new_content  TEXT,
+  lesson       TEXT,                         -- 预拼装的教训草案 / LLM 重写自然语言
+  source       TEXT NOT NULL DEFAULT 'replace',  -- replace | merge-conflict | l1
+  status       TEXT NOT NULL DEFAULT 'draft',    -- draft | promoted | dropped
+  draft_count  INTEGER NOT NULL DEFAULT 1,       -- 同 memory_id 被纠正次数（聚合防堆叠）
+  drafted_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lesson_drafts_status ON lesson_drafts(status, drafted_at);
 `
 
 /**

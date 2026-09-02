@@ -198,6 +198,8 @@ export function buildL1Prompt(summary: string, toolsUsed?: string): { system: st
     '{"content": string, "kind": "preference|env|lesson|decision|general", "importance": 1-5, ' +
     '"epistemic": "observed|inferred|subjective", "topic": string}. content must be concise, plain, ' +
     'and standalone. Drop ephemeral chit-chat and one-off details. If nothing durable, return []. ' +
+    'If the summary contains a CORRECTION or a mistake that was made then fixed, ALSO emit one ' +
+    'kind=lesson candidate that captures the hindsight (sent with kind="lesson"). ' +
     'Be compact; avoid ellipses; mark uncertainty honestly via epistemic.'
   const user = `Session summary:\n${JSON.stringify(summary)}${toolsUsed ? `\nTools used: ${toolsUsed}` : ''}`
   return { system, user }
@@ -437,3 +439,199 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
   }
   return stats
 }
+
+// ---- lesson pipeline (DESIGN docs/lesson-pipeline.md §2) ----
+
+/** One lesson draft as seen by the judge prompt (minimal input, DESIGN §0 #4). */
+export interface LessonDraftForJudge {
+  id: number
+  topic: string
+  oldContent: string | null
+  newContent: string | null
+  draftCount: number
+}
+
+/** Build the lesson-judge system + framed user prompt (DESIGN §2.4). */
+export function buildLessonJudgePrompt(drafts: LessonDraftForJudge[]): { system: string; user: string } {
+  const system =
+    'You are the lesson judge of an AI memory system. A stored fact was corrected. ' +
+    'For EACH draft, classify whether the correction reveals a durable lesson worth remembering as a ' +
+    'lesson memory (a) wrong-original 原始记错 → promote: hindsight "关于X应记Y，因曾误记为Z"; ' +
+    '(b) stale 旧记忆过时 → promote: "此类事实易变，用前须复查"; ' +
+    '(c) trivial 纯措辞微调 → drop, do not persist. ' +
+    'Return ONLY a JSON array, each element matching the input index: ' +
+    '{"index": n, "decision": "promote|drop", "lesson": string|absent (natural-language lesson text when promote), "importance": 1-5|absent}. ' +
+    'No prose, no markdown fence.'
+  const user = JSON.stringify(drafts)
+  return { system, user }
+}
+
+export interface LessonJudgement {
+  index: number
+  decision: 'promote' | 'drop'
+  lesson?: string
+  importance?: number
+}
+
+/** Parse lesson-judge model output. Structurally valid array → judgements (possibly
+ *  empty); unparseable → null (treated as degraded, drafts retained). */
+export function parseLessonJudgements(text: string): LessonJudgement[] | null {
+  const arr = parseJsonArray(text)
+  if (arr === null) return null
+  const out: LessonJudgement[] = []
+  for (const item of arr) {
+    if (item === null || typeof item !== 'object') continue
+    const it = item as Record<string, unknown>
+    const index = Number(it.index)
+    if (!Number.isInteger(index) || index < 0) continue
+    if (it.decision !== 'promote' && it.decision !== 'drop') continue
+    const lesson = typeof it.lesson === 'string' && it.lesson.trim() ? it.lesson.trim() : undefined
+    let importance: number | undefined
+    if (typeof it.importance === 'number' && Number.isFinite(it.importance)) {
+      importance = Math.min(5, Math.max(1, Math.round(it.importance)))
+    }
+    out.push({ index, decision: it.decision, ...(lesson ? { lesson } : {}), ...(importance ? { importance } : {}) })
+  }
+  return out.length > 0 ? out : []
+}
+
+export interface LessonPromoteInput {
+  llm?: LlmStreamSeam | null
+  provider?: string
+  model?: string
+  maxTokens?: number
+  timeoutMs?: number
+  /** false → pure-rule template promotion (degraded fallback, no LLM seam call). */
+  lessonUseLlm?: boolean
+  /** true → judge only the single newest draft (fire-and-forget after replace). */
+  instant?: boolean
+  limit?: number
+}
+
+/**
+ * Promote staged lesson drafts (DESIGN §2.4): (a)/(b) → write a `kind=lesson`
+ * memory through store.batch (so dedup/quality/tier apply), mark the draft
+ * promoted; (c) → mark dropped. With lessonUseLlm=false or a missing route, falls
+ * back to pure-rule template promotion (the template text is always present).
+ * A failed/unparseable judgement keeps drafts for the next pass and audits
+ * `degraded`. Never throws to the caller.
+ */
+export async function runRefineLessonPromote(store: MemoryStore, input: LessonPromoteInput = {}): Promise<{
+  promoted: number
+  dropped: number
+  degraded: number
+  runIds: number[]
+}> {
+  const stats = { promoted: 0, dropped: 0, degraded: 0, runIds: [] as number[] }
+  const drafts = store.listLessonDrafts({
+    status: 'draft',
+    limit: input.limit ?? (input.instant ? 5 : 12),
+  })
+  if (drafts.length === 0) return stats
+  const route = input.provider && input.model ? `${input.provider}/${input.model}` : undefined
+  const useLlm = input.lessonUseLlm !== false && Boolean(input.llm && input.provider && input.model)
+
+  // Pure-rule / no-route fallback: promote every draft with its template lesson.
+  if (!useLlm) {
+    for (const d of drafts) {
+      try {
+        store.batch([{ action: 'add', layer: 'memory', kind: 'lesson', importance: 3, topic: d.topic, content: d.lesson }], 'lesson-promote')
+        store.markLessonDraftStatus(d.id, 'promoted')
+        stats.runIds.push(store.writeRefineRun({ level: 3, sourceId: String(d.id), route, decisions: JSON.stringify({ action: 'promote', lesson: d.lesson, importance: 3 }), status: 'ok' }))
+        stats.promoted += 1
+      } catch { /* per-draft isolated */ }
+    }
+    return stats
+  }
+
+  const forJudge: LessonDraftForJudge[] = drafts.map((d) => ({
+    id: d.id,
+    topic: d.topic,
+    oldContent: d.old_content,
+    newContent: d.new_content,
+    draftCount: d.draft_count,
+  }))
+  const prompt = buildLessonJudgePrompt(forJudge)
+  const raw = await llmText(input.llm!, {
+    provider: input.provider!, model: input.model!, system: prompt.system, user: prompt.user,
+    maxTokens: input.maxTokens ?? 600, timeoutMs: input.timeoutMs,
+  })
+  const judgements = raw === null ? null : parseLessonJudgements(raw)
+  if (raw === null || judgements === null) {
+    // degraded: keep drafts for next pass; audit each.
+    for (const d of drafts) {
+      try { stats.runIds.push(store.writeRefineRun({ level: 3, sourceId: String(d.id), route, decisions: '[]', status: 'degraded' })) } catch {}
+    }
+    stats.degraded = drafts.length
+    return stats
+  }
+  for (const j of judgements) {
+    const d = drafts[j.index]
+    if (!d) continue
+    try {
+      if (j.decision === 'drop') {
+        store.markLessonDraftStatus(d.id, 'dropped')
+        stats.runIds.push(store.writeRefineRun({ level: 3, sourceId: String(d.id), route, decisions: JSON.stringify({ action: 'drop' }), status: 'ok' }))
+        stats.dropped += 1
+      } else {
+        const lessonText = j.lesson && j.lesson.trim() ? j.lesson.trim() : d.lesson
+        store.batch([{ action: 'add', layer: 'memory', kind: 'lesson', importance: (j.importance ?? 3) as Importance, topic: d.topic, content: lessonText }], 'lesson-promote')
+        store.markLessonDraftStatus(d.id, 'promoted')
+        stats.runIds.push(store.writeRefineRun({ level: 3, sourceId: String(d.id), route, decisions: JSON.stringify({ action: 'promote', lesson: lessonText, importance: j.importance ?? 3 }), status: 'ok' }))
+        stats.promoted += 1
+      }
+    } catch { /* per-draft isolated */ }
+  }
+  return stats
+}
+
+// ---- §3.1 add-meta judge (kind + importance light-weight injection) ----
+
+/** Build the add-meta judge prompt for one content string (DESIGN §3.1). */
+export function buildAddMetaPrompt(content: string): { system: string; user: string } {
+  const system =
+    'You classify one memory fact for an AI memory system. Output ONLY JSON: ' +
+    '{"kind": "preference|env|lesson|decision|general", "importance": 1-5}. ' +
+    'kind: preference = user stable like/dislike; env = environment fact that stays true; ' +
+    'lesson = hindsight learned from a correction; decision = one-off choice made (not a standing rule); ' +
+    'general = ordinary fact. importance reflects durability/protectiveness (5 = never forget).'
+  return { system, user: content }
+}
+
+/** Parse add-meta judge output. Null on unparseable. */
+export function parseAddMetaJson(text: string): { kind?: Kind; importance?: number } | null {
+  const cleaned = stripFence(text)
+  let obj: unknown
+  try { obj = JSON.parse(cleaned) } catch { return null }
+  if (obj === null || typeof obj !== 'object') return null
+  const it = obj as Record<string, unknown>
+  const kind = typeof it.kind === 'string' && (KINDS as readonly string[]).includes(it.kind) ? it.kind as Kind : undefined
+  let importance: number | undefined
+  if (typeof it.importance === 'number' && Number.isFinite(it.importance)) {
+    importance = Math.min(5, Math.max(1, Math.round(it.importance)))
+  }
+  if (!kind && !importance) return null
+  return { ...(kind ? { kind } : {}), ...(importance ? { importance } : {}) }
+}
+
+/**
+ * Judge add-meta (kind + importance) for one content (DESIGN §3.1), returning a
+ * pair to merge into a write. Missing route / LLM failure → null (caller keeps
+ * the rule defaults). This is the seam an add-site or a background calibration
+ * pass calls; it never touches the agent context and never blocks the write.
+ */
+export async function judgeAddMeta(
+  store: MemoryStore,
+  content: string,
+  input: { llm?: LlmStreamSeam | null; provider?: string; model?: string; timeoutMs?: number },
+): Promise<{ kind?: Kind; importance?: number } | null> {
+  if (!input.llm || !input.provider || !input.model) return null
+  const prompt = buildAddMetaPrompt(content)
+  const raw = await llmText(input.llm, {
+    provider: input.provider!, model: input.model!, system: prompt.system, user: prompt.user,
+    maxTokens: 60, timeoutMs: input.timeoutMs,
+  })
+  if (raw === null) return null
+  return parseAddMetaJson(raw)
+}
+

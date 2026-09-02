@@ -109,6 +109,9 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
 | 凝练整理时间间隔（小时） | `refineIntervalMs` | 自定义 L1/L2 抽取与去重的周期扫描间隔（默认 1h，0.1h 起）；改小更及时更费 API、改大更省。新会话后 10 秒内仍会即时凝练一次（不受此间隔影响） |
 | soul.md / user.md 编辑器 | — | 行内 textarea 编辑 + **保存**；旁有 **打开编辑** 按钮——经 `/memory/identity/open` 用系统默认编辑器打开磁盘上的真实文件（文件仍为真相源） |
+| 教训沉淀开关 | `lessonDraftEnabled` | 关 → 纠错仍记审计、草案滞留表内，但不做升格沉淀 |
+| 纠正即时判定 | `lessonInstantJudge` | 关 → 仅周期升格（默认 1h + 会话后 10s 触发），不做 replace 现场即时判定 |
+| 教训用 LLM | `lessonUseLlm` | 关 → 纯规则模板升格（降级兜底，不调 LLM） |
 
 面板另有两个操作按钮：
 - **立即整理记忆** —— 点按即触发 `POST /memory/trigger`，不等定时扫描，立即执行 **L1/L2 凝练 + 主动遗忘**（绕过忙闲时段抑制，因为是你主动要求），并回显本次结果（凝练是否执行、遗忘降级/归档/删除各多少）。
@@ -278,7 +281,7 @@ memory_recall  query="上周关于部署的讨论"    scope=episodic
 # 自动探测 esbuild / @types/react / typescript 最高语义版本（不硬编码），
 # 随后 tsc 类型检查（Node + client）+ esbuild 打包 client。
 node build.mjs
-# 冒烟（无 dsh 也可跑，全量断言组 G1–G25）
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G33）
 npm run smoke   # 等价于 node smoke.mjs
 ```
 
@@ -288,13 +291,14 @@ npm run smoke   # 等价于 node smoke.mjs
 
 ## 八、状态与兼容性
 
-- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）——`smoke.mjs` 全部断言组（187 项）全绿、稳定连跑，`tsc` 零错误。
+- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）——`smoke.mjs` 全部断言组（204 项，G1–G33）全绿、稳定连跑，`tsc` 零错误。
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
 - **后台凝练 L1/L2**：周期性运行（默认 1h，面板可自定义间隔），情景→事实抽取 + 语义簇合并/去重，受忙闲时段抑制；新会话落库 10 秒内即时触发一次；亦可面板「立即整理记忆」手动触发。LLM 降级时不退化为纯规则硬抽（标记 degraded）。
 - **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.5）。
 - **去重 + 身份权威化（2026-08-31）**：① 写时近重复合并 `findCanonical`（严格门）+ L1 同通道受益；② `isNearDupCandidate` token 宽松门支撑跨 topic 分组；③ `crossTopicNearDupGroups` 接入 L2 周期，破除按 topic 聚类边界；④ `layer=user` 移出 Tier0 注入 —— user.md 转人写权威（画像只经 user.md 呈现）。
 - **user.md 按需加载（2026-09-02）**：完整画像不再内联注入系统提示（省上下文、稳 KV 前缀），系统提示仅留一条指引；模型确需了解用户画像时调用 `memory_read_user` 工具读取 user.md。
 - **设置面板控制面（2026-09-02）**：soul/user 编辑器新增「打开编辑」（`/memory/identity/open` 默认编辑器打开磁盘文件）；新增「立即整理记忆」（`/memory/trigger`，绕过忙闲时段立即执行凝练+遗忘并回显结果）与「查看记忆」（`/memory/view` 只读弹窗）；「凝练整理时间间隔」可在面板自定义（`refineIntervalMs`），改动 live 生效。新增路由全部 loopback 校验。
+- **教训沉淀管道（2026-09-02，DESIGN docs/lesson-pipeline.md）**：`replace/合并冲突` 触发 `recordFailure` 时，零 LLM 即时双写 `lesson_drafts` 草案（同 memory 纠正聚合 draft_count）；后台周期（默认 1h）+ replace 现场即时（`lessonInstantJudge`）两条通道经 LLM 判定（wrong-original / stale → 升格 `kind=lesson`；trivial → drop；LLM 失败保留待下次），纯规则模板兜底（`lessonUseLlm=false`）。全旁路：独立 seam、非阻塞、只落库不回流、输入最小化。新增 `smoke.mjs` 断言 G26–G33 全绿。
 - **user.md 自动维护彻底移除（2026-09-02）**：`maintainUserIdentity`、`identityAuto`/`identityIntervalMs`/`identityMaxBytes`、`identity_synced`/`identity_meta` 表及 G22/P3-4 测试全部删除；user.md 与 soul.md 一样完全由人维护。旧库残留的 `identity_synced`/`identity_meta` 表为惰性孤儿，不再被引用、无害。
 
 ---

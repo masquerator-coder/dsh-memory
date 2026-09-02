@@ -29,7 +29,7 @@ import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from '
 import { buildIdentitySection, buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
-import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
+import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type SuppressCfg } from './refine.js'
 import { autocreateIdentityFiles } from './identity.js'
 import { registerControlRoutes, type MemoryControlHandlers, type RunNowResult } from './identity-routes.js'
 import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
@@ -130,6 +130,12 @@ export interface Config {
    *  (clean sessions) and background condensation/forgetting stop; the memory /
    *  memory_recall tools stay available for explicit use. Default true. */
   enabled?: boolean
+  /** Lesson pipeline master switch (DESIGN §2.6). Default true. */
+  lessonDraftEnabled?: boolean
+  /** replace 现场即时判定 (DESIGN §2.6). false → only the periodic pass promotes. Default true. */
+  lessonInstantJudge?: boolean
+  /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
+  lessonUseLlm?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -176,6 +182,9 @@ export const Config: z<Config> = z.object({
   timeZone: z.string(),
   enableIdentity: z.boolean(),
   enabled: z.boolean(),
+  lessonDraftEnabled: z.boolean(),
+  lessonInstantJudge: z.boolean(),
+  lessonUseLlm: z.boolean(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -237,6 +246,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     forgetEnabled: config.forgetEnabled ?? MEMORY_SETTINGS_DEFAULTS.forgetEnabled,
     refineIntervalMs: config.refineIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.refineIntervalMs,
     peakHourSuppress: MEMORY_SETTINGS_DEFAULTS.peakHourSuppress,
+    lessonDraftEnabled: config.lessonDraftEnabled ?? MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled,
+    lessonInstantJudge: config.lessonInstantJudge ?? MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge,
+    lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
   }
   const runtime = { ...settingsBase }
 
@@ -254,6 +266,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.forgetEnabled = seed.forgetEnabled
     runtime.refineIntervalMs = seed.refineIntervalMs
     runtime.peakHourSuppress = seed.peakHourSuppress
+    runtime.lessonDraftEnabled = seed.lessonDraftEnabled
+    runtime.lessonInstantJudge = seed.lessonInstantJudge
+    runtime.lessonUseLlm = seed.lessonUseLlm
     // P3-6 (review 2026-08-31): keep the unsubscribe and call it on dispose —
     // relying on the host scope's lifetime silently leaked the watcher across
     // hot reloads.
@@ -262,6 +277,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.forgetEnabled = next.forgetEnabled
       runtime.refineIntervalMs = next.refineIntervalMs
       runtime.peakHourSuppress = next.peakHourSuppress
+      runtime.lessonDraftEnabled = next.lessonDraftEnabled
+      runtime.lessonInstantJudge = next.lessonInstantJudge
+      runtime.lessonUseLlm = next.lessonUseLlm
     })
   }
 
@@ -425,7 +443,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const model = config.l0Model ?? cfg?.model
       l0InFlight += 1
       track(runL0(store, {
-        events: session.events as readonly unknown[],
+        events: session.snapshotEvents() as readonly unknown[],
         turn,
         summarize: 'rules', // M5: turn-end never burns LLM — settle does
         sessionId: session.id,
@@ -438,7 +456,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (session.id) {
         const prev = l0Pending.get(session.id)
         const cursor = prev?.eventCursor ?? 0
-        const newEvents = (session.events as readonly unknown[]).slice(cursor)
+        const newEvents = (session.snapshotEvents() as readonly unknown[]).slice(cursor)
         const texts = collectTurnTexts(newEvents, turn)
         if (!prev && l0Pending.size >= L0_PENDING_MAX_SESSIONS) {
           // P2-5: evict the least-recently-active session's buffer.
@@ -450,7 +468,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         l0Pending.set(session.id, {
           lastActivity: Date.now(),
           texts: (prev ? prev.texts : []).concat(texts).slice(-200),
-          eventCursor: session.events.length,
+          eventCursor: session.snapshotEvents().length,
         })
       }
       kickRefine() // M6: a fresh realtime episode → L1 extraction in ~10s
@@ -520,12 +538,55 @@ export function apply(ctx: Context, config: Config = {}): void {
             incremental: l2Incremental, // M7
           })
         }
+        // Lesson pipeline (DESIGN §2.5): promote staged lesson drafts (corrected
+        // memories) into kind=lesson memories. Periodic pass runs with the same
+        // route resolution / peak-hour / re-entrancy protection as L1/L2.
+        if (runtime.lessonDraftEnabled) {
+          const lessonRoute = resolveRefineRoute(
+            (config.l0Provider && config.l0Model)
+              ? { provider: config.l0Provider, model: config.l0Model }
+              : undefined,
+            learned,
+            hostDefault,
+          )
+          await runRefineLessonPromote(store, {
+            llm: llmSeam,
+            provider: lessonRoute?.provider,
+            model: lessonRoute?.model,
+            maxTokens: l0MaxTokens, timeoutMs: l0TimeoutMs,
+            lessonUseLlm: runtime.lessonUseLlm,
+          })
+        }
       } catch (err) {
         if (!disposed) console.warn('[dsh-memory] refine run failed:', err instanceof Error ? err.message : err)
       } finally {
         refining = false
       }
     }
+    // Lesson pipeline instant judge (DESIGN §2.5): recordFailure dual-writes a
+    // draft, then this non-blocking hook fire-and-forgets a judgement of the
+    // newest draft so a correction becomes a recallable lesson within seconds —
+    // NOT the next periodic pass (1h). Gated by lessonInstantJudge + lessonUseLlm.
+    const lessonInstant = async (): Promise<void> => {
+      if (disposed || !runtime.enabled) return
+      if (!runtime.lessonInstantJudge || !runtime.lessonUseLlm || !runtime.lessonDraftEnabled) return
+      const route = resolveRefineRoute(
+        (config.l0Provider && config.l0Model)
+          ? { provider: config.l0Provider, model: config.l0Model }
+          : undefined,
+        learned,
+        hostDefault,
+      )
+      await runRefineLessonPromote(store, {
+        llm: llmSeam,
+        provider: route?.provider,
+        model: route?.model,
+        maxTokens: l0MaxTokens, timeoutMs: l0TimeoutMs,
+        lessonUseLlm: runtime.lessonUseLlm,
+        instant: true,
+      }).catch(() => { /* never breaks the write path */ })
+    }
+    store.onLessonDraft = () => { track(lessonInstant()) }
     const scheduleRefine = (delay: number): void => {
       if (disposed) return
       refineTimer = setTimeout(() => {

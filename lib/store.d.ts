@@ -1,4 +1,4 @@
-import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Importance, Kind, Layer, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
+import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Importance, Kind, Layer, LessonDraft, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
 export declare const DEFAULT_BUDGET: MemoryBudget;
 /** Near-duplicate similarity threshold (contentSimilarity, 0=disjoint 1=id).
  *  Writing a fact at or above this closeness to an existing active row merges
@@ -219,7 +219,24 @@ export declare class MemoryStore {
     l2RefinedTs(topic: string): number | undefined;
     /** M7: record that a topic cluster was LLM-audited at `ts` (idempotent upsert). */
     upsertL2Refined(topic: string, ts?: number): void;
+    /** Optional hook fired after a lesson draft is (re)written, so the host can
+     *  fire-and-forget an instant LLM judgement (lessonInstantJudge) WITHOUT
+     *  coupling the synchronous store to the async LLM seam. Default unset. */
+    onLessonDraft?: (draftId: number) => void;
     recordFailure(memoryId: string, oldContent: string, newContent: string): void;
+    /** Design §2.3: upsert one staged lesson draft per corrected memory (aggregate
+     *  frequent corrections into a single `draft` row by bumping draft_count). The
+     *  `lesson` field starts as a pure-rule template so even a no-LLM run has a
+     *  fallen-back lesson text. Zero LLM, synchronous, never throws. */
+    private upsertLessonDraft;
+    private fireLessonDraft;
+    /** List staged lesson drafts (oldest first). */
+    listLessonDrafts(opts?: {
+        status?: 'draft' | 'promoted' | 'dropped';
+        limit?: number;
+    }): LessonDraft[];
+    getLessonDraft(id: number): LessonDraft | undefined;
+    markLessonDraftStatus(id: number, status: 'promoted' | 'dropped'): void;
     failureTrail(): {
         memoryId: string;
         oldContent: string;

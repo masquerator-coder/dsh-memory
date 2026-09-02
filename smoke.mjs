@@ -40,7 +40,7 @@ import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shoul
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
-import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
+import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
 import { buildIdentitySection } from './lib/inject.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { readFileSync, existsSync } from 'node:fs'
@@ -954,6 +954,119 @@ group('G25 review fixes 2026-09-02 (S1 / G4)')
     assert('G25 S1 longer/equal extension add still merges & extends', rows.length === 1 && rows[0].content === '用户偏好深色主题且')
     s.close(); rmSync(t, { recursive: true, force: true })
   }
+}
+
+// ============================= lesson pipeline (G26–G33) ====================
+// DESIGN docs/lesson-pipeline.md — 纠错→教训 沉淀管道.
+
+// ---------------------------------------------------------------------------
+group('G26 lesson_drafts 双写 + 聚合 (lesson pipeline)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g26-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m1', '旧内容A', '新内容A')
+  let drafts = s.listLessonDrafts()
+  assert('replace/recordFailure 后出现 lesson 草案', drafts.length === 1 && drafts[0].memory_id === 'm1')
+  assert('草案 lesson 已预填规则模板', drafts[0].lesson.includes('旧内容A'))
+  s.recordFailure('m1', '旧内容A', '新内容A2') // 同一 memory 再次纠正
+  drafts = s.listLessonDrafts()
+  assert('同 memory 再次纠正 → 聚合为 1 行且 draft_count=2、new 更新', drafts.length === 1 && drafts[0].draft_count === 2 && drafts[0].new_content === '新内容A2')
+  assert('failure_memories 审计痕仍正常', s.failureTrail().length === 2)
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G27 升格 (a)/(b) → kind=lesson (LLM seam promote)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g27-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m2', '旧X', '新X')
+  const d = s.listLessonDrafts()[0]
+  const seam = { stream: async function* () { yield { text: '[{"index":0,"decision":"promote","lesson":"判断关于X应记新X，因曾误记旧X","importance":4}]' } } }
+  await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true, instant: true })
+  const lessons = s.activeEntries().filter((e) => e.kind === 'lesson')
+  assert('写入 kind=lesson 且 importance=4', lessons.length >= 1 && lessons[0].importance === 4)
+  const after = s.getLessonDraft(d.id)
+  assert('草案标记 promoted', after && after.status === 'promoted')
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G28 二度升格同教训被 findCanonical 去重')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g28-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m3', 'a', 'b')
+  s.recordFailure('m4', 'c', 'd')
+  const seam = { stream: async function* () { yield { text: '[{"index":0,"decision":"promote","lesson":"同一条教训文本"},{"index":1,"decision":"promote","lesson":"同一条教训文本"}]' } } }
+  await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true })
+  const lessons = s.activeEntries().filter((e) => e.kind === 'lesson' && e.content === '同一条教训文本')
+  assert('同文本教训经去重后仍 1 条', lessons.length === 1)
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G29 (c) trivial → dropped, 不沉淀')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g29-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m5', '旧', '新')
+  const seam = { stream: async function* () { yield { text: '[{"index":0,"decision":"drop"}]' } } }
+  await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true })
+  assert('drop 无 lesson 写入', s.activeEntries().filter((e) => e.kind === 'lesson').length === 0)
+  assert('草案标记 dropped', s.listLessonDrafts({ status: 'dropped' }).length === 1)
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G30 零 LLM 底座 + LLM 失败保留草案')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g30-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m6', 'o', 'n') // 无任何 LLM/route 也写草案
+  assert('recordFailure 无 LLM 也写草案(零 LLM 底座)', s.listLessonDrafts().length === 1)
+  s.recordFailure('m7', 'o2', 'n2')
+  const bad = { stream: async function* () { yield { text: 'not valid json' } } }
+  await runRefineLessonPromote(s, { llm: bad, provider: 'p', model: 'm', lessonUseLlm: true })
+  assert('LLM 返回非法 → 草案保留(不误删不误promote)', s.listLessonDrafts({ status: 'draft' }).length >= 1)
+  assert('非法输出不产生 lesson', s.activeEntries().filter((e) => e.kind === 'lesson').length === 0)
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G31 判定 seam 输入最小化(上下文隔离)')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g31-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m8', '秘密上下文', '新X')
+  let captured = null
+  const seam = {
+    stream: async function* (cfg) {
+      captured = { system: cfg.system, user: cfg.messages[0].content[0].text }
+      yield { text: '[{"index":0,"decision":"promote"}]' }
+    },
+  }
+  await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true })
+  assert('system 是 lesson judge 提示(独立 seam)', typeof captured.system === 'string' && captured.system.includes('lesson judge'))
+  const u = JSON.parse(captured.user)
+  assert('user 仅含草案最小字段(无执行上下文泄漏)', Array.isArray(u) && u.length === 1 && !('extra' in u[0]) && ('oldContent' in u[0]) && ('newContent' in u[0]) && ('draftCount' in u[0]))
+  s.close(); rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G32/G33 lessonUseLlm=false → 纯规则模板升格, 无 seam 调用')
+{
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g33-'))
+  const s = new MemoryStore(t)
+  s.recordFailure('m9', '旧教训内容', '新')
+  let calls = 0
+  const seam = { stream: async function* () { calls++; yield { text: '[{"index":0,"decision":"drop"}]' } } }
+  await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: false })
+  assert('lessonUseLlm=false 不调 LLM seam', calls === 0)
+  const lessons = s.activeEntries().filter((e) => e.kind === 'lesson')
+  assert('纯规则模板升格出 lesson', lessons.length === 1 && lessons[0].content.includes('旧教训内容'))
+  assert('草案被 promote', s.listLessonDrafts({ status: 'promoted' }).length === 1)
+  s.close(); rmSync(t, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

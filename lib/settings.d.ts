@@ -25,17 +25,30 @@ export interface MemorySettings {
     forgetEnabled: boolean;
     refineIntervalMs: number;
     peakHourSuppress: boolean;
+    /** lesson pipeline master switch (DESIGN §2.6). false → recordFailure still
+     *  audits, drafts stay in lesson_drafts, but no promote pass runs. */
+    lessonDraftEnabled: boolean;
+    /** replace 现场即时判定 (DESIGN §2.6). false → only the periodic pass promotes. */
+    lessonInstantJudge: boolean;
+    /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
+    lessonUseLlm: boolean;
 }
 export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     enabled: z<boolean, boolean>;
     forgetEnabled: z<boolean, boolean>;
     refineIntervalMs: z<number, number>;
     peakHourSuppress: z<boolean, boolean>;
+    lessonDraftEnabled: z<boolean, boolean>;
+    lessonInstantJudge: z<boolean, boolean>;
+    lessonUseLlm: z<boolean, boolean>;
 }>, Schemastery.ObjectT<{
     enabled: z<boolean, boolean>;
     forgetEnabled: z<boolean, boolean>;
     refineIntervalMs: z<number, number>;
     peakHourSuppress: z<boolean, boolean>;
+    lessonDraftEnabled: z<boolean, boolean>;
+    lessonInstantJudge: z<boolean, boolean>;
+    lessonUseLlm: z<boolean, boolean>;
 }>>;
 /** Hard defaults (used as the base layer's floor; cordis config overrides these,
  *  then the settings user layer overrides cordis config). */

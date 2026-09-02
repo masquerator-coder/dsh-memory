@@ -29,6 +29,7 @@ import type {
   Importance,
   Kind,
   Layer,
+  LessonDraft,
   MemoryBudget,
   MemoryEntry,
   MemoryOp,
@@ -1080,9 +1081,94 @@ export class MemoryStore {
 
   // ---- correction trail ----------------------------------------------------
 
+  /** Optional hook fired after a lesson draft is (re)written, so the host can
+   *  fire-and-forget an instant LLM judgement (lessonInstantJudge) WITHOUT
+   *  coupling the synchronous store to the async LLM seam. Default unset. */
+  onLessonDraft?: (draftId: number) => void
+
   recordFailure(memoryId: string, oldContent: string, newContent: string): void {
     this.stmt('INSERT INTO failure_memories(memory_id, old_content, new_content, corrected_at) VALUES (?,?,?,?)')
       .run(memoryId, oldContent, newContent, Date.now())
+    // ZERO-LLM base of the lesson pipeline (DESIGN §2.3): dual-write a staged
+    // lesson draft. Aggregates repeated corrections of the same memory into one
+    // draft (draft_count), never stacks one draft per correction.
+    this.upsertLessonDraft(memoryId, oldContent, newContent)
+  }
+
+  /** Design §2.3: upsert one staged lesson draft per corrected memory (aggregate
+   *  frequent corrections into a single `draft` row by bumping draft_count). The
+   *  `lesson` field starts as a pure-rule template so even a no-LLM run has a
+   *  fallen-back lesson text. Zero LLM, synchronous, never throws. */
+  private upsertLessonDraft(memoryId: string, oldContent: string, newContent: string): void {
+    const now = Date.now()
+    try {
+      const existing = this.stmt(
+        "SELECT id, draft_count FROM lesson_drafts WHERE memory_id = ? AND status = 'draft' ORDER BY id DESC LIMIT 1",
+      ).get(memoryId) as { id: number; draft_count: number } | undefined
+      if (existing) {
+        this.stmt('UPDATE lesson_drafts SET draft_count = ?, new_content = ?, drafted_at = ? WHERE id = ?')
+          .run(existing.draft_count + 1, newContent, now, existing.id)
+        this.fireLessonDraft(existing.id)
+        return
+      }
+      const lesson = `判断曾被纠正：原记“${oldContent}”，更正为“${newContent}”。`
+      const r = this.stmt(
+        "INSERT INTO lesson_drafts(memory_id, topic, old_content, new_content, lesson, source, status, draft_count, drafted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+      ).run(memoryId, 'general', oldContent, newContent, lesson, 'replace', 'draft', 1, now)
+      this.fireLessonDraft(Number(r.lastInsertRowid))
+    } catch {
+      // The zero-LLM base must never break the correction write. Audit already
+      // went to failure_memories above; a failed draft is dropped silently.
+    }
+  }
+
+  private fireLessonDraft(draftId: number): void {
+    if (!this.onLessonDraft) return
+    try { this.onLessonDraft(draftId) } catch { /* observer must not break writes */ }
+  }
+
+  /** List staged lesson drafts (oldest first). */
+  listLessonDrafts(opts: { status?: 'draft' | 'promoted' | 'dropped'; limit?: number } = {}): LessonDraft[] {
+    let sql = 'SELECT * FROM lesson_drafts'
+    const params: Array<string | number | null> = []
+    if (opts.status) { sql += ' WHERE status = ?'; params.push(opts.status) }
+    sql += ' ORDER BY drafted_at ASC'
+    const lim = Number.isFinite(opts.limit) ? Math.max(1, Math.floor(opts.limit as number)) : 0
+    if (lim > 0) sql += ` LIMIT ${lim}`
+    const rows = this.stmt(sql).all(...params) as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: Number(r.id),
+      memory_id: String(r.memory_id),
+      topic: String(r.topic ?? 'general'),
+      old_content: r.old_content == null ? null : String(r.old_content),
+      new_content: r.new_content == null ? null : String(r.new_content),
+      lesson: String(r.lesson ?? ''),
+      source: String(r.source ?? 'replace'),
+      status: String(r.status) as LessonDraft['status'],
+      draft_count: Number(r.draft_count ?? 1),
+      drafted_at: Number(r.drafted_at),
+    }))
+  }
+
+  getLessonDraft(id: number): LessonDraft | undefined {
+    const r = this.stmt('SELECT * FROM lesson_drafts WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    if (!r) return undefined
+    return {
+      id: Number(r.id),
+      memory_id: String(r.memory_id),
+      topic: String(r.topic ?? 'general'),
+      old_content: r.old_content == null ? null : String(r.old_content),
+      new_content: r.new_content == null ? null : String(r.new_content),
+      lesson: String(r.lesson ?? ''),
+      source: String(r.source ?? 'replace'),
+      status: String(r.status) as LessonDraft['status'],
+      draft_count: Number(r.draft_count ?? 1),
+      drafted_at: Number(r.drafted_at),
+    }
+  }
+
+  markLessonDraftStatus(id: number, status: 'promoted' | 'dropped'): void {
+    this.stmt('UPDATE lesson_drafts SET status = ? WHERE id = ?').run(status, id)
   }
 
   failureTrail(): { memoryId: string; oldContent: string; newContent: string; correctedAt: number }[] {

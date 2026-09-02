@@ -146,3 +146,76 @@ export declare function runRefineL2(store: MemoryStore, input?: RefineInput & {
     verdictsApplied: number;
     runIds: number[];
 }>;
+/** One lesson draft as seen by the judge prompt (minimal input, DESIGN §0 #4). */
+export interface LessonDraftForJudge {
+    id: number;
+    topic: string;
+    oldContent: string | null;
+    newContent: string | null;
+    draftCount: number;
+}
+/** Build the lesson-judge system + framed user prompt (DESIGN §2.4). */
+export declare function buildLessonJudgePrompt(drafts: LessonDraftForJudge[]): {
+    system: string;
+    user: string;
+};
+export interface LessonJudgement {
+    index: number;
+    decision: 'promote' | 'drop';
+    lesson?: string;
+    importance?: number;
+}
+/** Parse lesson-judge model output. Structurally valid array → judgements (possibly
+ *  empty); unparseable → null (treated as degraded, drafts retained). */
+export declare function parseLessonJudgements(text: string): LessonJudgement[] | null;
+export interface LessonPromoteInput {
+    llm?: LlmStreamSeam | null;
+    provider?: string;
+    model?: string;
+    maxTokens?: number;
+    timeoutMs?: number;
+    /** false → pure-rule template promotion (degraded fallback, no LLM seam call). */
+    lessonUseLlm?: boolean;
+    /** true → judge only the single newest draft (fire-and-forget after replace). */
+    instant?: boolean;
+    limit?: number;
+}
+/**
+ * Promote staged lesson drafts (DESIGN §2.4): (a)/(b) → write a `kind=lesson`
+ * memory through store.batch (so dedup/quality/tier apply), mark the draft
+ * promoted; (c) → mark dropped. With lessonUseLlm=false or a missing route, falls
+ * back to pure-rule template promotion (the template text is always present).
+ * A failed/unparseable judgement keeps drafts for the next pass and audits
+ * `degraded`. Never throws to the caller.
+ */
+export declare function runRefineLessonPromote(store: MemoryStore, input?: LessonPromoteInput): Promise<{
+    promoted: number;
+    dropped: number;
+    degraded: number;
+    runIds: number[];
+}>;
+/** Build the add-meta judge prompt for one content string (DESIGN §3.1). */
+export declare function buildAddMetaPrompt(content: string): {
+    system: string;
+    user: string;
+};
+/** Parse add-meta judge output. Null on unparseable. */
+export declare function parseAddMetaJson(text: string): {
+    kind?: Kind;
+    importance?: number;
+} | null;
+/**
+ * Judge add-meta (kind + importance) for one content (DESIGN §3.1), returning a
+ * pair to merge into a write. Missing route / LLM failure → null (caller keeps
+ * the rule defaults). This is the seam an add-site or a background calibration
+ * pass calls; it never touches the agent context and never blocks the write.
+ */
+export declare function judgeAddMeta(store: MemoryStore, content: string, input: {
+    llm?: LlmStreamSeam | null;
+    provider?: string;
+    model?: string;
+    timeoutMs?: number;
+}): Promise<{
+    kind?: Kind;
+    importance?: number;
+} | null>;

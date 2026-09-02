@@ -26,6 +26,13 @@ export interface MemorySettings {
   forgetEnabled: boolean
   refineIntervalMs: number
   peakHourSuppress: boolean
+  /** lesson pipeline master switch (DESIGN §2.6). false → recordFailure still
+   *  audits, drafts stay in lesson_drafts, but no promote pass runs. */
+  lessonDraftEnabled: boolean
+  /** replace 现场即时判定 (DESIGN §2.6). false → only the periodic pass promotes. */
+  lessonInstantJudge: boolean
+  /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
+  lessonUseLlm: boolean
 }
 
 export const memorySettingsSchema = z.object({
@@ -33,6 +40,9 @@ export const memorySettingsSchema = z.object({
   forgetEnabled: z.boolean(),
   refineIntervalMs: z.number(),
   peakHourSuppress: z.boolean(),
+  lessonDraftEnabled: z.boolean(),
+  lessonInstantJudge: z.boolean(),
+  lessonUseLlm: z.boolean(),
 })
 
 /** Hard defaults (used as the base layer's floor; cordis config overrides these,
@@ -42,4 +52,7 @@ export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   forgetEnabled: true,
   refineIntervalMs: 3600_000,
   peakHourSuppress: true,
+  lessonDraftEnabled: true,
+  lessonInstantJudge: true,
+  lessonUseLlm: true,
 }

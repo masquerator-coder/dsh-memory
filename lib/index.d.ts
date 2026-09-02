@@ -130,6 +130,12 @@ export interface Config {
      *  (clean sessions) and background condensation/forgetting stop; the memory /
      *  memory_recall tools stay available for explicit use. Default true. */
     enabled?: boolean;
+    /** Lesson pipeline master switch (DESIGN §2.6). Default true. */
+    lessonDraftEnabled?: boolean;
+    /** replace 现场即时判定 (DESIGN §2.6). false → only the periodic pass promotes. Default true. */
+    lessonInstantJudge?: boolean;
+    /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
+    lessonUseLlm?: boolean;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;
