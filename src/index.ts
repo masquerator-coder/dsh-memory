@@ -25,13 +25,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
-import { DEFAULT_BUDGET, MemoryStore, resolveDshHome } from './store.js'
+import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
 import { buildIdentitySection, buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
-import { autocreateIdentityFiles, IDENTITY_MAX_BYTES, maintainUserIdentity } from './identity.js'
-import { registerIdentityRoutes } from './identity-routes.js'
+import { autocreateIdentityFiles, IDENTITY_MAX_BYTES, maintainUserIdentity, type MaintainResult } from './identity.js'
+import { registerControlRoutes, type MemoryControlHandlers, type RunNowResult } from './identity-routes.js'
 import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
 import type { ForgetDays } from './types.js'
 
@@ -299,16 +299,17 @@ export function apply(ctx: Context, config: Config = {}): void {
   let settleTimer: ReturnType<typeof setTimeout> | undefined
   let identityTimer: ReturnType<typeof setTimeout> | undefined
 
-  const runForget = (): void => {
-    if (disposed || !runtime.enabled || !runtime.forgetEnabled) return
+  const runForget = (): ForgetResult | undefined => {
+    if (disposed || !runtime.enabled || !runtime.forgetEnabled) return undefined
     try {
-      store.forgetRun({
+      return store.forgetRun({
         forgetDays: config.forgetDays,
         episodeRetentionDays,
         observeDays: forgetObserveDays,
       })
     } catch (err) {
       if (!disposed) console.warn('[dsh-memory] forget run failed:', err instanceof Error ? err.message : err)
+      return undefined
     }
   }
 
@@ -331,9 +332,26 @@ export function apply(ctx: Context, config: Config = {}): void {
     // so a later settings toggle-on has the files ready.
     autocreateIdentityFiles(store.dir)
 
-    // R3-ui: expose soul.md/user.md over /memory/identity for the settings UI
-    // editor. Degrades silently if the host has no webServer service.
-    const disposeIdentityRoutes = registerIdentityRoutes(ctx, store)
+    // R3-ui: expose soul.md/user.md over /memory/identity and the condensation /
+    // viewer / editor controls over /memory/trigger, /memory/view,
+    // /memory/identity/open for the settings UI. Degrades silently if the host
+    // has no webServer service. `controls` is mutated below once the pass
+    // closures exist (the route handlers dereference it at call time, so
+    // forward assignment is safe); the stub keeps the interface valid in strict
+    // mode before that.
+    const controls: MemoryControlHandlers = {
+      runNow: async (): Promise<RunNowResult> => ({
+        refined: false,
+        identityCandidates: 0,
+        identityWrote: 0,
+        forgetDemoted: 0,
+        forgetArchivedMem: 0,
+        forgetDeletedMem: 0,
+        forgetArchivedEpi: 0,
+        forgetDeletedEpi: 0,
+      }),
+    }
+    const disposeControlRoutes = registerControlRoutes(ctx, store, controls)
 
     // Tier-0 memory + identity sections stay registered; their text thunk reads
     // runtime.enabled so toggling the master switch drops/restores injection live.
@@ -474,13 +492,15 @@ export function apply(ctx: Context, config: Config = {}): void {
     // because the timer has no request-header. Guarded by a re-entrancy latch so
     // a slow pass never stacks; never blocks the core write/recall loop.
     let refining = false
-    const runRefine = async (): Promise<void> => {
+    const runRefine = async (force = false): Promise<void> => {
       if (disposed || refining || !runtime.enabled) return
       refining = true
       try {
         // M8: peak-hour gate (toggleable via settings) — skip LLM burn during
-        // expensive windows; the periodic scan re-evaluates later.
-        if (runtime.peakHourSuppress && isSuppressed(new Date(), suppressCfg)) return
+        // expensive windows; the periodic scan re-evaluates later. A manual
+        // "立即整理" trigger (force=true) bypasses the gate — the user asked
+        // for it explicitly.
+        if (!force && runtime.peakHourSuppress && isSuppressed(new Date(), suppressCfg)) return
         if (l1Enabled) {
           const l1Route = resolveRefineRoute(
             (config.l1Provider && config.l1Model)
@@ -589,12 +609,40 @@ export function apply(ctx: Context, config: Config = {}): void {
 
     // R3-i: identity-file maintenance pass — appends new user-layer memories into
     // user.md. Pure-rule, zero LLM; skips entirely when there is no new content.
-    const runIdentity = (): void => {
-      if (disposed || !runtime.enabled || !runtime.identityAuto) return
+    const runIdentity = (): MaintainResult | undefined => {
+      if (disposed || !runtime.enabled || !runtime.identityAuto) return undefined
       try {
-        maintainUserIdentity(store, store.dir, { maxBytes: identityMaxBytes })
+        return maintainUserIdentity(store, store.dir, { maxBytes: identityMaxBytes })
       } catch (err) {
         if (!disposed) console.warn('[dsh-memory] identity maintain failed:', err instanceof Error ? err.message : err)
+        return undefined
+      }
+    }
+
+    // R3-ui: wire the "立即整理记忆" control. Bypasses the peak-hour gate, runs
+    // condensation (L1/L2) then identity maintenance then forgetting, and
+    // returns a summarized result for the settings UI. Fire-and-forget for the
+    // background schedulers; here we await runRefine because the route caller
+    // wants feedback.
+    controls.runNow = async (): Promise<RunNowResult> => {
+      let refined = false
+      try {
+        await runRefine(true)
+        refined = true
+      } catch (err) {
+        if (!disposed) console.warn('[dsh-memory] manual refine failed:', err instanceof Error ? err.message : err)
+      }
+      const identity = runIdentity()
+      const forget = runForget()
+      return {
+        refined,
+        identityCandidates: identity?.candidates ?? 0,
+        identityWrote: identity?.wrote ?? 0,
+        forgetDemoted: forget?.demoted ?? 0,
+        forgetArchivedMem: forget?.archivedMem ?? 0,
+        forgetDeletedMem: forget?.deletedMem ?? 0,
+        forgetArchivedEpi: forget?.archivedEpi ?? 0,
+        forgetDeletedEpi: forget?.deletedEpi ?? 0,
       }
     }
     const scheduleIdentity = (delay: number): void => {
@@ -616,7 +664,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     return () => {
       disposed = true
       l0Dispose()
-      disposeIdentityRoutes()
+      disposeControlRoutes()
       unwatchSettings?.() // P3-6: stop the settings watcher on dispose
       if (timer) clearTimeout(timer)
       if (refineTimer) clearTimeout(refineTimer)
