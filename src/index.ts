@@ -30,7 +30,7 @@ import { buildIdentitySection, buildSection } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, type SuppressCfg } from './refine.js'
-import { autocreateIdentityFiles, IDENTITY_MAX_BYTES, maintainUserIdentity, type MaintainResult } from './identity.js'
+import { autocreateIdentityFiles } from './identity.js'
 import { registerControlRoutes, type MemoryControlHandlers, type RunNowResult } from './identity-routes.js'
 import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
 import type { ForgetDays } from './types.js'
@@ -130,12 +130,6 @@ export interface Config {
    *  (clean sessions) and background condensation/forgetting stop; the memory /
    *  memory_recall tools stay available for explicit use. Default true. */
   enabled?: boolean
-  /** R3-i: auto-create + incrementally maintain user.md from user-layer memories. Default true. */
-  identityAuto?: boolean
-  /** R3-i: identity maintenance cadence (ms). Default 6h. */
-  identityIntervalMs?: number
-  /** R3-i: cap on the auto-maintained identity file (bytes). Default 2000. */
-  identityMaxBytes?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -182,9 +176,6 @@ export const Config: z<Config> = z.object({
   timeZone: z.string(),
   enableIdentity: z.boolean(),
   enabled: z.boolean(),
-  identityAuto: z.boolean(),
-  identityIntervalMs: z.number(),
-  identityMaxBytes: z.number(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -237,17 +228,13 @@ export function apply(ctx: Context, config: Config = {}): void {
     suppressLeadMinutes: config.suppressLeadMinutes ?? 15,
     timeZone: config.timeZone ?? 'Asia/Shanghai',
   }
-  // R3-total / R3-i / R3-ui — live-toggleable settings. `runtime` is the single
+  // R3-total / R3-ui — live-toggleable settings. `runtime` is the single
   // source of truth for everything a settings page can change at runtime: seeded
   // from cordis config and refreshed from the dsh settings document via
-  // scope.watch() below. identityMaxBytes stays a static cordis-config value
-  // (a file-size cap, not a toggle).
-  const identityMaxBytes = config.identityMaxBytes ?? IDENTITY_MAX_BYTES
+  // scope.watch() below.
   const settingsBase: MemorySettings = {
     enabled: config.enabled ?? MEMORY_SETTINGS_DEFAULTS.enabled,
     forgetEnabled: config.forgetEnabled ?? MEMORY_SETTINGS_DEFAULTS.forgetEnabled,
-    identityAuto: config.identityAuto ?? MEMORY_SETTINGS_DEFAULTS.identityAuto,
-    identityIntervalMs: config.identityIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.identityIntervalMs,
     refineIntervalMs: config.refineIntervalMs ?? MEMORY_SETTINGS_DEFAULTS.refineIntervalMs,
     peakHourSuppress: MEMORY_SETTINGS_DEFAULTS.peakHourSuppress,
   }
@@ -265,8 +252,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     const seed = settingsScope.get()
     runtime.enabled = seed.enabled
     runtime.forgetEnabled = seed.forgetEnabled
-    runtime.identityAuto = seed.identityAuto
-    runtime.identityIntervalMs = seed.identityIntervalMs
     runtime.refineIntervalMs = seed.refineIntervalMs
     runtime.peakHourSuppress = seed.peakHourSuppress
     // P3-6 (review 2026-08-31): keep the unsubscribe and call it on dispose —
@@ -275,8 +260,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     unwatchSettings = settingsScope.watch((next) => {
       runtime.enabled = next.enabled
       runtime.forgetEnabled = next.forgetEnabled
-      runtime.identityAuto = next.identityAuto
-      runtime.identityIntervalMs = next.identityIntervalMs
       runtime.refineIntervalMs = next.refineIntervalMs
       runtime.peakHourSuppress = next.peakHourSuppress
     })
@@ -297,7 +280,6 @@ export function apply(ctx: Context, config: Config = {}): void {
   let refineTimer: ReturnType<typeof setTimeout> | undefined
   let refineKick: ReturnType<typeof setTimeout> | undefined
   let settleTimer: ReturnType<typeof setTimeout> | undefined
-  let identityTimer: ReturnType<typeof setTimeout> | undefined
 
   const runForget = (): ForgetResult | undefined => {
     if (disposed || !runtime.enabled || !runtime.forgetEnabled) return undefined
@@ -342,8 +324,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     const controls: MemoryControlHandlers = {
       runNow: async (): Promise<RunNowResult> => ({
         refined: false,
-        identityCandidates: 0,
-        identityWrote: 0,
         forgetDemoted: 0,
         forgetArchivedMem: 0,
         forgetDeletedMem: 0,
@@ -607,23 +587,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       settleTimer.unref?.() // P1-11: don't hold the event loop
     }
 
-    // R3-i: identity-file maintenance pass — appends new user-layer memories into
-    // user.md. Pure-rule, zero LLM; skips entirely when there is no new content.
-    const runIdentity = (): MaintainResult | undefined => {
-      if (disposed || !runtime.enabled || !runtime.identityAuto) return undefined
-      try {
-        return maintainUserIdentity(store, store.dir, { maxBytes: identityMaxBytes })
-      } catch (err) {
-        if (!disposed) console.warn('[dsh-memory] identity maintain failed:', err instanceof Error ? err.message : err)
-        return undefined
-      }
-    }
-
     // R3-ui: wire the "立即整理记忆" control. Bypasses the peak-hour gate, runs
-    // condensation (L1/L2) then identity maintenance then forgetting, and
-    // returns a summarized result for the settings UI. Fire-and-forget for the
-    // background schedulers; here we await runRefine because the route caller
-    // wants feedback.
+    // condensation (L1/L2) then forgetting, and returns a summarized result for
+    // the settings UI. Fire-and-forget for the background schedulers; here we
+    // await runRefine because the route caller wants feedback.
     controls.runNow = async (): Promise<RunNowResult> => {
       let refined = false
       try {
@@ -632,12 +599,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       } catch (err) {
         if (!disposed) console.warn('[dsh-memory] manual refine failed:', err instanceof Error ? err.message : err)
       }
-      const identity = runIdentity()
       const forget = runForget()
       return {
         refined,
-        identityCandidates: identity?.candidates ?? 0,
-        identityWrote: identity?.wrote ?? 0,
         forgetDemoted: forget?.demoted ?? 0,
         forgetArchivedMem: forget?.archivedMem ?? 0,
         forgetDeletedMem: forget?.deletedMem ?? 0,
@@ -645,22 +609,12 @@ export function apply(ctx: Context, config: Config = {}): void {
         forgetDeletedEpi: forget?.deletedEpi ?? 0,
       }
     }
-    const scheduleIdentity = (delay: number): void => {
-      if (disposed) return
-      identityTimer = setTimeout(() => {
-        identityTimer = undefined
-        runIdentity()
-        scheduleIdentity(runtime.identityIntervalMs)
-      }, delay)
-      identityTimer.unref?.()
-    }
 
     // Background loops start unconditionally; each run() gates runtime.enabled,
     // so toggling the master switch live gates the work without timer churn.
     scheduleForget(FORGET_FIRST_DELAY_MS)
     scheduleRefine(2 * 60 * 1000) // first pass 2 min after boot
     scheduleSettle() // M5: idle-settle loop (every checkMinutes)
-    scheduleIdentity(60 * 1000) // first identity pass 1 min after boot
     return () => {
       disposed = true
       l0Dispose()
@@ -670,7 +624,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (refineTimer) clearTimeout(refineTimer)
       if (refineKick) clearTimeout(refineKick)
       if (settleTimer) clearTimeout(settleTimer)
-      if (identityTimer) clearTimeout(identityTimer)
       // P2-4 (review 2026-08-31): close the store only after every in-flight
       // background task (L0 / settle / refine) has settled — they are
       // fire-and-forget async and would otherwise write to a closed DB.

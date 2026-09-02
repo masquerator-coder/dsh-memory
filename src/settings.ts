@@ -10,10 +10,13 @@
  * Fields are the ones a user can reasonably toggle on a settings page:
  *   enabled              master memory switch (clean sessions when false)
  *   forgetEnabled        active-forgetting switch (pause demote/archive/hard-delete)
- *   identityAuto         auto-maintain user.md from user-layer memories
- *   identityIntervalMs   identity maintenance cadence (ms)
  *   refineIntervalMs     L1/L2 condensation scan cadence (ms)
  *   peakHourSuppress     M8 peak-hour LLM suppression switch
+ *
+ * The R3-i auto-maintenance controls (identityAuto / identityIntervalMs) were
+ * removed 2026-09-02 with the user.md auto-maintenance feature — user.md is
+ * human-authored and human-maintained like soul.md, so there is nothing to
+ * configure.
  */
 import z from '@deepseek-ai/schemastery'
 
@@ -21,8 +24,6 @@ import z from '@deepseek-ai/schemastery'
 export interface MemorySettings {
   enabled: boolean
   forgetEnabled: boolean
-  identityAuto: boolean
-  identityIntervalMs: number
   refineIntervalMs: number
   peakHourSuppress: boolean
 }
@@ -30,8 +31,6 @@ export interface MemorySettings {
 export const memorySettingsSchema = z.object({
   enabled: z.boolean(),
   forgetEnabled: z.boolean(),
-  identityAuto: z.boolean(),
-  identityIntervalMs: z.number(),
   refineIntervalMs: z.number(),
   peakHourSuppress: z.boolean(),
 })
@@ -41,13 +40,6 @@ export const memorySettingsSchema = z.object({
 export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   enabled: true,
   forgetEnabled: true,
-  // 2026-08-31 (user.md 人写权威化): default OFF. user.md is a human-authored,
-  // decisive portrait like soul.md — the plugin must not auto-append user-layer
-  // memories into it (reintroduces the double-presentation + KV-prefix churn we
-  // removed from tier0 injection). User-layer memories still accumulate for
-  // recall; flipping this back on restores the old auto-maintenance behavior.
-  identityAuto: false,
-  identityIntervalMs: 6 * 3600_000,
   refineIntervalMs: 3600_000,
   peakHourSuppress: true,
 }

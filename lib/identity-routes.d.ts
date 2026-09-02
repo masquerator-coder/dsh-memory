@@ -27,8 +27,6 @@ import type { MemoryStore } from './store.js';
 /** Result of an immediate "整理记忆" pass, returned by the trigger route. */
 export interface RunNowResult {
     refined: boolean;
-    identityCandidates: number;
-    identityWrote: number;
     forgetDemoted: number;
     forgetArchivedMem: number;
     forgetDeletedMem: number;

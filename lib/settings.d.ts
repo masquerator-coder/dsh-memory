@@ -10,33 +10,30 @@
  * Fields are the ones a user can reasonably toggle on a settings page:
  *   enabled              master memory switch (clean sessions when false)
  *   forgetEnabled        active-forgetting switch (pause demote/archive/hard-delete)
- *   identityAuto         auto-maintain user.md from user-layer memories
- *   identityIntervalMs   identity maintenance cadence (ms)
  *   refineIntervalMs     L1/L2 condensation scan cadence (ms)
  *   peakHourSuppress     M8 peak-hour LLM suppression switch
+ *
+ * The R3-i auto-maintenance controls (identityAuto / identityIntervalMs) were
+ * removed 2026-09-02 with the user.md auto-maintenance feature — user.md is
+ * human-authored and human-maintained like soul.md, so there is nothing to
+ * configure.
  */
 import z from '@deepseek-ai/schemastery';
 /** Memory settings exposed to the settings UI (subset of the full Config). */
 export interface MemorySettings {
     enabled: boolean;
     forgetEnabled: boolean;
-    identityAuto: boolean;
-    identityIntervalMs: number;
     refineIntervalMs: number;
     peakHourSuppress: boolean;
 }
 export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     enabled: z<boolean, boolean>;
     forgetEnabled: z<boolean, boolean>;
-    identityAuto: z<boolean, boolean>;
-    identityIntervalMs: z<number, number>;
     refineIntervalMs: z<number, number>;
     peakHourSuppress: z<boolean, boolean>;
 }>, Schemastery.ObjectT<{
     enabled: z<boolean, boolean>;
     forgetEnabled: z<boolean, boolean>;
-    identityAuto: z<boolean, boolean>;
-    identityIntervalMs: z<number, number>;
     refineIntervalMs: z<number, number>;
     peakHourSuppress: z<boolean, boolean>;
 }>>;

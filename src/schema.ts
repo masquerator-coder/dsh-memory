@@ -110,57 +110,7 @@ CREATE TABLE IF NOT EXISTS l2_refined (
   topic      TEXT PRIMARY KEY,
   refined_at INTEGER NOT NULL
 );
-
--- R3-i (2026-08-31): identity-file sync ledger — which semantic memory contents
--- have already been written into the auto-maintained soul.md/user.md identity
--- files (dedup key = contentId(content), so a content edit re-enters as new).
--- P3-4 (review 2026-08-31): composite PK (content_id, target) — the table
--- carries a target column, so a sole content_id PK would collide when the
--- same content syncs to two targets. Legacy single-PK installs are rebuilt
--- in place by migrateColumns.
-CREATE TABLE IF NOT EXISTS identity_synced (
-  content_id TEXT NOT NULL,
-  target     TEXT NOT NULL,
-  ts         INTEGER NOT NULL,
-  PRIMARY KEY (content_id, target)
-);
-CREATE TABLE IF NOT EXISTS identity_meta (
-  key   TEXT PRIMARY KEY,
-  value INTEGER
-);
 `
-
-/**
- * Idempotent column-migration extension point. v3.0.0 shipped a full DDL, so
- * until the first v3.x column lands the only migration is the identity_synced
- * PK rebuild (P3-4): legacy installs created the table with content_id as the
- * sole PRIMARY KEY while the design carries a `target` column — the same
- * content synced to two targets would collide. The table is rebuilt in place
- * (data preserved) whenever the legacy single-column PK is detected; new
- * installs get the composite PK straight from the DDL and take the no-op path.
- */
-export function migrateColumns(db: DatabaseSync): void {
-  try {
-    const cols = db.prepare('PRAGMA table_info(identity_synced)').all() as { name: string; pk: number }[]
-    if (cols.length === 0) return // table absent — DDL above creates the right shape
-    const pkCols = cols.filter(c => c.pk > 0).map(c => c.name).sort()
-    if (pkCols.join(',') === 'content_id,target') return
-    db.exec(`
-      CREATE TABLE identity_synced_new (
-        content_id TEXT NOT NULL,
-        target     TEXT NOT NULL,
-        ts         INTEGER NOT NULL,
-        PRIMARY KEY (content_id, target)
-      );
-      INSERT INTO identity_synced_new(content_id, target, ts)
-        SELECT content_id, target, ts FROM identity_synced;
-      DROP TABLE identity_synced;
-      ALTER TABLE identity_synced_new RENAME TO identity_synced;
-    `)
-  } catch {
-    /* absent/corrupt table → DDL above creates the right shape */
-  }
-}
 
 /**
  * Boot-time FTS integrity helper. NOTE (P2-36): on a regular (non-contentless,

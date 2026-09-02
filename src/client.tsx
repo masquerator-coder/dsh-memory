@@ -43,8 +43,6 @@ function MemoryIcon(): JSX.Element {
 interface MemorySettingsValue {
   enabled?: boolean
   forgetEnabled?: boolean
-  identityAuto?: boolean
-  identityIntervalMs?: number
   refineIntervalMs?: number
   peakHourSuppress?: boolean
 }
@@ -74,8 +72,6 @@ interface SaveResult {
 /** Result of an immediate /memory/trigger pass. */
 interface RunNowResult {
   refined: boolean
-  identityCandidates: number
-  identityWrote: number
   forgetDemoted: number
   forgetArchivedMem: number
   forgetDeletedMem: number
@@ -247,7 +243,6 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
       const r = await props.runNow()
       setTriggerResult(
         `整理完成：凝练${r.refined ? '已执行' : '已跳过（无待整理或无 LLM 路由）'}；` +
-        `画像新增 ${r.identityWrote} 条（候选 ${r.identityCandidates}）；` +
         `遗忘：降级 ${r.forgetDemoted}、归档记忆 ${r.forgetArchivedMem}、删除记忆 ${r.forgetDeletedMem}、归档会话 ${r.forgetArchivedEpi}、删除会话 ${r.forgetDeletedEpi}`,
       )
     } catch (e) {
@@ -299,18 +294,18 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
       />
       <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0' }}>
         <span style={{ flex: 1 }}>
-          <div>身份维护扫描间隔（小时）</div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>身份维护扫描周期（在配置中开启 identityAuto 后生效）</div>
+          <div>凝练整理时间间隔（小时）</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>后台 L1/L2 抽取与去重的周期扫描；改小更及时、更费 API，改大更省。新会话后 10 秒内仍会即时凝练一次</div>
         </span>
         <input
           type="number"
-          min={1}
-          step={1}
+          min={0.1}
+          step={0.5}
           disabled={!ready}
-          value={Math.round((value.identityIntervalMs ?? 6 * 3600_000) / 3600_000)}
+          value={Math.round(((value.refineIntervalMs ?? 3600_000) / 3600_000) * 10) / 10}
           onChange={(e) => {
-            const h = Math.max(1, Math.round(Number(e.target.value) || 1))
-            set('identityIntervalMs', h * 3600_000)
+            const h = Math.max(0.1, Number(e.target.value) || 1)
+            set('refineIntervalMs', Math.round(h * 3600_000))
           }}
           style={{ width: 64 }}
         />
@@ -456,7 +451,7 @@ export function apply(ctx: ClientContext): () => void {
     const data = await resp.json().catch(() => ({})) as Partial<{ ok: boolean; result: RunNowResult; error: string }>
     if (!resp.ok || !data.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
     return data.result ?? {
-      refined: false, identityCandidates: 0, identityWrote: 0,
+      refined: false,
       forgetDemoted: 0, forgetArchivedMem: 0, forgetDeletedMem: 0,
       forgetArchivedEpi: 0, forgetDeletedEpi: 0,
     }

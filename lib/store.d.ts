@@ -219,12 +219,6 @@ export declare class MemoryStore {
     l2RefinedTs(topic: string): number | undefined;
     /** M7: record that a topic cluster was LLM-audited at `ts` (idempotent upsert). */
     upsertL2Refined(topic: string, ts?: number): void;
-    /** Content-ids already written into an auto-maintained identity file. */
-    identitySyncedIds(target: string): Set<string>;
-    /** Record that a memory content was written into an identity file (idempotent). */
-    markIdentitySynced(content: string, target: string, ts?: number): void;
-    identityMetaGet(key: string): number | undefined;
-    identityMetaSet(key: string, value: number): void;
     recordFailure(memoryId: string, oldContent: string, newContent: string): void;
     failureTrail(): {
         memoryId: string;

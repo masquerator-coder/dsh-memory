@@ -130,12 +130,6 @@ export interface Config {
      *  (clean sessions) and background condensation/forgetting stop; the memory /
      *  memory_recall tools stay available for explicit use. Default true. */
     enabled?: boolean;
-    /** R3-i: auto-create + incrementally maintain user.md from user-layer memories. Default true. */
-    identityAuto?: boolean;
-    /** R3-i: identity maintenance cadence (ms). Default 6h. */
-    identityIntervalMs?: number;
-    /** R3-i: cap on the auto-maintained identity file (bytes). Default 2000. */
-    identityMaxBytes?: number;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;

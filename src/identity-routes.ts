@@ -39,8 +39,6 @@ const IDENTITY_FILE = { soul: 'soul.md', user: 'user.md' } as const
 /** Result of an immediate "整理记忆" pass, returned by the trigger route. */
 export interface RunNowResult {
   refined: boolean
-  identityCandidates: number
-  identityWrote: number
   forgetDemoted: number
   forgetArchivedMem: number
   forgetDeletedMem: number

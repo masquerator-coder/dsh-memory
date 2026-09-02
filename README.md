@@ -15,7 +15,7 @@ DeepSeek Harness 的三层凝练记忆插件（Cordis 插件，bundle-declarativ
 3. **热度只看 recency**——`1/(1+λ·Δt)^α` 只依赖最后访问时间，区分不出"过去 30 天召回 50 次"与"昨天召回 1 次"。
 4. **凝练未显式化**——记忆应沿时间熵减（对话 → 事实 → 规则），早期只有去重/合并，缺"情景 → 语义"的抽取管道。
 
-v3 对应补齐：情景层、主动遗忘、**双信号热度**、显式凝练管道（L0 记录落地，L1/L2 为架构预留、默认休眠）。
+v3 对应补齐：情景层、主动遗忘、**双信号热度**、显式凝练管道（L0 记录落地，L1/L2 周期性运行 + 即时触发）。
 
 ### 1.2 三层记忆架构
 
@@ -26,7 +26,7 @@ v3 对应补齐：情景层、主动遗忘、**双信号热度**、显式凝练�
 | **语义记忆** | `memories` 表 | 稳定事实 / 偏好 / 教训 | Tier0 注入 + Tier1 召回 | 三级阶梯 |
 
 ```
-工作记忆(宿主) ──会话结束──▶ 情景记忆(episodes) ──L1抽取(休眠)──▶ 语义记忆(memories) ──L2抽象(休眠)──▶ 技能(扩展预留)
+工作记忆(宿主) ──会话结束──▶ 情景记忆(episodes) ──L1抽取(周期/即时)──▶ 语义记忆(memories) ──L2去重/合并──▶ 技能(扩展预留)
 ```
 
 三个关键决策：
@@ -73,7 +73,7 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 ### 1.5 零 LLM 主循环 & Live 设置
 
 - **存、查、写、热度、遗忘全零 LLM**（纯函数 + 规则）。核心存查循环绝不因 LLM 挂掉而退化。
-- LLM 只在**可选的凝练增强**使用：L0 会话摘要（默认纯规则，可切 LLM）、L1/L2 决策式整理（v3 休眠）、情景召回摘要增强。
+- LLM 只在**凝练增强**使用：L0 会话摘要（默认纯规则，可切 LLM）、L1/L2 决策式整理（周期性 + 即时触发）、情景召回摘要增强。
 - 宿主通过 `ctx.settings` 注册 `memory` 命名空间，**设置面板的开关改动经 `scope.watch` live 热生效，无需重启**。
 
 ---
@@ -100,30 +100,32 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 
 ### 2.2 设置面板（dsh 设置页「记忆」项）
 
-设置面板注册在官方 `settings.section` slot，左侧导航自带**神经元图标**（插件自声明，无需侵入 harness shell）。可实时切换：
+设置面板注册在官方 `settings.section` slot，左侧导航自带**神经元图标**（插件自声明，无需侵入 harness shell）。可实时切换（经 `scope.watch` live 生效，免重启，写入 dsh 设置文档持久化）：
 
-| 开关 | 字段 | 作用 |
+| 开关 / 控件 | 字段 | 作用 |
 |---|---|---|
-| 记忆总开关 | `enabled` | 关 → 清洁会话（不注入任何记忆），后台整理/遗忘/维护全停 |
+| 记忆总开关 | `enabled` | 关 → 清洁会话（不注入任何记忆），后台整理/遗忘全停 |
 | 主动遗忘 | `forgetEnabled` | 关 → 暂停降级/归档/硬删，**不清理已有记忆** |
-| user.md 自动进化 | `identityAuto` | 关（default）→ user.md 人写权威，插件不自动 append；开 → 恢复自动维护 |
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
-| 身份维护扫描间隔 | `identityIntervalMs` | user.md 自动同步周期 |
-| soul.md / user.md 内联编辑 | — | 直接读写身份文件（文件仍为真相源） |
+| 凝练整理时间间隔（小时） | `refineIntervalMs` | 自定义 L1/L2 抽取与去重的周期扫描间隔（默认 1h，0.1h 起）；改小更及时更费 API、改大更省。新会话后 10 秒内仍会即时凝练一次（不受此间隔影响） |
+| soul.md / user.md 编辑器 | — | 行内 textarea 编辑 + **保存**；旁有 **打开编辑** 按钮——经 `/memory/identity/open` 用系统默认编辑器打开磁盘上的真实文件（文件仍为真相源） |
+
+面板另有两个操作按钮：
+- **立即整理记忆** —— 点按即触发 `POST /memory/trigger`，不等定时扫描，立即执行 **L1/L2 凝练 + 主动遗忘**（绕过忙闲时段抑制，因为是你主动要求），并回显本次结果（凝练是否执行、遗忘降级/归档/删除各多少）。
+- **查看记忆** —— 打开一个弹窗（`GET /memory/view`），只读展示当前有效记忆摘要：有效记忆/会话摘要/主题计数 + 表格（层级、类型、主题、内容、重要性）。
 
 ### 2.3 身份文件（soul.md / user.md）
 
 - **soul.md**：AI 人格 / 行为准则，**只由人写**，插件永不自动改写。
-- **user.md**：用户长期画像，**人写权威（2026-08-31 起）**——与 soul.md 同机制，由人维护，插件不再自动 append（`identityAuto` 默认关）。`layer=user` 稳定记忆继续在库中积累、供 `memory_recall` 召回，但**不注入 Tier0**（画像只经 user.md 呈现，避免双份 + KV-prefix 抖动）。
+- **user.md**：用户长期画像，**由人手动维护（2026-08-31 权威化 → 2026-09-02 彻底取消自动维护）**——与 soul.md 完全相同的人写机制。`layer=user` 稳定记忆继续在库中积累、供 `memory_recall` 召回，但**不注入 Tier0**（画像只经 user.md 呈现，避免双份 + KV-prefix 抖动）。
 
-两者作为恒定 section 注入（mtime 变化才重读，KV 缓存友好），不与 memories 表混管（不该被热度/遗忘管）。Windows 写入无 BOM UTF-8。
+两者通过设置面板的 **保存 / 打开编辑** 或直接手改文件维护（`<memoryHome>/memory/*.md`），作为恒定 section 注入（mtime 变化才重读，KV 缓存友好），不与 memories 表混管（不该被热度/遗忘管）。Windows 写入无 BOM UTF-8。
 
 ### 2.4 后台维护
 
 - **L0 会话收口**：turn-end 只做零 LLM 规则留痕；会话空闲 ≥ `l0IdleMinutes` 后一次性 LLM 收口为 episode 摘要。
-- **L1/L2 凝练**（架构预留、默认休眠）：情景→事实抽取、语义簇合并/仲裁；启用遵循"先护栏后接线"纪律。
+- **L1/L2 凝练**（情景→事实抽取 + 语义簇合并/去重）：由 `scheduleRefine` 按 `refineIntervalMs`（默认 1h，设置面板可自定义）周期扫描；新会话摘要落库后约 10 秒即时触发一次（M6 kick，不受间隔影响）。可随时用面板「立即整理记忆」手动触发（绕过忙闲时段）。
 - **每日主动遗忘**：`runForget` 按热度/重要性/时间执行三级阶梯，受 `enabled` 与 `forgetEnabled` 双闸门实时控制。
-- **身份维护**：按 `identityIntervalMs`（默认 6h）增量同步 user.md。
 - **峰时抑制**：默认北京 09–12 / 14–18 点（含前 15 分钟）跳过后台 LLM 凝练，省 API 费用。
 
 ### 2.5 关于 KV Cache（配置注意事项）
@@ -165,7 +167,7 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
-**`/memory/identity` 路由的信任模型（安全，2026-08-31）**：该路由的 POST 会写入 soul.md / user.md——两者作为恒定 section 注入 system prompt，属于持久化 prompt 注入面。因此**写操作仅接受 loopback 来源**（校验 `Host` 为 `127.0.0.1` / `localhost` / `::1`，浏览器跨站写携带的 `Origin` 也必须为 loopback；GET 只读不限）。若你把宿主 webServer 绑定到局域网地址，设置面板的 soul/user 编辑器将得到 403——请保持绑定 loopback，或在宿主侧为该路由前置你自己的鉴权。
+**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
 
 ---
 
@@ -204,9 +206,9 @@ l0Provider: ''               # 显式路由（建议留空跟随）
 l0Model: ''
 l0MaxTokens: 400
 l0TimeoutMs: 8000
-l1Enabled: true              # L1 情景→稳定事实抽取（LLM 决策，v3 休眠）
-l2Enabled: true              # L2 语义簇合并/仲裁（LLM 决策，v3 休眠）
-refineIntervalMs: 3600000    # 后台整理扫描间隔
+l1Enabled: true              # L1 情景→稳定事实抽取（LLM 决策）
+l2Enabled: true              # L2 语义簇合并/仲裁（LLM 决策）
+refineIntervalMs: 3600000    # 后台整理扫描间隔（面板可自定义，live 生效）
 l2MinCluster: 2
 l1RetryDegraded: false
 
@@ -227,14 +229,11 @@ peakHourSuppress: true       # false → 任何时段都跑后台 LLM
 # --- M9 身份块 ---
 enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section
 
-# --- R3-total / R3-i：记忆总开关 & 身份维护 ---
+# --- R3-total：记忆总开关 ---
 enabled: true                # false → 清洁会话，后台全部停；memory 工具保留
-identityAuto: false            # default: user.md 人写权威，插件不自动 append（开=true 恢复自动维护）
-identityIntervalMs: 21600000 # 默认 6h
-identityMaxBytes: 2000       # user.md 自动追加上限，达到后跳过不截断
 ```
 
-**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `identityAuto` / `identityIntervalMs` / `refineIntervalMs` / `peakHourSuppress`——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效。
+**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress`——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
 
 ---
 
@@ -249,8 +248,7 @@ identityMaxBytes: 2000       # user.md 自动追加上限，达到后跳过不�
     ├── ep_fts             # FTS5 情景索引
     ├── failure_memories   # 纠错留痕
     ├── forget_runs        # 遗忘审计
-    ├── forget_deleted     # 真删快照（内容+原因，可回滚/可查）
-    └── identity_synced    # user.md 增量同步去重指纹
+    └── forget_deleted     # 真删快照（内容+原因，可回滚/可查）
 ```
 
 身份文件（不进 memories 表）：`<memoryHome>/memory/soul.md`、`<memoryHome>/memory/user.md`。
@@ -260,7 +258,7 @@ identityMaxBytes: 2000       # user.md 自动追加上限，达到后跳过不�
 ## 六、使用示例
 
 ```text
-# Agent 记入一条用户偏好（layer=user → 永生，自动进 user.md）
+# Agent 记入一条用户偏好（layer=user → 永生；不自动写 user.md，user.md 由人维护）
 memory  action=add  layer=user  topic="用户偏好"  importance=5  content="用户偏爱简洁、结构化的中文回答"
 
 # 记一条一般教训
@@ -280,7 +278,7 @@ memory_recall  query="上周关于部署的讨论"    scope=episodic
 # 自动探测 esbuild / @types/react / typescript 最高语义版本（不硬编码），
 # 随后 tsc 类型检查（Node + client）+ esbuild 打包 client。
 node build.mjs
-# 冒烟（无 dsh 也可跑，全量断言组 G1–G24）
+# 冒烟（无 dsh 也可跑，全量断言组 G1–G25）
 npm run smoke   # 等价于 node smoke.mjs
 ```
 
@@ -290,12 +288,14 @@ npm run smoke   # 等价于 node smoke.mjs
 
 ## 八、状态与兼容性
 
-- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）——`smoke.mjs` 全部断言组（201 项）全绿、稳定连跑，`tsc` 零错误。
+- **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）——`smoke.mjs` 全部断言组（187 项）全绿、稳定连跑，`tsc` 零错误。
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
-- **后台凝练 L1/L2**：v3 休眠（仅零 LLM 骨架 + 纯规则降级/归档），为后续接线预留、遵循先护栏后接线纪律。
+- **后台凝练 L1/L2**：周期性运行（默认 1h，面板可自定义间隔），情景→事实抽取 + 语义簇合并/去重，受忙闲时段抑制；新会话落库 10 秒内即时触发一次；亦可面板「立即整理记忆」手动触发。LLM 降级时不退化为纯规则硬抽（标记 degraded）。
 - **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.5）。
-- **去重 + 身份权威化（2026-08-31）**：① 写时近重复合并 `findCanonical`（严格门）+ L1 同通道受益；② `isNearDupCandidate` token 宽松门支撑跨 topic 分组；③ `crossTopicNearDupGroups` 接入 L2 周期，破除按 topic 聚类边界；④ `layer=user` 移出 Tier0 注入、`identityAuto` 默认 false —— user.md 转人写权威（画像只经 user.md 呈现）。迁移：活库一键归档无歧义重复 + 修错误路径，歧义交 L2。
+- **去重 + 身份权威化（2026-08-31）**：① 写时近重复合并 `findCanonical`（严格门）+ L1 同通道受益；② `isNearDupCandidate` token 宽松门支撑跨 topic 分组；③ `crossTopicNearDupGroups` 接入 L2 周期，破除按 topic 聚类边界；④ `layer=user` 移出 Tier0 注入 —— user.md 转人写权威（画像只经 user.md 呈现）。
 - **user.md 按需加载（2026-09-02）**：完整画像不再内联注入系统提示（省上下文、稳 KV 前缀），系统提示仅留一条指引；模型确需了解用户画像时调用 `memory_read_user` 工具读取 user.md。
+- **设置面板控制面（2026-09-02）**：soul/user 编辑器新增「打开编辑」（`/memory/identity/open` 默认编辑器打开磁盘文件）；新增「立即整理记忆」（`/memory/trigger`，绕过忙闲时段立即执行凝练+遗忘并回显结果）与「查看记忆」（`/memory/view` 只读弹窗）；「凝练整理时间间隔」可在面板自定义（`refineIntervalMs`），改动 live 生效。新增路由全部 loopback 校验。
+- **user.md 自动维护彻底移除（2026-09-02）**：`maintainUserIdentity`、`identityAuto`/`identityIntervalMs`/`identityMaxBytes`、`identity_synced`/`identity_meta` 表及 G22/P3-4 测试全部删除；user.md 与 soul.md 一样完全由人维护。旧库残留的 `identity_synced`/`identity_meta` 表为惰性孤儿，不再被引用、无害。
 
 ---
 

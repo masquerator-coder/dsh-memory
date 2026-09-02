@@ -42,7 +42,7 @@ import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerd
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2 } from './lib/refine.js'
 import { buildIdentitySection } from './lib/inject.js'
-import { autocreateIdentityFiles, maintainUserIdentity, readIdentityFiles, writeIdentityFile } from './lib/identity.js'
+import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -808,53 +808,6 @@ group('G21 M9 identity sections (soul.md / user.md)')
   s.close(); rmSync(t, { recursive: true, force: true })
 }
 
-// G22 — R3-i identity-file auto-maintenance (auto-create, incremental fill, cap, no-new-skip)
-group('G22 R3-i identity file auto-maintenance')
-{
-  const t = mkdtempSync(join(tmpdir(), 'dsh-memory-r3-'))
-  const s = new MemoryStore(t)
-  const db = new DatabaseSync(s.dbPath)
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name)
-  db.close()
-  assert('G22 identity_synced table exists', tables.includes('identity_synced'))
-  assert('G22 identity_meta table exists', tables.includes('identity_meta'))
-  // auto-create empty shells, idempotent
-  const c1 = autocreateIdentityFiles(s.dir)
-  assert('G22 autocreate made empty soul+user', c1.created.sort().join(',') === 'soul.md,user.md')
-  assert('G22 soul starts empty (byte 0)', readFileSync(join(s.dir, 'soul.md'), 'utf8').length === 0)
-  const c2 = autocreateIdentityFiles(s.dir)
-  assert('G22 autocreate idempotent (no re-create)', c2.created.length === 0)
-  // no user memories → candidates 0, file untouched
-  const r0 = maintainUserIdentity(s, s.dir)
-  assert('G22 no-content → candidates 0, no write', r0.candidates === 0 && r0.wrote === 0)
-  assert('G22 scan records last_maintain meta', s.identityMetaGet('last_maintain') !== undefined)
-  // add user-layer memories → appended + synced
-  s.batch([
-    { action: 'add', layer: 'user', importance: 4, content: '用户偏好用中文交流' },
-    { action: 'add', layer: 'user', importance: 4, content: '用户是某大学经管学院副教授' },
-  ])
-  const r1 = maintainUserIdentity(s, s.dir)
-  const u1 = readFileSync(join(s.dir, 'user.md'), 'utf8')
-  assert('G22 wrote the 2 new user memories', r1.wrote === 2 && u1.includes('中文交流') && u1.includes('副教授'))
-  // second pass with no new content → zero write, file byte-identical
-  const r2 = maintainUserIdentity(s, s.dir)
-  assert('G22 no new content → skip, file unchanged', r2.candidates === 0 && readFileSync(join(s.dir, 'user.md'), 'utf8') === u1)
-  s.close(); rmSync(t, { recursive: true, force: true })
-  // size cap: entries that would overflow are skipped, file stays under maxBytes
-  const t2 = mkdtempSync(join(tmpdir(), 'dsh-memory-r3b-'))
-  const s2 = new MemoryStore(t2)
-  s2.batch([
-    { action: 'add', layer: 'user', importance: 4, content: '一款超长到足以触发大小上限被跳过的用户画像内容一' },
-    { action: 'add', layer: 'user', importance: 4, content: '第二段也很长的用户画像内容同样应当被跳过二' },
-  ])
-  const cap = maintainUserIdentity(s2, s2.dir, { maxBytes: 30 })
-  const ufPath = join(s2.dir, 'user.md')
-  const uf = existsSync(ufPath) ? readFileSync(ufPath, 'utf8') : ''
-  assert('G22 size cap: overflowing entries skipped', cap.overflow >= 1)
-  assert('G22 file bytes stay at or under cap', Buffer.byteLength(uf, 'utf8') <= 30)
-  s2.close(); rmSync(t2, { recursive: true, force: true })
-}
-
 // G23 — R3-ui identity-file read/write (source of truth + no BOM + path narrowing)
 group('G23 R3-ui identity file read/write')
 {
@@ -929,30 +882,6 @@ group('G24 review fixes 2026-08-31 (P1-1 / P2-1 / P2-3 / P3-4)')
     assert('G24 P2-3 empty topic → DEFAULT_TOPIC (no empty bucket)', e && e.topic === 'general')
     assert('G24 P2-3 topicsIndex shows no empty label', s.topicsIndex().every(ti => ti.topic !== ''))
     s.close(); rmSync(t, { recursive: true, force: true })
-  }
-
-  // P3-4: identity_synced carries the composite PK (content_id, target); a
-  // legacy single-PK table is migrated in place with data preserved.
-  {
-    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-f4-'))
-    const s = new MemoryStore(t)
-    const db = new DatabaseSync(s.dbPath)
-    const pk = db.prepare('PRAGMA table_info(identity_synced)').all().filter(c => c.pk > 0).map(c => c.name).sort().join(',')
-    db.close()
-    assert('G24 P3-4 new install: composite PK (content_id,target)', pk === 'content_id,target')
-    s.close()
-    // simulate a legacy install: single-column PK + one row
-    const db2 = new DatabaseSync(join(t, 'memory', 'memory.db'))
-    db2.exec("DROP TABLE identity_synced; CREATE TABLE identity_synced (content_id TEXT PRIMARY KEY, target TEXT NOT NULL, ts INTEGER NOT NULL); INSERT INTO identity_synced VALUES ('abc123', 'user', 1);")
-    db2.close()
-    const s2 = new MemoryStore(t) // constructor runs migrateColumns → rebuild
-    const db3 = new DatabaseSync(s2.dbPath)
-    const pk2 = db3.prepare('PRAGMA table_info(identity_synced)').all().filter(c => c.pk > 0).map(c => c.name).sort().join(',')
-    const kept = db3.prepare("SELECT COUNT(*) AS c FROM identity_synced WHERE content_id = 'abc123' AND target = 'user'").get()
-    db3.close()
-    assert('G24 P3-4 legacy single-PK table migrated to composite PK', pk2 === 'content_id,target')
-    assert('G24 P3-4 migration preserved the row', Number(kept.c) === 1)
-    s2.close(); rmSync(t, { recursive: true, force: true })
   }
 }
 

@@ -37,7 +37,7 @@ import type {
 } from './types.js'
 import { DAY_MS, heatOf, resolveForgetDays, shouldArchive, shouldDelete, shouldDemote } from './heat.js'
 import { contentSimilarity, isNearDupCandidate, isLowQuality, qualityScore } from './quality.js'
-import { DDL, migrateColumns, rebuildFts } from './schema.js'
+import { DDL, rebuildFts } from './schema.js'
 
 export const DEFAULT_BUDGET: MemoryBudget = { tier0: 900, user: 400, memory: 500 }
 
@@ -150,7 +150,6 @@ export class MemoryStore {
     this.db.exec('PRAGMA journal_mode=WAL')
     this.db.exec('PRAGMA busy_timeout=3000')
     this.db.exec(DDL)
-    migrateColumns(this.db)
     rebuildFts(this.db)
 
     this.upsertMemStmt = this.stmt(`
@@ -1077,28 +1076,6 @@ export class MemoryStore {
     this.stmt(
       'INSERT INTO l2_refined(topic, refined_at) VALUES (?, ?) ON CONFLICT(topic) DO UPDATE SET refined_at = excluded.refined_at',
     ).run(topic, ts)
-  }
-
-  // ---- identity-file sync ledger (R3-i, 2026-08-31) -------------------------
-
-  /** Content-ids already written into an auto-maintained identity file. */
-  identitySyncedIds(target: string): Set<string> {
-    const rows = this.stmt('SELECT content_id FROM identity_synced WHERE target = ?').all(target) as { content_id: string }[]
-    return new Set(rows.map(r => r.content_id))
-  }
-
-  /** Record that a memory content was written into an identity file (idempotent). */
-  markIdentitySynced(content: string, target: string, ts = Date.now()): void {
-    this.stmt('INSERT OR IGNORE INTO identity_synced(content_id, target, ts) VALUES (?,?,?)').run(contentId(content), target, ts)
-  }
-
-  identityMetaGet(key: string): number | undefined {
-    const r = this.stmt('SELECT value AS v FROM identity_meta WHERE key = ?').get(key) as { v: number } | undefined
-    return r ? Number(r.v) : undefined
-  }
-
-  identityMetaSet(key: string, value: number): void {
-    this.stmt('INSERT INTO identity_meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
   }
 
   // ---- correction trail ----------------------------------------------------

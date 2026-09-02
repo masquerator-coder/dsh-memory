@@ -1,42 +1,33 @@
 /**
- * dsh-memory — auto-maintained identity files (soul.md / user.md), R3-i 2026-08-31.
+ * dsh-memory — identity files (soul.md / user.md), R3-i 2026-08-31.
  *
- * Two goals from the user:
- *  1. create empty identity files on boot; progressively fill them as the memory
- *     condensation layer yields durable content;
- *  2. cap file growth, and only touch files when there is genuinely new content
- *     to add ("先扫描，没新增不维护").
+ * Since 2026-08-31 the persistent identity files are HUMAN-authored and
+ * human-maintained, exactly like soul.md: the plugin auto-creates empty shells
+ * on boot (so injection can render a section once the human writes content)
+ * and exposes them to the settings UI over the /memory/identity HTTP route.
  *
- * Design (kept minimal & zero-LLM):
- *  - `autocreateIdentityFiles` creates empty soul.md / user.md if absent.
- *  - `maintainUserIdentity` is a pure-rule pass: it scans the semantic store for
- *    `layer=user` memories, appends the ones not yet synced into user.md (dedup
- *    key = contentId(content)), and records them in `identity_synced`. If there
- *    is no unsynced candidate, it returns immediately without touching the file
- *    (the "no new content → no maintenance" gate).
- *  - File size is capped at `maxBytes`; once reached, further appends are
- *    skipped (the file is protected, never truncated).
+ * What this module does NOT do anymore (cancelled 2026-09-02): the automatic
+ * `maintainUserIdentity` pass that appended layer=user memories into user.md,
+ * the identity_synced / identity_meta ledger tables, and the associated store
+ * methods were removed. user.md is never auto-written; it is edited by hand the
+ * same way soul.md is. (Old databases may still contain the orphaned tables
+ * from the pre-cancellation build — they are inert and never touched.)
  *
- * soul.md is intentionally NOT auto-written: an AI persona is a design decision
- * (human-authored), not something a condensation pass should fabricate. The file
- * is auto-created and injected, but its content stays human-maintained. (The
- * maintain function is structured so a soul source can be added later without
- * reworking the ledger.)
+ * soul.md is intentionally never auto-written either: an AI persona is a
+ * design decision (human-authored), not something a condensation pass should
+ * fabricate.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { contentId, type MemoryStore } from './store.js'
-
-/** Default cap on an auto-maintained identity file (bytes, UTF-8). */
-export const IDENTITY_MAX_BYTES = 2000
 
 function stripBom(s: string): string {
   return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s
 }
 
 /** Create empty soul.md / user.md under `dir` when absent. Files stay empty until
- *  the maintenance pass (or the user) writes real content — the injection renderer
- *  treats an empty file as "no identity section". Never touches existing files. */
+ *  the human writes real content — the injection renderer treats an empty file
+ *  as "no identity section". Never touches existing files (a human-authored file
+ *  is never overwritten). */
 export function autocreateIdentityFiles(dir: string): { created: string[]; skipped: string[] } {
   mkdirSync(dir, { recursive: true })
   const created: string[] = []
@@ -48,59 +39,6 @@ export function autocreateIdentityFiles(dir: string): { created: string[]; skipp
     created.push(file)
   }
   return { created, skipped }
-}
-
-export interface MaintainResult {
-  /** unsynced user-layer candidates found this run */
-  candidates: number
-  /** entries actually appended to the identity file */
-  wrote: number
-  /** entries skipped because the file size cap was hit */
-  overflow: number
-}
-
-/** Incremental, zero-LLM maintenance of `user.md` from the semantic store's
- *  `layer=user` memories. Dedups via contentId(content) in `identity_synced`.
- *  No unsynced candidate → returns `{candidates:0,...}` without writing (the
- *  "no new content → no maintenance" gate). File capped at `maxBytes`. */
-export function maintainUserIdentity(store: MemoryStore, dir: string, opts: { maxBytes?: number } = {}): MaintainResult {
-  const maxBytes = opts.maxBytes ?? IDENTITY_MAX_BYTES
-  const target = 'user'
-  const file = join(dir, 'user.md')
-
-  const candidates = store.list({ layer: 'user', includeArchived: false, includeLowQuality: false })
-  const synced = store.identitySyncedIds(target)
-  const todo = candidates.filter(e => !synced.has(contentId(e.content)))
-  store.identityMetaSet('last_maintain', Date.now()) // a scan happened even if nothing to write
-  if (todo.length === 0) return { candidates: 0, wrote: 0, overflow: 0 }
-
-  const existing = existsSync(file) ? stripBom(readFileSync(file, 'utf8')) : ''
-  let buf = existing
-  let base = Buffer.byteLength(buf, 'utf8')
-  let wrote = 0
-  let overflow = 0
-  const toSync: string[] = []
-
-  for (const e of todo) {
-    if (base >= maxBytes) { overflow += todo.length - wrote; break }
-    const line = `- ${e.content.trim()}\n`
-    const add = Buffer.byteLength(line, 'utf8')
-    if (base + add > maxBytes) { overflow += 1; continue }
-    buf += line
-    base += add
-    toSync.push(e.content)
-    wrote += 1
-  }
-
-  if (wrote > 0) {
-    // G6 (2026-09-01): write file FIRST, then mark synced — if write fails,
-    // the ledger stays clean and the next run will retry.
-    writeFileSync(file, buf, 'utf8') // UTF-8, no BOM
-    for (const content of toSync) {
-      store.markIdentitySynced(content, target)
-    }
-  }
-  return { candidates: todo.length, wrote, overflow }
 }
 
 /** Read both identity files (missing file → empty string). Used by the settings
