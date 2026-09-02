@@ -28,6 +28,7 @@
  *   G22  R3-i identity file auto-maintenance
  *   G23  R3-ui identity file read/write
  *   G24  review fixes 2026-08-31 (P1-1/P2-1/P2-3/P3-4)
+ *   G25  review fixes 2026-09-02 (S1 truncation / G4 cross-layer flip)
  *
  * Run: node smoke.mjs
  */
@@ -952,6 +953,77 @@ group('G24 review fixes 2026-08-31 (P1-1 / P2-1 / P2-3 / P3-4)')
     assert('G24 P3-4 legacy single-PK table migrated to composite PK', pk2 === 'content_id,target')
     assert('G24 P3-4 migration preserved the row', Number(kept.c) === 1)
     s2.close(); rmSync(t, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G25 — review fixes 2026-09-02 (S1 residual truncation / G4 cross-layer flip)
+group('G25 review fixes 2026-09-02 (S1 / G4)')
+{
+  // G4: re-adding identical content under a different layer must never silently
+  // change the existing row's layer. A user-layer re-add as `memory` used to
+  // drop the row's immortality (tier0 guard was a no-op because the content-hash
+  // id is deterministic → the ON CONFLICT(id) upsert still flipped the layer).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g1-'))
+    const s = new MemoryStore(t)
+    const C = '用户偏好的永生保护画像条目唯一正文'
+    s.batch([{ action: 'add', layer: 'user', importance: 5, content: C, topic: 'p' }])
+    s.batch([{ action: 'add', layer: 'memory', content: C }])
+    const rows = s.activeEntries().filter(e => e.content === C)
+    assert('G25 G4 cross-layer re-add stays a single row', rows.length === 1)
+    assert('G25 G4 user fact NOT silently downgraded to memory', rows[0].layer === 'user')
+    assert('G25 G4 immortality tier preserved (tier 0)', rows[0].tier === 0)
+    assert('G25 G4 content preserved intact', rows[0].content === C)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // G4 reverse: a memory-layer fact must not be silently upgraded to user.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g2-'))
+    const s = new MemoryStore(t)
+    const D = '普通观察层事实正文唯一标识不升级'
+    s.batch([{ action: 'add', layer: 'memory', content: D }])
+    s.batch([{ action: 'add', layer: 'user', content: D }])
+    const rows = s.activeEntries().filter(e => e.content === D)
+    assert('G25 G4 memory fact NOT silently upgraded to user', rows.length === 1 && rows[0].layer === 'memory')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // S1: a SHORTER added fact that is a near-substring of a longer stored entry
+  // must not silently truncate the longer content; the stored entry is kept and
+  // the dropped add leaves an audit trail.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g3-'))
+    const s = new MemoryStore(t)
+    const LONG = '用户偏好深色主题且使用VSCode开发工具做前端界面'
+    const SHORT = '用户偏好深色主题且使用VSCode开发工具做前端' // prefix-substring, sim=24/26≥0.85
+    s.batch([{ action: 'add', content: LONG }])
+    s.batch([{ action: 'add', content: SHORT }])
+    const rows = s.activeEntries()
+    assert('G25 S1 near-substring merge stays a single row', rows.length === 1)
+    assert('G25 S1 longer stored content preserved (no silent truncation)', rows[0].content === LONG)
+    assert('G25 S1 dropped shorter add leaves an audit trail', s.failureTrail().some(f => f.newContent === SHORT))
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // S1: a very short fragment (length ratio > 2) must not merge at all → both rows survive.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g4-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', content: '用户偏好深色主题且使用VSCode开发' }])
+    s.batch([{ action: 'add', content: '用户偏好深色主题' }])
+    const rows = s.activeEntries()
+    assert('G25 S1 very-short fragment (ratio>2) does not merge', rows.length === 2)
+    assert('G25 S1 original long entry intact', rows.some(r => r.content === '用户偏好深色主题且使用VSCode开发'))
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // S1: an equal-or-longer re-add (an extension that still passes SIM_DUP) may overwrite.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-memory-g5-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', content: '用户偏好深色主题' }])
+    s.batch([{ action: 'add', content: '用户偏好深色主题且' }]) // +1 char, sim=8/9≈0.89 ≥ SIM_DUP
+    const rows = s.activeEntries()
+    assert('G25 S1 longer/equal extension add still merges & extends', rows.length === 1 && rows[0].content === '用户偏好深色主题且')
+    s.close(); rmSync(t, { recursive: true, force: true })
   }
 }
 

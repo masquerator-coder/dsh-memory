@@ -405,7 +405,7 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
           const canonical = store.findCanonical(v.content, 'memory')
           const survivors = new Set<string>([contentId(v.content)])
           if (canonical) survivors.add(canonical.id)
-          ops.push({ action: 'add', layer: 'memory', content: v.content, topic: cluster.topic, ...(v.kind ? { kind: v.kind } : {}) })
+          ops.push({ action: 'add', layer: 'memory', content: v.content, topic: cluster.topic, authoritative: true, ...(v.kind ? { kind: v.kind } : {}) })
           for (const id of ids) if (!survivors.has(id)) ops.push({ action: 'remove', id })
           applied.push(v)
         } else if (v.action === 'drop' && ids.length > 0) {

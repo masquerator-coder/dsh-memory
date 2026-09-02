@@ -65,6 +65,11 @@ export interface MemoryOp {
     sessionId?: string;
     /** remove: hard-delete when true. */
     force?: boolean;
+    /** add: L2-adjudicated merge — the new content is authoritative and MAY
+     *  overwrite a longer existing entry (intentional consolidation), bypassing
+     *  the S1 short-fragment length guard. Set ONLY by the L2 consolidate path,
+     *  never by a model-facing add (2026-09-02). */
+    authoritative?: boolean;
 }
 export interface MemoryBudget {
     tier0: number;

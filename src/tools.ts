@@ -12,6 +12,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolCallKind, type ToolCallView, type ToolResult, type ToolResultView } from '@deepseek-ai/dsh-tools'
 import type { MemoryStore } from './store.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './format.js'
+import { readIdentityFiles } from './identity.js'
 import type { ApplyResult, Epistemic, Importance, Kind, Layer, MemoryOp, OpAction, Tier } from './types.js'
 
 const ACTION_VERBS: Record<OpAction, string> = {
@@ -214,4 +215,30 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
 
   ctx.tools.register(memoryTool)
   ctx.tools.register(recallTool)
+
+  // ---- user_profile: lazy read of user.md (2026-09-02) ----------------------
+  // user.md is NOT injected into the system prompt by default (it only carries a
+  // constant pointer); the model fetches the full portrait here when it actually
+  // needs to know the user (identity / preferences / environment / habits).
+  const userProfileTool = defineTool({
+    name: 'memory_read_user',
+    description:
+      '读取用户画像(user.md)。画像内容默认不注入系统提示以节省上下文;当回答、决策或个性化确实需要了解用户(身份/偏好/工作环境/习惯)时,调用本工具获取完整画像。无参数。',
+    parameters: {},
+    output: objectOutput,
+    async execute(_args, _exec) {
+      const files = readIdentityFiles(store.dir)
+      const u = (files.user ?? '').trim()
+      if (!u) return { content: '用户画像(user.md)尚未维护或为空;如需建立,可在设置中编辑 user.md,或用 memory(layer=user) 记录用户事实。' }
+      return { content: u }
+    },
+    presentCall() {
+      return callCard('读取用户画像', 'search', 'user.md')
+    },
+    presentResult(_args, result): ToolResultView | undefined {
+      const text = textOf(result)
+      return resultCard('用户画像', { isError: result.isError })
+    },
+  })
+  ctx.tools.register(userProfileTool)
 }
