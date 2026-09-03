@@ -217,6 +217,8 @@ l1Enabled: true              # L1 情景→稳定事实抽取（LLM 决策）
 l2Enabled: true              # L2 语义簇合并/仲裁（LLM 决策）
 refineIntervalMs: 3600000    # 后台整理扫描间隔（面板可自定义，live 生效）
 l2MinCluster: 2
+# L1 遇非 JSON/空输出先做一次纠错重试（R8）再降级；手动"立即整理"始终复活
+# degraded 的 episode（R9），不受本开关影响。true=后台周期也重试 degraded。
 l1RetryDegraded: false
 
 # --- M5 会话收口 ---

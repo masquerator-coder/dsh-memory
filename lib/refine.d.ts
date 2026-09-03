@@ -89,6 +89,13 @@ export declare function buildL1Prompt(summary: string, toolsUsed?: string): {
     system: string;
     user: string;
 };
+/** R8 (2026-09-03): user prompt for ONE corrective L1 retry. Feeds the offending
+ *  model output back and re-demands the strict JSON contract. v4-flash-class
+ *  models intermittently drift off the contract (prose / fences / truncated
+ *  arrays); a hard parse failure on real output is the dominant cause of
+ *  degraded episodes in the field, and a single correction recovers most of
+ *  them without an unbounded retry loop. */
+export declare function buildL1RetryUser(summary: string, toolsUsed: string | undefined, badRaw: string): string;
 /** Build the L2 system + framed user prompt over a cluster of candidate facts. */
 export declare function buildL2Prompt(facts: {
     id: string;

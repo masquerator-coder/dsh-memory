@@ -524,7 +524,12 @@ export function apply(ctx: Context, config: Config = {}): void {
             provider: l1Route?.provider,
             model: l1Route?.model,
             maxTokens: l1MaxTokens, timeoutMs: l1TimeoutMs,
-            retryDegraded: l1RetryDegraded,
+            // R9 (2026-09-03): a manual "立即整理" (force=true) also resurrects
+            // degraded (extracted=2) episodes — the user asked explicitly, so
+            // episodes whose earlier L1 pass failed (transient format drift /
+            // route blip) get another chance instead of being skipped forever.
+            // Background passes keep the cheap default (retryDegraded config).
+            retryDegraded: force || l1RetryDegraded,
           })
         }
         if (l2Enabled) {

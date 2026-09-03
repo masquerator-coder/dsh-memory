@@ -205,6 +205,16 @@ export function buildL1Prompt(summary: string, toolsUsed?: string): { system: st
   return { system, user }
 }
 
+/** R8 (2026-09-03): user prompt for ONE corrective L1 retry. Feeds the offending
+ *  model output back and re-demands the strict JSON contract. v4-flash-class
+ *  models intermittently drift off the contract (prose / fences / truncated
+ *  arrays); a hard parse failure on real output is the dominant cause of
+ *  degraded episodes in the field, and a single correction recovers most of
+ *  them without an unbounded retry loop. */
+export function buildL1RetryUser(summary: string, toolsUsed: string | undefined, badRaw: string): string {
+  return `${buildL1Prompt(summary, toolsUsed).user}\n\nYour previous answer was not a valid JSON array:\n${badRaw}\nReturn ONLY the JSON array specified above — no prose, no markdown fence, no preamble. If nothing durable remains, return [].`
+}
+
 /** Build the L2 system + framed user prompt over a cluster of candidate facts. */
 export function buildL2Prompt(facts: { id: string; content: string; kind?: Kind; importance?: Importance }[]): { system: string; user: string } {
   const system =
@@ -294,10 +304,25 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
       } else {
         const prompt = buildL1Prompt(ep.summary, ep.tools_used)
         const sha = contentId(`${ep.id}\n${ep.summary}`)
-        const raw = await llmText(input.llm!, {
+        let raw = await llmText(input.llm!, {
           provider: input.provider!, model: input.model!, system: prompt.system, user: prompt.user,
           maxTokens: input.maxTokens, timeoutMs: input.timeoutMs,
         })
+        // R8 (2026-09-03): before degrading on a hard parse failure, issue ONE
+        // corrective retry that feeds the offending output back. Intermittent
+        // format drift (prose / fence / truncated array) is the dominant cause
+        // of degraded episodes; a single correction recovers most. Bounded:
+        // never loops; worst case total ≤ 2×timeout. raw===null (route timeout
+        // / empty stream) is NOT retried here — the manual "立即整理" trigger
+        // resurrects degraded episodes, and retryDegraded opts background back.
+        if (raw !== null && parseL1Json(raw) === null) {
+          raw = await llmText(input.llm!, {
+            provider: input.provider!, model: input.model!,
+            system: prompt.system,
+            user: buildL1RetryUser(ep.summary, ep.tools_used, raw),
+            maxTokens: input.maxTokens, timeoutMs: input.timeoutMs,
+          })
+        }
         facts = raw === null ? null : parseL1Json(raw)
         if (raw === null || facts === null) status = 'degraded'
       }
