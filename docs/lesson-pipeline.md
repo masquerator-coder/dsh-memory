@@ -199,7 +199,7 @@ if (lessonDraftEnabled) await runRefineLessonPromote(store, { llm, provider: rou
 
 - **基线修复（前置）**：deepseek-harness 升级后 `Session.events` public 属性移除 → 改为 `Session.snapshotEvents()`（index.ts 三处）。**仅改 dsh-memory 插件，未侵入 harness**。
 - **§2 lesson pipeline 已实现**：schema `lesson_drafts` 表；store `recordFailure` 零 LLM 双写（`upsertLessonDraft` 聚合 draft_count）+ `listLessonDrafts`/`getLessonDraft`/`markLessonDraftStatus` + 可选 `onLessonDraft` 钩子；refine `runRefineLessonPromote`（LLM 判定 / 纯规则兜底 / degraded 保留）+ `buildLessonJudgePrompt`/`parseLessonJudgements`；index `runRefine` 周期末 pass + `store.onLessonDraft` 即时 fire-and-forget。`refine_runs.level=3` 记 lesson 决策。
-- **§3.1 kind/importance**：实现 `judgeAddMeta` + `buildAddMetaPrompt`/`parseAddMetaJson` 能力 seam；lesson 升格已正确标注 `kind=lesson` 与 LLM 判 importance。**普通 add 热路径的异步旁路修订**（对存量 `kind=general/importance=3` 条目批量校准）按"绝不阻塞 + 只落库不回流"原则作为独立校准 pass **延后**（侵入 add 热路径需异步重构，风险高，不做坏本轮稳定交付）——留接口，后续接。
+- **§3.1 kind/importance**：~~实现 `judgeAddMeta` + `buildAddMetaPrompt`/`parseAddMetaJson` 能力 seam~~（**2026-09-03 审计后删除**：全项目零调用的死代码，接入 add 热路径的方案仍延后；需要时从 git 历史恢复）；lesson 升格已正确标注 `kind=lesson` 与 LLM 判 importance。**普通 add 热路径的异步旁路修订**（对存量 `kind=general/importance=3` 条目批量校准）按"绝不阻塞 + 只落库不回流"原则作为独立校准 pass **延后**（侵入 add 热路径需异步重构，风险高，不做坏本轮稳定交付）。
 - **§3.2 forgetRun 删除复核**：未实现（设计稿明确为非阻塞、第二阶段）。forgetRun 处留思路注释。
 - **L1 增强已实现**：`buildL1Prompt` system 追加"若摘要含纠正/失误，额外输出 kind=lesson 候选"。
 - **三设置项** `lessonDraftEnabled`/`lessonInstantJudge`/`lessonUseLlm` 已接入 settings 面板 + runtime live watch。

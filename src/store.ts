@@ -616,7 +616,10 @@ export class MemoryStore {
         // is the authoritative identity of that content — preserve it untouched.
         // An explicit layer change belongs on replace(id, { layer }).
         if (existing && existing.layer !== layer) {
-          return { ok: true }
+          // M4 (audit 2026-09-03): this write lands NOTHING — reporting ok:true
+          // made the tool tell the model "已记入" for a zero-write op. Reject
+          // with the actionable reason instead (the row itself stays untouched).
+          return { ok: false, error: `same content already stored in layer "${existing.layer}"; kept untouched — use replace(id, { layer }) to move it` }
         }
         if (!existing) {
           // P2-dedup (2026-08-31): the exact-content lookup below was only able
@@ -636,7 +639,9 @@ export class MemoryStore {
           if (exAny) {
             const ex = this.rowToEntry(exAny)
             if (!ex.archived && ex.layer !== layer) {
-              return { ok: true }
+              // M4 (audit 2026-09-03): same honest-rejection contract as the
+              // cid-hit branch above — the write is a no-op, say so.
+              return { ok: false, error: `same content already stored in layer "${ex.layer}"; kept untouched — use replace(id, { layer }) to move it` }
             }
           }
         }
@@ -731,7 +736,16 @@ export class MemoryStore {
         ? target.topic
         : String(op.topic).trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
       this.writeMemory(target.id, {
-        layer, kind, tier, topic: newTopic, content, importance, quality, epistemic,
+        // C1 (audit 2026-09-03): unspecified metadata must keep the TARGET's
+        // values (same semantics P2-37 established for topic) — the shared
+        // defaults above used to silently reset a user-layer entry to 'memory'
+        // (dropping immortality) and importance to 3 (piercing the >=5
+        // never-hard-delete guard) on a bare replace(id, { content }).
+        layer: op.layer ?? target.layer,
+        kind: op.kind ?? target.kind,
+        tier, topic: newTopic, content,
+        importance: op.importance ?? target.importance,
+        quality, epistemic: op.epistemic ?? target.epistemic,
         heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
         last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
         window_freq: target.window_freq, window_start: target.window_start,
@@ -872,6 +886,10 @@ export class MemoryStore {
   }
 
   recall(query: string, opts: RecallOpts = {}): RecallHit[] {
+    // M1 (audit 2026-09-03): a blank query must not degrade into a full-library
+    // LIKE '%%' scan whose top-K then get heat/frequency boosts via touchAccess —
+    // arbitrary entries were being promoted for a query that said nothing.
+    if (!query.trim()) return []
     const topK = opts.topK ?? 8
     const weighting = opts.epistemicWeighting ?? true
     const now = Date.now()
@@ -1043,6 +1061,9 @@ export class MemoryStore {
    *  8.6ms/call, strictly linear; the semantic recall path is O(hits) at 0.05ms).
    *  Scoring itself is unchanged — same FTS/substring/keyword base + recency. */
   recallEpisodes(query: string, opts: { topK?: number } = {}): EpisodeHit[] {
+    // M1 (audit 2026-09-03): mirror recall()'s blank-query early return — the
+    // episodic LIKE layer would otherwise return the whole table for ''.
+    if (!query.trim()) return []
     const topK = opts.topK ?? 8
     const seen = new Set<string>()
     const candidates: Episode[] = []
@@ -1263,12 +1284,14 @@ export class MemoryStore {
     try { this.onLessonDraft(draftId) } catch { /* observer must not break writes */ }
   }
 
-  /** List staged lesson drafts (oldest first). */
-  listLessonDrafts(opts: { status?: 'draft' | 'promoted' | 'dropped'; limit?: number } = {}): LessonDraft[] {
+  /** List staged lesson drafts (oldest first by default; `order: 'desc'` for
+   *  the instant judge, which must adjudicate the NEWEST draft — M6, audit
+   *  2026-09-03). The id tiebreaker keeps same-ms inserts deterministic. */
+  listLessonDrafts(opts: { status?: 'draft' | 'promoted' | 'dropped'; limit?: number; order?: 'asc' | 'desc' } = {}): LessonDraft[] {
     let sql = 'SELECT * FROM lesson_drafts'
     const params: Array<string | number | null> = []
     if (opts.status) { sql += ' WHERE status = ?'; params.push(opts.status) }
-    sql += ' ORDER BY drafted_at ASC'
+    sql += opts.order === 'desc' ? ' ORDER BY drafted_at DESC, id DESC' : ' ORDER BY drafted_at ASC, id ASC'
     const lim = Number.isFinite(opts.limit) ? Math.max(1, Math.floor(opts.limit as number)) : 0
     if (lim > 0) sql += ` LIMIT ${lim}`
     const rows = this.stmt(sql).all(...params) as Record<string, unknown>[]

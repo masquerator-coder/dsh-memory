@@ -6,10 +6,12 @@
  *
  * Hard constraints honored here:
  *  - These are BACKGROUND ENHANCEMENTS. They never gate recall, and a dead /
- *    missing LLM degrades cleanly: L1 marks the episode `extracted=2` (skip,
- *    no pure-rule extraction — episode text is already compressed, rule
- *    extraction would be noise); L2 simply does not merge. The core store /
- *    recall / forget loop is untouched and never says "waiting on the model".
+ *    missing LLM degrades cleanly: with no resolvable route L1 skips episodes
+ *    untouched (retried once a route appears, M3 audit 2026-09-03); a failed
+ *    LLM call marks the episode `extracted=2` (skip, no pure-rule extraction —
+ *    episode text is already compressed, rule extraction would be noise); L2
+ *    simply does not merge. The core store / recall / forget loop is untouched
+ *    and never says "waiting on the model".
  *  - Every LLM decision is audited into `refine_runs` (route, status, decisions).
  *  - Background runs have no session context, so a route (provider/model) must
  *    be supplied explicitly; there is no request-header to fall back on.
@@ -128,8 +130,10 @@ export interface RefineInput {
  * Run L1 extraction over pending episodes. Per episode: LLM decides the stable
  * facts (or that there are none); approved facts are written through
  * store.batch (so dedup/quality/tier apply) and the episode is marked
- * extracted=1. A missing/failed route or unparseable output marks extracted=2
- * (degraded-skip) with an audit row. Budget overflow falls back to writing
+ * extracted=1. A missing route (M3, audit 2026-09-03: typically the cold-start
+ * window) SKIPS the episode untouched for a later pass; a failed route call or
+ * unparseable output marks extracted=2 (degraded-skip) with an audit row.
+ * Budget overflow falls back to writing
  * facts one-at-a-time so a tier-0 squeeze never loses facts silently.
  * R2 (review 2026-08-30): an episode whose facts are persistently rejected
  * (budget) is retried at most L1_MAX_WRITE_RETRIES times, then degraded —
@@ -206,28 +210,3 @@ export declare function runRefineLessonPromote(store: MemoryStore, input?: Lesso
     degraded: number;
     runIds: number[];
 }>;
-/** Build the add-meta judge prompt for one content string (DESIGN §3.1). */
-export declare function buildAddMetaPrompt(content: string): {
-    system: string;
-    user: string;
-};
-/** Parse add-meta judge output. Null on unparseable. */
-export declare function parseAddMetaJson(text: string): {
-    kind?: Kind;
-    importance?: number;
-} | null;
-/**
- * Judge add-meta (kind + importance) for one content (DESIGN §3.1), returning a
- * pair to merge into a write. Missing route / LLM failure → null (caller keeps
- * the rule defaults). This is the seam an add-site or a background calibration
- * pass calls; it never touches the agent context and never blocks the write.
- */
-export declare function judgeAddMeta(store: MemoryStore, content: string, input: {
-    llm?: LlmStreamSeam | null;
-    provider?: string;
-    model?: string;
-    timeoutMs?: number;
-}): Promise<{
-    kind?: Kind;
-    importance?: number;
-} | null>;

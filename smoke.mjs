@@ -29,6 +29,7 @@
  *   G23  R3-ui identity file read/write
  *   G24  review fixes 2026-08-31 (P1-1/P2-1/P2-3/P3-4)
  *   G25  review fixes 2026-09-02 (S1 truncation / G4 cross-layer flip)
+ *   G38  audit fixes 2026-09-03 (C1 replace metadata / M1 blank query / M3 no-route skip / M4 honest reject / M6 newest draft)
  *
  * Run: node smoke.mjs
  */
@@ -457,15 +458,20 @@ group('G13 L1 episodic → semantic extraction (LLM-decided)')
   assert('L1 llm-down audit status degraded', r2.status === 'degraded')
   db2.close()
 
-  // no route: pending episode degraded with null route (no hot-loop retry)
-  s.addEpisode({ sessionId: 'sess-d', summary: '没有任何路由配置时也应降级跳过且审计留空路由' })
-  const noRoute = await runRefineL1(s, {})
-  assert('L1 no-route degrades pending episode', noRoute.degraded === 1)
-  assert('L1 no-route episode not pending (no retry loop)', s.listEpisodesForRefine().length === 0)
+  // no route (M3, audit 2026-09-03): the cold-start window must NOT permanently
+  // degrade an episode that never saw an LLM — it stays pending (extracted=0)
+  // for the next pass with a route; no audit row, no hot loop (skip is free).
+  s.addEpisode({ sessionId: 'sess-d', summary: '没有任何路由配置时应跳过等待下次有路由再抽取' })
   const db3 = new DatabaseSync(s.dbPath)
-  const r3 = db3.prepare('SELECT status, llm_route FROM refine_runs ORDER BY id DESC LIMIT 1').get()
-  assert('L1 no-route audit route null + degraded', r3.status === 'degraded' && r3.llm_route === null)
+  const runsBefore = Number(db3.prepare('SELECT COUNT(*) AS c FROM refine_runs').get().c)
   db3.close()
+  const noRoute = await runRefineL1(s, {})
+  assert('L1 no-route skips episode without degrading', noRoute.degraded === 0 && noRoute.processed === 0)
+  assert('L1 no-route episode stays pending for retry (extracted=0)', s.listEpisodesForRefine().length === 1)
+  const db4 = new DatabaseSync(s.dbPath)
+  const runsAfter = Number(db4.prepare('SELECT COUNT(*) AS c FROM refine_runs').get().c)
+  assert('L1 no-route writes no new audit row', runsAfter === runsBefore)
+  db4.close()
   s.close()
   rmSync(t1, { recursive: true, force: true })
 }
@@ -1176,6 +1182,73 @@ group('G37 tier0 buildSection noise trims')
   assert('single usage report (header drops raw char count)', txt.includes('单条≤300') && txt.includes('记忆占用'))
   assert('does not duplicate raw-char usage in header', !txt.includes('占用 25字符'))
   s.close()
+}
+
+// ---------------------------------------------------------------------------
+group('G38 audit fixes 2026-09-03 (C1 / M1 / M3 / M4 / M6)')
+{
+  // C1: replace without explicit metadata must keep target's layer/kind/importance/epistemic.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g38a-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'user', kind: 'preference', importance: 5, epistemic: 'subjective', content: '用户长期偏好原始正文内容', topic: 'profile' }])
+    const row = s.activeEntries()[0]
+    s.batch([{ action: 'replace', id: row.id, content: '用户长期偏好更新后的正文内容' }])
+    const after = s.get(row.id)
+    assert('G38 C1 replace keeps user layer (immortality)', after.layer === 'user')
+    assert('G38 C1 replace keeps importance 5 (never-hard-delete guard)', after.importance === 5)
+    assert('G38 C1 replace keeps kind', after.kind === 'preference')
+    assert('G38 C1 replace keeps epistemic', after.epistemic === 'subjective')
+    assert('G38 C1 replace updates content', after.content === '用户长期偏好更新后的正文内容')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // M1: blank query returns [] and must not touch heat/frequency signals.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g38b-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', content: '空调温度偏好记录文本', importance: 4 }])
+    const before = s.activeEntries()[0]
+    assert('G38 M1 blank recall returns []', s.recall('   ').length === 0)
+    assert('G38 M1 blank recallEpisodes returns []', s.recallEpisodes('  ').length === 0)
+    const after = s.activeEntries()[0]
+    assert('G38 M1 blank recall does not touch access signals',
+      after.window_freq === before.window_freq && after.last_accessed === before.last_accessed)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // M4: cross-layer conflicting add is rejected with an actionable reason (no silent ok:true).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g38c-'))
+    const s = new MemoryStore(t)
+    const C = '跨层冲突如实上报的唯一正文内容'
+    s.batch([{ action: 'add', layer: 'user', importance: 5, content: C }])
+    const res = s.batch([{ action: 'add', layer: 'memory', content: C }])
+    assert('G38 M4 cross-layer add rejected (not silent ok)', res.applied.length === 0 && res.rejected.length === 1)
+    assert('G38 M4 rejection reason is actionable', res.rejected[0].reason.includes('replace'))
+    assert('G38 M4 authoritative row preserved untouched', s.activeEntries()[0].layer === 'user')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // M3: L1 with no resolvable route skips episodes (extracted stays 0), never degrades.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g38d-'))
+    const s = new MemoryStore(t)
+    s.addEpisode({ sessionId: 'sess-no-route', summary: '冷启动窗口的会话摘要' })
+    await runRefineL1(s, {}) // no llm/provider/model → no route
+    const eps = s.listEpisodesForRefine({ retryDegraded: true })
+    assert('G38 M3 no-route L1 leaves episode pending (extracted=0, not 2)', eps.length === 1 && eps[0].extracted === 0)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // M6: the instant judge must adjudicate the NEWEST draft first.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g38e-'))
+    const s = new MemoryStore(t)
+    s.recordFailure('mA', '旧内容一', '新内容一')
+    s.recordFailure('mB', '旧内容二', '新内容二')
+    let judged = null
+    const seam = { stream: async function* (cfg) { judged = JSON.parse(cfg.messages[0].content[0].text); yield { text: '[]' } } }
+    await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true, instant: true })
+    assert('G38 M6 instant judge sees the newest draft first', Array.isArray(judged) && judged[0]?.newContent === '新内容二')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
 }
 
 // ---------------------------------------------------------------------------

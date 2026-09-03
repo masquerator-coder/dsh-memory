@@ -95,15 +95,12 @@ export function qualityScore(content: string, existing: readonly MemoryEntry[]):
 }
 
 export const LOW_QUALITY = 30
-export const DEGRADED_HIGH = 60
 
 export function isLowQuality(score: number): boolean {
   return score <= LOW_QUALITY
 }
 
-/** Injection weight multiplier (0 = never injected; degraded entries down-weighted). */
-export function weightOf(score: number): number {
-  if (score >= DEGRADED_HIGH) return 1
-  if (score <= LOW_QUALITY) return 0
-  return score / 100
-}
+// weightOf (quality → injection-weight multiplier) removed 2026-09-03 as dead
+// code (audit L2): the injection path no longer uses a quality weight, and
+// DEGRADED_HIGH had no other consumer. Recoverable from git history if a
+// future calibration pass needs the curve.

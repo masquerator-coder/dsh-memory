@@ -283,10 +283,13 @@ export declare class MemoryStore {
      *  fallen-back lesson text. Zero LLM, synchronous, never throws. */
     private upsertLessonDraft;
     private fireLessonDraft;
-    /** List staged lesson drafts (oldest first). */
+    /** List staged lesson drafts (oldest first by default; `order: 'desc'` for
+     *  the instant judge, which must adjudicate the NEWEST draft — M6, audit
+     *  2026-09-03). The id tiebreaker keeps same-ms inserts deterministic. */
     listLessonDrafts(opts?: {
         status?: 'draft' | 'promoted' | 'dropped';
         limit?: number;
+        order?: 'asc' | 'desc';
     }): LessonDraft[];
     getLessonDraft(id: number): LessonDraft | undefined;
     markLessonDraftStatus(id: number, status: 'promoted' | 'dropped'): void;

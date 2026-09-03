@@ -6,10 +6,12 @@
  *
  * Hard constraints honored here:
  *  - These are BACKGROUND ENHANCEMENTS. They never gate recall, and a dead /
- *    missing LLM degrades cleanly: L1 marks the episode `extracted=2` (skip,
- *    no pure-rule extraction — episode text is already compressed, rule
- *    extraction would be noise); L2 simply does not merge. The core store /
- *    recall / forget loop is untouched and never says "waiting on the model".
+ *    missing LLM degrades cleanly: with no resolvable route L1 skips episodes
+ *    untouched (retried once a route appears, M3 audit 2026-09-03); a failed
+ *    LLM call marks the episode `extracted=2` (skip, no pure-rule extraction —
+ *    episode text is already compressed, rule extraction would be noise); L2
+ *    simply does not merge. The core store / recall / forget loop is untouched
+ *    and never says "waiting on the model".
  *  - Every LLM decision is audited into `refine_runs` (route, status, decisions).
  *  - Background runs have no session context, so a route (provider/model) must
  *    be supplied explicitly; there is no request-header to fall back on.
@@ -291,8 +293,10 @@ export interface RefineInput {
  * Run L1 extraction over pending episodes. Per episode: LLM decides the stable
  * facts (or that there are none); approved facts are written through
  * store.batch (so dedup/quality/tier apply) and the episode is marked
- * extracted=1. A missing/failed route or unparseable output marks extracted=2
- * (degraded-skip) with an audit row. Budget overflow falls back to writing
+ * extracted=1. A missing route (M3, audit 2026-09-03: typically the cold-start
+ * window) SKIPS the episode untouched for a later pass; a failed route call or
+ * unparseable output marks extracted=2 (degraded-skip) with an audit row.
+ * Budget overflow falls back to writing
  * facts one-at-a-time so a tier-0 squeeze never loses facts silently.
  * R2 (review 2026-08-30): an episode whose facts are persistently rejected
  * (budget) is retried at most L1_MAX_WRITE_RETRIES times, then degraded —
@@ -314,7 +318,13 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
       let facts: ExtractedFact[] | null = null
       let status: 'ok' | 'degraded' = 'ok'
       if (!hasRoute) {
-        status = 'degraded'
+        // M3 (audit 2026-09-03): no route resolved RIGHT NOW — typically the
+        // cold-start window (the boot-time first pass runs ~2min after start,
+        // often before any session header has taught a route). Skip WITHOUT
+        // marking extracted=2: permanently degrading an episode that never saw
+        // an LLM silently forfeits its extraction chance. Leave extracted=0 so
+        // the periodic pass retries once a route becomes available.
+        continue
       } else {
         const prompt = buildL1Prompt(ep.summary, ep.tools_used)
         const sha = contentId(`${ep.id}\n${ep.summary}`)
@@ -382,8 +392,14 @@ export async function runRefineL1(store: MemoryStore, input: RefineInput = {}): 
       stats.processed += 1
       stats.runIds.push(runId)
     } catch {
-      store.markEpisodeExtracted(ep.id, 2)
-      stats.runIds.push(store.writeRefineRun({ level: 1, sourceId: ep.id, route, decisions: '[]', status: 'error' }))
+      // M2 (audit 2026-09-03): guard the catch-block store calls (A3-parity
+      // with runRefineL2) — markEpisodeExtracted/writeRefineRun throw again
+      // when the DB is closed, which would escape the loop and break the
+      // "Never throws to the caller" contract.
+      try { store.markEpisodeExtracted(ep.id, 2) } catch { /* store closed */ }
+      try {
+        stats.runIds.push(store.writeRefineRun({ level: 1, sourceId: ep.id, route, decisions: '[]', status: 'error' }))
+      } catch { /* audit write failed too — count only */ }
       stats.degraded += 1
       stats.processed += 1
     }
@@ -565,6 +581,10 @@ export async function runRefineLessonPromote(store: MemoryStore, input: LessonPr
   const drafts = store.listLessonDrafts({
     status: 'draft',
     limit: input.limit ?? (input.instant ? 5 : 12),
+    // M6 (audit 2026-09-03): the instant (fire-and-forget after replace) judge
+    // must adjudicate the NEWEST drafts — listLessonDrafts defaults ASC (oldest
+    // first), which made "数秒成课" silently judge the oldest backlog instead.
+    order: input.instant ? 'desc' : 'asc',
   })
   if (drafts.length === 0) return stats
   const route = input.provider && input.model ? `${input.provider}/${input.model}` : undefined
@@ -622,55 +642,5 @@ export async function runRefineLessonPromote(store: MemoryStore, input: LessonPr
     } catch { /* per-draft isolated */ }
   }
   return stats
-}
-
-// ---- §3.1 add-meta judge (kind + importance light-weight injection) ----
-
-/** Build the add-meta judge prompt for one content string (DESIGN §3.1). */
-export function buildAddMetaPrompt(content: string): { system: string; user: string } {
-  const system =
-    'You classify one memory fact for an AI memory system. Output ONLY JSON: ' +
-    '{"kind": "preference|env|lesson|decision|general", "importance": 1-5}. ' +
-    'kind: preference = user stable like/dislike; env = environment fact that stays true; ' +
-    'lesson = hindsight learned from a correction; decision = one-off choice made (not a standing rule); ' +
-    'general = ordinary fact. importance reflects durability/protectiveness (5 = never forget).'
-  return { system, user: content }
-}
-
-/** Parse add-meta judge output. Null on unparseable. */
-export function parseAddMetaJson(text: string): { kind?: Kind; importance?: number } | null {
-  const cleaned = stripFence(text)
-  let obj: unknown
-  try { obj = JSON.parse(cleaned) } catch { return null }
-  if (obj === null || typeof obj !== 'object') return null
-  const it = obj as Record<string, unknown>
-  const kind = typeof it.kind === 'string' && (KINDS as readonly string[]).includes(it.kind) ? it.kind as Kind : undefined
-  let importance: number | undefined
-  if (typeof it.importance === 'number' && Number.isFinite(it.importance)) {
-    importance = Math.min(5, Math.max(1, Math.round(it.importance)))
-  }
-  if (!kind && !importance) return null
-  return { ...(kind ? { kind } : {}), ...(importance ? { importance } : {}) }
-}
-
-/**
- * Judge add-meta (kind + importance) for one content (DESIGN §3.1), returning a
- * pair to merge into a write. Missing route / LLM failure → null (caller keeps
- * the rule defaults). This is the seam an add-site or a background calibration
- * pass calls; it never touches the agent context and never blocks the write.
- */
-export async function judgeAddMeta(
-  store: MemoryStore,
-  content: string,
-  input: { llm?: LlmStreamSeam | null; provider?: string; model?: string; timeoutMs?: number },
-): Promise<{ kind?: Kind; importance?: number } | null> {
-  if (!input.llm || !input.provider || !input.model) return null
-  const prompt = buildAddMetaPrompt(content)
-  const raw = await llmText(input.llm, {
-    provider: input.provider!, model: input.model!, system: prompt.system, user: prompt.user,
-    maxTokens: 60, timeoutMs: input.timeoutMs,
-  })
-  if (raw === null) return null
-  return parseAddMetaJson(raw)
 }
 
