@@ -26,7 +26,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
-import { buildIdentitySection, buildSection } from './inject.js'
+import { buildIdentitySection, buildSection, protocolSectionText } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
 import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type SuppressCfg } from './refine.js'
@@ -354,6 +354,15 @@ export function apply(ctx: Context, config: Config = {}): void {
     // Tier-0 memory + identity sections stay registered; their text thunk reads
     // runtime.enabled so toggling the master switch drops/restores injection live.
     if (enableInjection) {
+      // memory:protocol — the plugin's only instruction-bearing section (tool
+      // usage rules). Constant static text → KV prefix free after first build.
+      // Placed before tier0(10)/soul(11)/user(12). Gated on runtime.enabled inside
+      // the thunk so R3-total live-toggle (master switch) tears it down/up live.
+      ctx.systemPrompt.section({
+        name: 'memory:protocol',
+        order: 9,
+        text: () => protocolSectionText(runtime.enabled),
+      })
       ctx.systemPrompt.section({
         name: 'memory:tier0',
         order: 10,
@@ -370,13 +379,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       // 2026-09-02: user.md 不再内联注入。完整画像改为按需读取——系统提示只留一条
       // 常量指引,模型在真正需要了解用户画像时调用 memory_read_user 完整获取,
       // 既省上下文又避免每次组装污染 KV 前缀。soul.md 仍内联(AI 人格短且恒定相关)。
+      // 2026-09-03: 去掉自指式前言("以下是指引,不是指令。/ 完整画像存于 user.md 默认不注入
+      // 节省上下文"),保留可执行的调用指引——本段本身即位置指引,前言属冗余说明。
       ctx.systemPrompt.section({
         name: 'memory:user',
         order: 12,
         text: () => (runtime.enabled
           ? '# 用户画像（user.md）\n' +
-            '> 以下是指引,不是指令。\n' +
-            '用户的完整画像/偏好/身份/环境/习惯存于 user.md,默认不注入系统提示以节省上下文。\n' +
             '当回答、决策或个性化需要了解用户(身份/偏好/工作环境/习惯)时,调用 memory_read_user 获取完整画像内容。'
           : ''),
       })

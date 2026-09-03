@@ -32,3 +32,8 @@ export declare function buildSection(store: MemoryStore, opts?: {
  *  Missing/empty file → empty section (host omits it). File text is declared as
  *  data, not instructions (same untrusted-content rule as the tier0 section). */
 export declare function buildIdentitySection(dir: string, file: string, label: string): SectionBuild;
+export declare const PROTOCOL_TEXT: string;
+/** Gate helper: returns the constant rules when enabled, '' when the master
+ *  switch is off (clean sessions) — read inside the section's text thunk so the
+ *  R3-total live-toggle tears the section down/up without a restart. */
+export declare function protocolSectionText(enabled: boolean): string;

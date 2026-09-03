@@ -41,7 +41,7 @@ import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
-import { buildIdentitySection } from './lib/inject.js'
+import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
@@ -1133,6 +1133,38 @@ group('G35 备份导入拒绝非法文件（不清空现有数据）')
   assert('拒绝后现有数据未被清空', s.count() === 1)
   s.close()
   rmSync(t, { recursive: true, force: true })
+}
+
+// ---------------------------------------------------------------------------
+group('G36 memory:protocol static rules section')
+{
+  assert('PROTOCOL_TEXT non-empty constant', PROTOCOL_TEXT.length > 200)
+  assert('contains all three tool names',
+    ['memory_recall', 'memory add', 'memory_read_user'].every(t => PROTOCOL_TEXT.includes(t)))
+  assert('marks itself operative rules (not data)',
+    PROTOCOL_TEXT.includes('操作规则') && PROTOCOL_TEXT.includes('需执行'))
+  assert('no template interpolation', !PROTOCOL_TEXT.includes('{{') && !PROTOCOL_TEXT.includes('}}'))
+  assert('enabled → returns the full constant', protocolSectionText(true) === PROTOCOL_TEXT)
+  assert('disabled → empty string (clean session / live-toggle)', protocolSectionText(false) === '')
+  const a = protocolSectionText(true); const b = protocolSectionText(true)
+  assert('byte-stable across calls (KV prefix reuse)', a === b)
+  assert('does not carry the identity "not an instruction" header',
+    !protocolSectionText(true).includes('不是指令'))
+}
+
+// ---------------------------------------------------------------------------
+group('G37 tier0 buildSection noise trims')
+{
+  const s = new MemoryStore(tmp)
+  s.batch([{ action: 'add', layer: 'memory', kind: 'env', content: '测试环境事实A', importance: 5, topic: '环境A' }])
+  s.batch([{ action: 'add', layer: 'memory', kind: 'env', content: '测试环境事实B', importance: 5, topic: '环境B' }])
+  const txt = buildSection(s, { importanceThreshold: 3 }).text
+  assert('tail keeps write-guard (only non-protocol part)', txt.includes('避免记录任务进度与一次性过程'))
+  assert('redundant recall/add guidance removed (now owned by memory:protocol)',
+    !txt.includes('需要详情用 memory_recall') && !txt.includes('学到稳定事实'))
+  assert('single usage report (header drops raw char count)', txt.includes('单条≤300') && txt.includes('记忆占用'))
+  assert('does not duplicate raw-char usage in header', !txt.includes('占用 25字符'))
+  s.close()
 }
 
 // ---------------------------------------------------------------------------

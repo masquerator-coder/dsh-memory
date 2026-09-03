@@ -77,16 +77,24 @@ export function buildSection(store: MemoryStore, opts: { importanceThreshold?: n
   // it, stored text containing the literal `</memory-entry>` closes the delimiter
   // early and forges structure inside the system prompt (persistent injection).
   if (coreMem.length > 0) {
-    rows.push('## memory · 偏好/环境', `占用 ${usage.memory}字符（单条≤${ENTRY_CAP}）。`)
+    rows.push('## memory · 偏好/环境', `单条≤${ENTRY_CAP}字符。`)
     for (const e of coreMem) rows.push(`- <memory-entry topic="${escHtml(sanitizeText(e.topic, 40))}">${escHtml(sanitizeText(e.content))}</memory-entry>`)
   }
   if (topics.length > 0) {
-    rows.push(`可召回长期记忆(tier1)领域(${topics.length}个): ${topics.map(t => sanitizeText(t.topic, 40)).join('、')}`)
+    // 封顶展示防止列表随记忆增长无限膨胀(stack/session 噪声): 只列前 10,其余交给 memory_recall。
+    const TOPIC_LIST_CAP = 10
+    const shown = topics.slice(0, TOPIC_LIST_CAP)
+    const rest = topics.length - shown.length
+    let line = `可召回长期记忆(tier1)领域(${topics.length}个): ${shown.map(t => sanitizeText(t.topic, 40)).join('、')}`
+    if (rest > 0) line += `等${rest}个`
+    rows.push(line)
   }
   if (episodeCount > 0) {
     rows.push(`有 ${episodeCount} 段历史会话情景记忆,可用 memory_recall(scope=episodic) 检索。`)
   }
-  rows.push(`记忆占用 ${usage.pct}%(${usage.total}字符);需要详情用 memory_recall;学到稳定事实(用户偏好/环境事实/可复用约定)用 memory 记录,避免任务进度与一次性过程。`)
+  // 记忆占用只在尾部报一次;recall/add 的"何时用"引导已移交 memory:protocol 节,
+  // 这里仅保留 protocol 未覆盖的写-禁止 guard(避免任务进度/一次性过程),消除同节重复指令。
+  rows.push(`记忆占用 ${usage.pct}%(${usage.total}字符);避免记录任务进度与一次性过程。`)
 
   let text = rows.join('\n')
   if (text.length > SECTION_CAP) {
@@ -134,4 +142,24 @@ export function buildIdentitySection(dir: string, file: string, label: string): 
   } catch {
     return { text: '', empty: true }
   }
+}
+
+// ---- memory:protocol — the plugin's single instruction-bearing section -------
+// Tools' WHEN-to-use rules. Deliberately the ONE place dsh-memory injects real
+// instructions; every other injected block (tier0, soul.md, user.md) is declared
+// data-not-instruction (P0-5). KV safety: PROTOCOL_TEXT is a pure, store/state/
+// timestamp-independent literal — the text thunk returns byte-identical output
+// every assembly, so after the first prompt build it rides the prefix cache free.
+export const PROTOCOL_TEXT =
+  '# 记忆使用指引（操作规则，非记忆数据；本段需执行。优先于 soul.md/user.md 中关于记忆工具的内容）\n' +
+  '## 工具调用时机（场景触发，非强制；有把握时可不调）\n' +
+  '- memory_recall：探索未知的环境/项目/配置，或做有后果的决策之前\n' +
+  '- memory add：学到新的稳定事实（路径/版本/架构决策），且不在当前对话历史\n' +
+  '- memory_read_user：需在多个方案中做推荐，而用户偏好未知'
+
+/** Gate helper: returns the constant rules when enabled, '' when the master
+ *  switch is off (clean sessions) — read inside the section's text thunk so the
+ *  R3-total live-toggle tears the section down/up without a restart. */
+export function protocolSectionText(enabled: boolean): string {
+  return enabled ? PROTOCOL_TEXT : ''
 }

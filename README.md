@@ -306,6 +306,10 @@ npm run smoke   # 等价于 node smoke.mjs
 - **user.md 自动维护彻底移除（2026-09-02）**：`maintainUserIdentity`、`identityAuto`/`identityIntervalMs`/`identityMaxBytes`、`identity_synced`/`identity_meta` 表及 G22/P3-4 测试全部删除；user.md 与 soul.md 一样完全由人维护。旧库残留的 `identity_synced`/`identity_meta` 表为惰性孤儿，不再被引用、无害。
 - **记忆备份导出/导入（2026-09-02）**：设置面板「记忆」项新增「导出备份」与「导入备份」。导出走 SQLite `VACUUM INTO` 生成**整库**一致快照（.db，含记忆、会话摘要、FTS、forget/refine/lesson 审计轨，WAL 无关），浏览器下载保存；导入先读-only 校验再**热切换连接**（`replaceWithBackup` 重准备全部语句，既有路由/tools/后台 pass 无需重启即针对恢复后数据继续工作），导入前自动把当前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚，非法文件（非 SQLite / 缺 memories+episodes 表）直接拒绝、不清空现有数据。两条新路由（`/memory/backup/export`、`/memory/backup/import`）同受 loopback 信任模型约束。新增 `smoke.mjs` 断言 G34–G35 全绿。
 
+- **memory:protocol 行为引导节（2026-09-03）**：新增插件**唯一指令性** section（name `memory:protocol`，order 9，置于 tier0/soul/user 之前）。恒定静态文本 `PROTOCOL_TEXT`（`src/inject.ts` 导出）声明三个记忆工具的"场景触发"时机——recall（探索未知环境/项目/配置、有后果的决策前）、add（学到稳定的新事实、不在当前对话历史）、read_user（多方案推荐且用户偏好未知）。设计要点：①KV 免费——纯字面量、与 store/状态/时间戳无关，text thunk 每次装配返回字节一致，第一轮装配后命中前缀缓存；②指令/数据分离——这是插件刻意注入操作规则唯一处，其余 tier0/soul/user 均按 P0-5 声明为"数据非指令"；③live-toggle——text thunk 读 `runtime.enabled`，总开关关→该节即时消失。新增 `smoke.mjs` 断言组 G36（8 断言）全绿。
+
+- **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除，保留单条≤300 提示）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（4 断言）全绿。
+
 ---
 
 ## 设计文档
