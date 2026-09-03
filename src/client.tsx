@@ -46,6 +46,17 @@ interface MemorySettingsValue {
   forgetEnabled?: boolean
   refineIntervalMs?: number
   peakHourSuppress?: boolean
+  /** R10: refine-model selection ('auto' | 'manual'). */
+  refineModelMode?: string
+  refineModelProvider?: string
+  refineModel?: string
+}
+
+/** R10: /memory/models payload for the refine-model picker. */
+interface RefineModelsPayload {
+  default: { provider?: string; model?: string }
+  candidates: { provider: string; model: string; name?: string }[]
+  failures: { id: string; name: string; message: string }[]
 }
 
 interface ScopeSnapshot {
@@ -117,6 +128,8 @@ interface PanelProps {
   exportBackup: () => Promise<SaveResult>
   /** Restore the store from a backup .db file (REPLACES all current data). */
   importBackup: (file: File) => Promise<{ ok: boolean; memories: number; episodes: number; error?: string }>
+  /** R10: fetch the host refine-model catalog for the model picker. */
+  loadModels: () => Promise<RefineModelsPayload>
 }
 
 /** Reactive snapshot value via the framework seat (scope.getSnapshot/subscribe). */
@@ -240,6 +253,11 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const [backupNote, setBackupNote] = useState<string | null>(null)
   const [backupError, setBackupError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  // R10: refine-model picker
+  const [models, setModels] = useState<RefineModelsPayload>({ default: {}, candidates: [], failures: [] })
+  useEffect(() => {
+    props.loadModels().then(setModels).catch(() => { /* route absent: only custom entry works */ })
+  }, [props.loadModels])
   useEffect(() => {
     props.loadIdentity().then(setIdentity).catch(() => { /* route absent: keep empty */ })
   }, [props.loadIdentity])
@@ -352,6 +370,88 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
           style={{ width: 64 }}
         />
       </label>
+
+      {/* R10: refine-model selection (auto follow vs manual pin). */}
+      {(() => {
+        const mode = value.refineModelMode === 'manual' ? 'manual' : 'auto'
+        const provider = value.refineModelProvider ?? ''
+        const model = value.refineModel ?? ''
+        const pairKey = `${provider}::${model}`
+        const hasCandidate = models.candidates.some((c) => `${c.provider}::${c.model}` === pairKey)
+        const defRoute = models.default && models.default.provider && models.default.model
+          ? `${models.default.provider}/${models.default.model}`
+          : null
+        return (
+          <div style={{ borderTop: '1px solid rgba(128,128,128,0.25)', padding: '8px 0', marginTop: 4 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 0' }}>
+              <span style={{ flex: 1 }}>
+                <div>凝练模型</div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>L1 抽取 / L2 合并 / 教训升格 / 会话收口等整理调用所用模型</div>
+              </span>
+              <select
+                value={mode}
+                disabled={!ready}
+                onChange={(e) => set('refineModelMode', e.target.value)}
+                style={{ padding: '4px 6px' }}
+              >
+                <option value="auto">自动（跟随会话 / dsh 默认）</option>
+                <option value="manual">手动指定</option>
+              </select>
+            </div>
+            {mode === 'manual' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '4px 0' }}>
+                <select
+                  value={hasCandidate ? pairKey : '__custom'}
+                  disabled={!ready}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (v === '__custom' || v === '') return
+                    const sep = v.indexOf('::')
+                    if (sep > 0) {
+                      set('refineModelProvider', v.slice(0, sep))
+                      set('refineModel', v.slice(sep + 2))
+                    }
+                  }}
+                  style={{ padding: '4px 6px' }}
+                >
+                  <option value="__custom">自定义…（手动输入）</option>
+                  {models.candidates.map((c) => (
+                    <option key={`${c.provider}::${c.model}`} value={`${c.provider}::${c.model}`}>
+                      {c.provider}/{c.model}
+                    </option>
+                  ))}
+                </select>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    placeholder="provider（如 deepseek-official）"
+                    disabled={!ready}
+                    value={provider}
+                    onChange={(e) => set('refineModelProvider', e.target.value)}
+                    style={{ width: 170, padding: '4px 6px' }}
+                  />
+                  <input
+                    placeholder="model（如 deepseek-v4-flash）"
+                    disabled={!ready}
+                    value={model}
+                    onChange={(e) => set('refineModel', e.target.value)}
+                    style={{ width: 170, padding: '4px 6px' }}
+                  />
+                </div>
+              </div>
+            )}
+            <div style={{ fontSize: 12, opacity: 0.75, paddingTop: 2 }}>
+              {mode === 'auto'
+                ? (defRoute ? `自动跟随：会话所用模型 → dsh 默认（${defRoute}）` : '自动跟随：会话所用模型 → dsh 默认模型')
+                : (provider && model ? `手动固定：${provider}/${model}` : '手动值未填完整，暂按自动跟随')}
+            </div>
+            {models.failures.length > 0 && (
+              <div style={{ fontSize: 11, opacity: 0.6, paddingTop: 2 }}>
+                部分提供方模型列表读取失败（{models.failures.map((f) => f.name).join('、')}）——可直接用“自定义…”输入。
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       <div style={{ display: 'flex', gap: 8, padding: '10px 0', borderTop: '1px solid rgba(128,128,128,0.25)', marginTop: 4 }}>
         <button type="button" disabled={triggering} onClick={() => { void runNow() }} style={{ padding: '6px 10px' }}>
@@ -532,6 +632,18 @@ export function apply(ctx: ClientContext): () => void {
     }
   }
 
+  /** R10: fetch the host refine-model catalog for the settings picker. */
+  const loadModels = async (): Promise<RefineModelsPayload> => {
+    const resp = await fetch('/memory/models', { cache: 'no-store' })
+    const data = await resp.json().catch(() => ({})) as Partial<RefineModelsPayload & { ok: boolean; error: string }>
+    if (!resp.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
+    return {
+      default: data.default && typeof data.default === 'object' ? data.default : {},
+      candidates: Array.isArray(data.candidates) ? data.candidates : [],
+      failures: Array.isArray(data.failures) ? data.failures : [],
+    }
+  }
+
   /** Download a full store snapshot as a .db attachment (browser download). */
   const exportBackup = async (): Promise<SaveResult> => {
     try {
@@ -580,7 +692,7 @@ export function apply(ctx: ClientContext): () => void {
       order: 50,
       label: () => '记忆',
       icon: <MemoryIcon />,
-      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView, exportBackup, importBackup }),
+      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView, exportBackup, importBackup, loadModels }),
     },
     MemorySettingsPanel,
   ))

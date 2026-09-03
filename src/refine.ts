@@ -59,6 +59,20 @@ export function resolveRefineRoute(
   return null
 }
 
+/** R10 (2026-09-03): settings-panel manual override for the refine LLM route.
+ *  A complete manual pair outranks every other source; an incomplete entry
+ *  (mode=manual but empty provider/model) returns undefined so callers fall
+ *  back to the auto chain instead of hard-degrading the pass. Pure — testable. */
+export function manualRefineOverride(
+  mode: 'auto' | 'manual' | undefined,
+  provider?: string,
+  model?: string,
+): RefineRoute | undefined {
+  if (mode !== 'manual') return undefined
+  if (provider && model) return { provider, model }
+  return undefined
+}
+
 /** One bounded peak-hour suppression window ("HH:MM" start/end, same-day). */
 export interface SuppressWindow { start: string; end: string }
 

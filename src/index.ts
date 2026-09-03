@@ -29,9 +29,9 @@ import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from '
 import { buildIdentitySection, buildSection, protocolSectionText } from './inject.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0, type L0Options } from './l0.js'
-import { isSuppressed, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type SuppressCfg } from './refine.js'
+import { isSuppressed, manualRefineOverride, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type RefineRoute, type SuppressCfg } from './refine.js'
 import { autocreateIdentityFiles } from './identity.js'
-import { registerControlRoutes, type MemoryControlHandlers, type RunNowResult } from './identity-routes.js'
+import { registerControlRoutes, type MemoryControlHandlers, type RefineModelCandidate, type RefineModelsPayload, type RunNowResult } from './identity-routes.js'
 import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
 import type { ForgetDays } from './types.js'
 
@@ -249,6 +249,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     lessonDraftEnabled: config.lessonDraftEnabled ?? MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled,
     lessonInstantJudge: config.lessonInstantJudge ?? MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge,
     lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
+    // R10: refine-model selection lives in the settings document (not cordis
+    // config) — auto by default, manual pin set from the settings panel.
+    refineModelMode: MEMORY_SETTINGS_DEFAULTS.refineModelMode,
+    refineModelProvider: MEMORY_SETTINGS_DEFAULTS.refineModelProvider,
+    refineModel: MEMORY_SETTINGS_DEFAULTS.refineModel,
   }
   const runtime = { ...settingsBase }
 
@@ -269,6 +274,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.lessonDraftEnabled = seed.lessonDraftEnabled
     runtime.lessonInstantJudge = seed.lessonInstantJudge
     runtime.lessonUseLlm = seed.lessonUseLlm
+    runtime.refineModelMode = seed.refineModelMode === 'manual' ? 'manual' : 'auto'
+    runtime.refineModelProvider = seed.refineModelProvider ?? ''
+    runtime.refineModel = seed.refineModel ?? ''
     // P3-6 (review 2026-08-31): keep the unsubscribe and call it on dispose —
     // relying on the host scope's lifetime silently leaked the watcher across
     // hot reloads.
@@ -280,8 +288,19 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.lessonDraftEnabled = next.lessonDraftEnabled
       runtime.lessonInstantJudge = next.lessonInstantJudge
       runtime.lessonUseLlm = next.lessonUseLlm
+      runtime.refineModelMode = next.refineModelMode === 'manual' ? 'manual' : 'auto'
+      runtime.refineModelProvider = next.refineModelProvider ?? ''
+      runtime.refineModel = next.refineModel ?? ''
     })
   }
+
+  // R10 (2026-09-03): settings-panel manual refine-model override — the TOP
+  // route source for every condensation LLM call (L1/L2/lesson/settle). A
+  // complete manual pair wins over cordis-config explicit routes, learned
+  // session routes, and the host default; an empty manual entry returns
+  // undefined so callers fall through to the existing auto chain.
+  const manualRefine = (): RefineRoute | undefined =>
+    manualRefineOverride(runtime.refineModelMode, runtime.refineModelProvider, runtime.refineModel)
 
   // P2-4 (review 2026-08-31): in-flight background tasks (L0 condensation,
   // idle settle, refine passes) are fire-and-forget async and write to the
@@ -348,6 +367,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         forgetArchivedEpi: 0,
         forgetDeletedEpi: 0,
       }),
+      // R10: stub until the closure below replaces it with the live catalog.
+      loadModels: async (): Promise<RefineModelsPayload> => ({ default: {}, candidates: [], failures: [] }),
     }
     const disposeControlRoutes = registerControlRoutes(ctx, store, controls)
 
@@ -510,11 +531,12 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (!force && runtime.peakHourSuppress && isSuppressed(new Date(), suppressCfg)) return
         if (l1Enabled) {
           const l1Route = resolveRefineRoute(
-            (config.l1Provider && config.l1Model)
+            manualRefine() ??
+            ((config.l1Provider && config.l1Model)
               ? { provider: config.l1Provider, model: config.l1Model }
               : (config.l0Provider && config.l0Model)
                 ? { provider: config.l0Provider, model: config.l0Model }
-                : undefined,
+                : undefined),
             learned,
             hostDefault,
           )
@@ -534,11 +556,12 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
         if (l2Enabled) {
           const l2Route = resolveRefineRoute(
-            (config.l2Provider && config.l2Model)
+            manualRefine() ??
+            ((config.l2Provider && config.l2Model)
               ? { provider: config.l2Provider, model: config.l2Model }
               : (config.l0Provider && config.l0Model)
                 ? { provider: config.l0Provider, model: config.l0Model }
-                : undefined,
+                : undefined),
             learned,
             hostDefault,
           )
@@ -557,9 +580,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         // route resolution / peak-hour / re-entrancy protection as L1/L2.
         if (runtime.lessonDraftEnabled) {
           const lessonRoute = resolveRefineRoute(
-            (config.l0Provider && config.l0Model)
+            manualRefine() ??
+            ((config.l0Provider && config.l0Model)
               ? { provider: config.l0Provider, model: config.l0Model }
-              : undefined,
+              : undefined),
             learned,
             hostDefault,
           )
@@ -585,9 +609,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed || !runtime.enabled) return
       if (!runtime.lessonInstantJudge || !runtime.lessonUseLlm || !runtime.lessonDraftEnabled) return
       const route = resolveRefineRoute(
-        (config.l0Provider && config.l0Model)
+        manualRefine() ??
+        ((config.l0Provider && config.l0Model)
           ? { provider: config.l0Provider, model: config.l0Model }
-          : undefined,
+          : undefined),
         learned,
         hostDefault,
       )
@@ -624,9 +649,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (now - p.lastActivity > L0_PENDING_STALE_MS) { l0Pending.delete(sid); continue }
         if (l0Summarize !== 'llm') { l0Pending.delete(sid); continue } // pure-rule mode: rule summary already live
         const route = resolveRefineRoute(
-          (config.l0Provider && config.l0Model)
+          manualRefine() ??
+          ((config.l0Provider && config.l0Model)
             ? { provider: config.l0Provider, model: config.l0Model }
-            : undefined,
+            : undefined),
           learned,
           hostDefault,
         )
@@ -683,6 +709,42 @@ export function apply(ctx: Context, config: Config = {}): void {
         forgetArchivedEpi: forget?.archivedEpi ?? 0,
         forgetDeletedEpi: forget?.deletedEpi ?? 0,
       }
+    }
+
+    // R10: refine-model catalog for the settings picker — enumerated lazily from
+    // the host LLM registry (ctx.llm.listProviders/listModels, the same source
+    // the dsh model picker uses). Providers whose model list fails are reported,
+    // not fatal; a host without the registry returns an empty candidate list and
+    // the UI still allows a fully custom provider/model entry.
+    controls.loadModels = async (): Promise<RefineModelsPayload> => {
+      const candidates: RefineModelCandidate[] = []
+      const failures: { id: string; name: string; message: string }[] = []
+      let hostDefault: { provider?: string; model?: string } = {}
+      try {
+        const sel = ctx.agentDefaultModel?.currentSelection?.()
+        if (sel?.provider && sel?.model) hostDefault = { provider: sel.provider, model: sel.model }
+      } catch { /* no default-model service */ }
+      const llm = ctx.llm as unknown as {
+        listProviders?: () => { id: string; name?: string }[]
+        listModels?: (providerId: string) => { id: string }[]
+      } | undefined
+      try {
+        const providers = typeof llm?.listProviders === 'function' ? llm.listProviders() : []
+        for (const p of providers) {
+          try {
+            const models = typeof llm?.listModels === 'function' ? await llm.listModels(p.id) : []
+            for (const m of Array.isArray(models) ? models : []) {
+              if (m && typeof m.id === 'string' && m.id.length > 0) {
+                candidates.push({ provider: p.id, model: m.id, ...(p.name ? { name: p.name } : {}) })
+              }
+            }
+          } catch (e) {
+            failures.push({ id: p.id, name: p.name ?? p.id, message: e instanceof Error ? e.message : String(e) })
+          }
+        }
+      } catch { /* llm seam missing → empty candidates */ }
+      candidates.sort((a, b) => (a.provider === b.provider ? a.model.localeCompare(b.model) : a.provider.localeCompare(b.provider)))
+      return { default: hostDefault, candidates, failures }
     }
 
     // Background loops start unconditionally; each run() gates runtime.enabled,

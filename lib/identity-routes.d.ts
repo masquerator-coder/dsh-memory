@@ -39,6 +39,30 @@ export interface RunNowResult {
 export interface MemoryControlHandlers {
     /** Run condensation (L1/L2) + identity maintenance + forgetting immediately. */
     runNow: () => Promise<RunNowResult>;
+    /** R10: enumerate the host LLM registry for the refine-model picker. */
+    loadModels: () => Promise<RefineModelsPayload>;
+}
+/** R10: one selectable refine-model candidate (host LLM registry entry). */
+export interface RefineModelCandidate {
+    provider: string;
+    model: string;
+    name?: string;
+}
+/** R10: payload of /memory/models — candidates from the live LLM registry
+ *  (the same source the dsh model picker uses) plus the host default route. */
+export interface RefineModelsPayload {
+    /** Host default model route (agentDefaultModel), for the auto hint. */
+    default: {
+        provider?: string;
+        model?: string;
+    };
+    candidates: RefineModelCandidate[];
+    /** Providers whose model list could not be read (kept for the UI hint). */
+    failures: {
+        id: string;
+        name: string;
+        message: string;
+    }[];
 }
 /** One memory row in the viewer digest. */
 export interface ViewMemory {

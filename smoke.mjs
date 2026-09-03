@@ -40,7 +40,7 @@ import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shoul
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
-import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
+import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
 import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { readFileSync, existsSync } from 'node:fs'
@@ -566,6 +566,17 @@ group('G16 auto-route resolution (explicit → learned session → host default)
   assert('no route → null (caller degrades)', r5 === null)
   const r6 = resolveRefineRoute(E, L, undefined)
   assert('explicit wins without host default too', r6?.provider === 'p-explicit')
+  // R10: manual refine-model override (settings panel) is the top source.
+  const m1 = manualRefineOverride('manual', 'p-manual', 'm-manual')
+  assert('R10 manual complete pair wins', m1?.provider === 'p-manual' && m1?.model === 'm-manual')
+  assert('R10 auto mode → no override', manualRefineOverride('auto', 'p-manual', 'm-manual') === undefined)
+  assert('R10 undefined mode → no override', manualRefineOverride(undefined, 'p-manual', 'm-manual') === undefined)
+  assert('R10 manual empty model → no override (falls to auto chain)', manualRefineOverride('manual', 'p-manual', '') === undefined)
+  assert('R10 manual empty provider → no override', manualRefineOverride('manual', '', 'm-manual') === undefined)
+  const eff1 = resolveRefineRoute(manualRefineOverride('manual', 'p-manual', 'm-manual') ?? E, L, H)
+  assert('R10 manual outranks explicit config/learned/host', eff1?.provider === 'p-manual')
+  const eff2 = resolveRefineRoute(manualRefineOverride('manual', 'p-manual', '') ?? E, L, H)
+  assert('R10 incomplete manual falls through to explicit config', eff2?.provider === 'p-explicit')
 }
 
 // ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 | 主动遗忘 | `forgetEnabled` | 关 → 暂停降级/归档/硬删，**不清理已有记忆** |
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
 | 凝练整理时间间隔（小时） | `refineIntervalMs` | 自定义 L1/L2 抽取与去重的周期扫描间隔（默认 1h，0.1h 起）；改小更及时更费 API、改大更省。新会话后 10 秒内仍会即时凝练一次（不受此间隔影响） |
+| 凝练模型（R10） | `refineModelMode` / `refineModelProvider` / `refineModel` | 记忆整理（L1 抽取/L2 合并/教训升格/会话收口）所用 LLM 的路由策略。**自动** = 跟随会话所用模型 → dsh 默认模型（含 cordis 显式 l1/l2/l0 路由）；**手动** = 固定用一个模型——下拉从 dsh 已配置模型（`GET /memory/models`，与 dsh 模型选择器同源的 LLM registry）里选，或选「自定义…」手填 provider/model。手动值填完整则**最高优先**于其余路由来源；未填完整自动回落，绝不硬降级 |
 | soul.md / user.md 编辑器 | — | 行内 textarea 编辑 + **保存**；旁有 **打开编辑** 按钮——经 `/memory/identity/open` 用系统默认编辑器打开磁盘上的真实文件（文件仍为真相源） |
 | 教训沉淀开关 | `lessonDraftEnabled` | 关 → 纠错仍记审计、草案滞留表内，但不做升格沉淀 |
 | 纠正即时判定 | `lessonInstantJudge` | 关 → 仅周期升格（默认 1h + 会话后 10s 触发），不做 replace 现场即时判定 |
@@ -174,7 +175,7 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
-**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
+**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/models`（R10：读取 dsh 已配置模型清单）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
 
 ---
 
@@ -242,7 +243,7 @@ enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section
 enabled: true                # false → 清洁会话，后台全部停；memory 工具保留
 ```
 
-**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress`——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
+**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress` / `lessonDraftEnabled` / `lessonInstantJudge` / `lessonUseLlm` / `refineModelMode` + `refineModelProvider` + `refineModel`（R10 凝练模型）——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
 
 ---
 
@@ -309,6 +310,8 @@ npm run smoke   # 等价于 node smoke.mjs
 - **记忆备份导出/导入（2026-09-02）**：设置面板「记忆」项新增「导出备份」与「导入备份」。导出走 SQLite `VACUUM INTO` 生成**整库**一致快照（.db，含记忆、会话摘要、FTS、forget/refine/lesson 审计轨，WAL 无关），浏览器下载保存；导入先读-only 校验再**热切换连接**（`replaceWithBackup` 重准备全部语句，既有路由/tools/后台 pass 无需重启即针对恢复后数据继续工作），导入前自动把当前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚，非法文件（非 SQLite / 缺 memories+episodes 表）直接拒绝、不清空现有数据。两条新路由（`/memory/backup/export`、`/memory/backup/import`）同受 loopback 信任模型约束。新增 `smoke.mjs` 断言 G34–G35 全绿。
 
 - **memory:protocol 行为引导节（2026-09-03）**：新增插件**唯一指令性** section（name `memory:protocol`，order 9，置于 tier0/soul/user 之前）。恒定静态文本 `PROTOCOL_TEXT`（`src/inject.ts` 导出）声明三个记忆工具的"场景触发"时机——recall（探索未知环境/项目/配置、有后果的决策前）、add（学到稳定的新事实、不在当前对话历史）、read_user（多方案推荐且用户偏好未知）。设计要点：①KV 免费——纯字面量、与 store/状态/时间戳无关，text thunk 每次装配返回字节一致，第一轮装配后命中前缀缓存；②指令/数据分离——这是插件刻意注入操作规则唯一处，其余 tier0/soul/user 均按 P0-5 声明为"数据非指令"；③live-toggle——text thunk 读 `runtime.enabled`，总开关关→该节即时消失。新增 `smoke.mjs` 断言组 G36（8 断言）全绿。
+- **凝练模型可选手动固定（R10，2026-09-03）**：设置面板「记忆」新增「凝练模型」——**自动**（跟随会话所用模型 → dsh 默认，含 cordis 显式 l1/l2/l0 路由）或**手动指定**（下拉从 `GET /memory/models` 枚举的 dsh LLM registry 已配置模型中选择，或选「自定义…」手填 provider/model）。手动完整 pair 通过 `manualRefineOverride` 成为 L1/L2/教训升格/会话收口全部整理 LLM 路由的**最高优先**来源（`src/index.ts` 5 处 resolveRefineRoute 统一接入）；未填完整自动回落、绝不硬降级。改动经设置文档 live 生效（免重启）。新增 `smoke.mjs` R10 断言（G16 扩展，+7 全绿）。
+- **L1 解析漂移一次纠错重试（R8，2026-09-03）**：`runRefineL1` 在硬解析失败（模型返回散文/fence/截断数组而非 JSON）时，把坏输出回灌做**一次有界纠错重试**再降级（不循环，最坏 ≤2×timeout；raw=null 超时/断流不重试，交给 R9）。同时**手动「立即整理」force=true 强制 `retryDegraded`**（R9）——降级（extracted=2）episode 不再永久跳过，每次手动整理都会复活重试；后台周期仍遵循 `l1RetryDegraded` 配置（默认 false）。
 
 - **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除，保留单条≤300 提示）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（4 断言）全绿。
 

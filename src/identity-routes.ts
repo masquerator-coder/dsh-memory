@@ -54,6 +54,25 @@ export interface RunNowResult {
 export interface MemoryControlHandlers {
   /** Run condensation (L1/L2) + identity maintenance + forgetting immediately. */
   runNow: () => Promise<RunNowResult>
+  /** R10: enumerate the host LLM registry for the refine-model picker. */
+  loadModels: () => Promise<RefineModelsPayload>
+}
+
+/** R10: one selectable refine-model candidate (host LLM registry entry). */
+export interface RefineModelCandidate {
+  provider: string
+  model: string
+  name?: string
+}
+
+/** R10: payload of /memory/models — candidates from the live LLM registry
+ *  (the same source the dsh model picker uses) plus the host default route. */
+export interface RefineModelsPayload {
+  /** Host default model route (agentDefaultModel), for the auto hint. */
+  default: { provider?: string; model?: string }
+  candidates: RefineModelCandidate[]
+  /** Providers whose model list could not be read (kept for the UI hint). */
+  failures: { id: string; name: string; message: string }[]
 }
 
 /** One memory row in the viewer digest. */
@@ -377,11 +396,26 @@ export function registerControlRoutes(
     })()
   }
 
+  /** Return the refine-model catalog for the settings picker (R10). */
+  const models: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'GET') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const payload = await handlers.loadModels()
+        writeJson(res, 200, { ok: true, ...payload })
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
   const routes: { path: string; handler: RouteHandler }[] = [
     { path: '/memory/identity', handler: identityEditor },
     { path: '/memory/identity/open', handler: identityOpen },
     { path: '/memory/trigger', handler: trigger },
     { path: '/memory/view', handler: view },
+    { path: '/memory/models', handler: models },
     { path: '/memory/backup/export', handler: backupExport },
     { path: '/memory/backup/import', handler: backupImport },
   ]
