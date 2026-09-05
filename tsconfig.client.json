@@ -1,4 +1,10 @@
 {
+  // IDE 默认配置 / 构建模板 —— 不在仓库里暴露任何开发机的真实绝对路径。
+  //
+  // 说明（2026-09-05）：同 tsconfig.json —— build.mjs 会把 `${DSH_HARNESS_ROOT}`
+  // 占位符替换成实测 harness 根目录，并同步把 `@types+react@<ver>` 替换成实际
+  // 探测到的最高语义版本，再生成临时 tsconfig.client.build.json 供 tsc 使用。
+  // IDE 直接读本文件时 `${DSH_HARNESS_ROOT}` 不会被展开，需先跑 build.mjs。
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
@@ -11,7 +17,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "typeRoots": ["D:/Apps/deepseek-harness/node_modules/.pnpm/@types+react@18.3.31/node_modules/@types"],
+    "typeRoots": ["${DSH_HARNESS_ROOT}/node_modules/.pnpm/@types+react@<REACT_VER>/node_modules/@types"],
     "types": ["react"]
   },
   "include": ["src/client.tsx"]

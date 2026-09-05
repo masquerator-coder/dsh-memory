@@ -33,7 +33,7 @@
  *
  * Run: node smoke.mjs
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryStore } from './lib/store.js'
@@ -44,7 +44,6 @@ import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWor
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
 import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
-import { readFileSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -1247,6 +1246,41 @@ group('G38 audit fixes 2026-09-03 (C1 / M1 / M3 / M4 / M6)')
     const seam = { stream: async function* (cfg) { judged = JSON.parse(cfg.messages[0].content[0].text); yield { text: '[]' } } }
     await runRefineLessonPromote(s, { llm: seam, provider: 'p', model: 'm', lessonUseLlm: true, instant: true })
     assert('G38 M6 instant judge sees the newest draft first', Array.isArray(judged) && judged[0]?.newContent === '新内容二')
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+group('G39 audit fixes 2026-09-05 (N1 force-remove snapshot + user-layer guard)')
+{
+  // N1: force-removing a user-layer memory is REFUSED (immortal); row preserved.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g39a-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'user', importance: 5, content: '用户层永生事实,禁止 force 物理删除的长正文内容' }])
+    const row = s.activeEntries()[0]
+    const res = s.batch([{ action: 'remove', id: row.id, force: true }])
+    assert('G39 N1 user-layer force-remove is rejected', res.applied.length === 0 && res.rejected.length === 1)
+    assert('G39 N1 rejection reason mentions soft-archive', res.rejected[0].reason.includes('soft-archive'))
+    assert('G39 N1 user fact preserved after refused force', s.get(row.id)?.layer === 'user')
+    // plain (non-force) remove still soft-archives a user fact — no rejection
+    const res2 = s.batch([{ action: 'remove', id: row.id }])
+    assert('G39 N1 plain remove on user layer still soft-archives', res2.applied.length === 1 && s.get(row.id)?.archived === true)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+  // N1: force-removing a memory-layer fact snapshots into forget_deleted (recoverable).
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g39b-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'memory', importance: 2, content: '将被 force 物理删除的一条普通记忆正文内容' }])
+    const row = s.activeEntries()[0]
+    s.batch([{ action: 'remove', id: row.id, force: true }])
+    assert('G39 N1 force-remove deletes the row', s.get(row.id) === undefined)
+    const db = new DatabaseSync(s.dbPath)
+    const snap = db.prepare('SELECT * FROM forget_deleted WHERE memory_id = ?').get(row.id)
+    db.close()
+    assert('G39 N1 force-remove snapshots content into forget_deleted', snap && String(snap.content).includes('force 物理删除'))
+    assert('G39 N1 snapshot reason is explicit-remove', snap && snap.reason === 'explicit-remove')
     s.close(); rmSync(t, { recursive: true, force: true })
   }
 }

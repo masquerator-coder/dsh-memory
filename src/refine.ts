@@ -474,7 +474,20 @@ export async function runRefineL2(store: MemoryStore, input: RefineInput & { min
         }
         // keep → no-op
       }
-      if (ops.length > 0) store.batch(ops, input.sessionId ?? 'l2-refine')
+      if (ops.length > 0) {
+        // M7a (audit 2026-09-05): the batch result used to be ignored — a tier-0
+        // overflow silently wrote nothing while the audit still claimed 'ok' AND
+        // M7 marked the cluster audited (so it was never offered again). Read the
+        // result: on overflow, record an honest 'ok-noop' and `continue` WITHOUT
+        // upsertL2Refined — facts are retained (lossless), and the cluster stays
+        // eligible once budget frees.
+        const batchRes = store.batch(ops, input.sessionId ?? 'l2-refine')
+        if (batchRes.overflowed) {
+          stats.runIds.push(store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: JSON.stringify(applied), status: 'ok-noop' }))
+          stats.clusters += 1
+          continue
+        }
+      }
       const runId = store.writeRefineRun({ level: 2, sourceId: cluster.seedId, promptSha: contentId(JSON.stringify(cluster.facts)), route, decisions: JSON.stringify(applied), status: 'ok' })
       stats.clusters += 1
       stats.verdictsApplied += applied.length
@@ -580,10 +593,14 @@ export async function runRefineLessonPromote(store: MemoryStore, input: LessonPr
   const stats = { promoted: 0, dropped: 0, degraded: 0, runIds: [] as number[] }
   const drafts = store.listLessonDrafts({
     status: 'draft',
-    limit: input.limit ?? (input.instant ? 5 : 12),
-    // M6 (audit 2026-09-03): the instant (fire-and-forget after replace) judge
-    // must adjudicate the NEWEST drafts — listLessonDrafts defaults ASC (oldest
-    // first), which made "数秒成课" silently judge the oldest backlog instead.
+    // M6/M7b (audit 2026-09-03/05): the instant (fire-and-forget after replace)
+    // judge must adjudicate EXACTLY the single newest draft — desc + limit 1.
+    // The 09-03 fix restored desc ordering but kept a limit of 5, so a busy
+    // backlog could still shift several stale drafts into a fire-and-forget
+    // judgement meant for the one just corrected (and re-judge them on every
+    // correction). limit 1 + desc isolates the newest; the periodic pass
+    // (order asc, limit 12) still clears the older backlog.
+    limit: input.limit ?? (input.instant ? 1 : 12),
     order: input.instant ? 'desc' : 'asc',
   })
   if (drafts.length === 0) return stats

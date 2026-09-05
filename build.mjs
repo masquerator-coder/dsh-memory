@@ -10,9 +10,11 @@
  *      (Node + client) via tsc;
  *   4. bundle src/client.tsx → lib/client.js (ModuleLoader format, react external).
  *
- * The checked-in tsconfig.json / tsconfig.client.json stay as IDE defaults for
- * the dev machine (D:/Apps/deepseek-harness); the build itself never trusts
- * those hardcoded values.
+ * The checked-in tsconfig.json / tsconfig.client.json act as IDE defaults and
+ * build TEMPLATES. They carry no real dev-machine path — paths use the
+ * `${DSH_HARNESS_ROOT}` placeholder, which this build substitutes with the
+ * auto-located harness root (and the auto-resolved @types/react version). The
+ * build never trusts any hardcoded absolute path, so it runs on any machine.
  */
 import { createRequire } from 'node:module'
 import { existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
@@ -75,14 +77,18 @@ function loadEsbuild() {
   throw new Error('[dsh-memory build] esbuild not found — run `npm i -D esbuild` or point DSH_HARNESS_ROOT at a repo that has it')
 }
 
-/** Emit a build tsconfig from the checked-in template: rewrite the dev-machine
- *  root and (for the client config) the hardcoded @types/react version with the
- *  auto-resolved ones. */
+/** Emit a build tsconfig from the checked-in template: rewrite the harness-root
+ *  placeholder and (for the client config) the hardcoded @types/react version
+ *  with the auto-resolved ones. The templates use `${DSH_HARNESS_ROOT}` as a
+ *  placeholder (a real dev-machine path is deliberately NOT committed; see
+ *  tsconfig.json), so this substitutes that token rather than any literal path. */
 function emitTsconfig(template, out, opts) {
   let text = readFileSync(template, 'utf8')
-  text = text.replaceAll('D:/Apps/deepseek-harness', harness)
+  text = text.split('${DSH_HARNESS_ROOT}').join(harness)
   if (opts.reactVersion) {
-    text = text.replace(/@types\+react@[\d.]+/g, `@types+react@${opts.reactVersion}`)
+    // Match whatever placeholder follows `@types+react@` (digits or a token like
+    // <REACT_VER>) and replace it with the actual auto-resolved version.
+    text = text.replace(/@types\+react@[^/ }]+/g, `@types+react@${opts.reactVersion}`)
   }
   writeFileSync(out, text)
 }

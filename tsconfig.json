@@ -1,4 +1,14 @@
 {
+  // IDE 默认配置 / 构建模板 —— 不在仓库里暴露任何开发机的真实绝对路径。
+  //
+  // 说明（2026-09-05）：
+  //  - 真正的构建走 `node build.mjs`：它先自动定位 deepseek-harness 根目录
+  //    （DSH_HARNESS_ROOT 环境变量 → 常见路径扫描），再把本文件里的
+  //    `${DSH_HARNESS_ROOT}` 占位符替换成实测根目录，生成临时
+  //    tsconfig.build.json 用于 tsc，用后即删。
+  //  - 因此在 IDE 中直接读本文件时，以下 paths / typeRoots 里的
+  //    `${DSH_HARNESS_ROOT}` 不会被 TS 展开，类型解析需先跑一次 build.mjs
+  //    （或在本机把 `${DSH_HARNESS_ROOT}` 另行替换为你的 harness 路径）。
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
@@ -14,15 +24,15 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true,
-    "typeRoots": ["D:/Apps/deepseek-harness/node_modules/@types"],
+    "typeRoots": ["${DSH_HARNESS_ROOT}/node_modules/@types"],
     "types": ["node"],
     "paths": {
-      "@deepseek-ai/cordis": ["D:/Apps/deepseek-harness/vendor/cordis/lib/types/index.d.ts"],
-      "@deepseek-ai/schemastery": ["D:/Apps/deepseek-harness/vendor/schemastery/lib/types/index.d.ts"],
-      "@deepseek-ai/dsh-agent": ["D:/Apps/deepseek-harness/packages/core/agent/lib/types/index.d.ts"],
-      "@deepseek-ai/dsh-llm": ["D:/Apps/deepseek-harness/packages/llm/llm/lib/types/index.d.ts"],
-      "@deepseek-ai/dsh-session": ["D:/Apps/deepseek-harness/packages/core/session/lib/types/index.d.ts"],
-      "@deepseek-ai/dsh-tools": ["D:/Apps/deepseek-harness/packages/core/tools/lib/types/index.d.ts"]
+      "@deepseek-ai/cordis": ["${DSH_HARNESS_ROOT}/vendor/cordis/lib/types/index.d.ts"],
+      "@deepseek-ai/schemastery": ["${DSH_HARNESS_ROOT}/vendor/schemastery/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-agent": ["${DSH_HARNESS_ROOT}/packages/core/agent/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-llm": ["${DSH_HARNESS_ROOT}/packages/llm/llm/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-session": ["${DSH_HARNESS_ROOT}/packages/core/session/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-tools": ["${DSH_HARNESS_ROOT}/packages/core/tools/lib/types/index.d.ts"]
     }
   },
   "include": ["src"],

@@ -28,27 +28,6 @@ export interface TurnTextSource {
     /** Text of the event's first text block, when it is a message-like event. */
     readonly text?: string;
 }
-/** Config-L0 knobs. All optional; defaults applied by the caller. */
-export interface L0Options {
-    /** 'llm' (default) uses ctx.llm when available with rule fallback; 'rules' is pure-rule only. */
-    summarize?: 'rules' | 'llm';
-    /** Explicit provider route; when absent L0 tries the session's request-header config. */
-    provider?: string;
-    /** Explicit model id; must pair with provider. */
-    model?: string;
-    /** Output-token cap for the LLM summarizer. Default 400. */
-    maxTokens?: number;
-    /** End-to-end LLM deadline ms. Default 8000. */
-    timeoutMs?: number;
-    /** Session id (used for episode provenance). */
-    sessionId?: string;
-    /** Abort signal (host shutdown / turn cancellation). */
-    signal?: AbortSignal;
-    /** Tool names used this turn, as a JSON string (episode.tools_used). */
-    toolsUsed?: string;
-    /** Topic label for the episode (default 'general'). */
-    topic?: string;
-}
 export declare const DEFAULT_L0_MAX_TOKENS = 400;
 export declare const DEFAULT_L0_TIMEOUT_MS = 8000;
 /**

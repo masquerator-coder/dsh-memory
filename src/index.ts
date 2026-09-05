@@ -459,7 +459,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     const l0Dispose = ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (!isCompletedTurnEnd(event)) return
       if (!runtime.enabled) return // R3-total: memory disabled → no auto condensation at all
-      if (l0InFlight >= L0_MAX_INFLIGHT) return // P1-10: cap concurrent condensation
       const turn = (event.data as { turn?: number } | null | undefined)?.turn
       // Resolve the model route (plan 2: auto from the session's request header).
       const cfg = session.requestHeader()?.config
@@ -467,19 +466,27 @@ export function apply(ctx: Context, config: Config = {}): void {
         learned.provider = cfg.provider
         learned.model = cfg.model
       }
+      // L11 (audit 2026-09-05): the old P1-10 in-flight cap was an early `return`
+      // BEFORE the per-turn buffering and refine kick — so during congestion a
+      // completed turn was never buffered for the idle-settle and never scheduled
+      // an L1 kick, silently starving those paths. Now only the runL0 dispatch is
+      // skipped under the cap; route teaching, text buffering, and kickRefine run
+      // regardless, so the congested turn still flows into settle + L1 later.
       // Realtime RULE summary (zero LLM) — keeps the episodic trace live while the
       // conversation runs; the LLM upgrade is deferred to the idle-settle pass.
-      const provider = config.l0Provider ?? cfg?.provider
-      const model = config.l0Model ?? cfg?.model
-      l0InFlight += 1
-      track(runL0(store, {
-        events: session.snapshotEvents() as readonly unknown[],
-        turn,
-        summarize: 'rules', // M5: turn-end never burns LLM — settle does
-        sessionId: session.id,
-        // P2-7: program errors (disk full, closed DB) must leave a trace.
-        onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
-      }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ }))
+      if (l0InFlight < L0_MAX_INFLIGHT) {
+        const provider = config.l0Provider ?? cfg?.provider
+        const model = config.l0Model ?? cfg?.model
+        l0InFlight += 1
+        track(runL0(store, {
+          events: session.snapshotEvents() as readonly unknown[],
+          turn,
+          summarize: 'rules', // M5: turn-end never burns LLM — settle does
+          sessionId: session.id,
+          // P2-7: program errors (disk full, closed DB) must leave a trace.
+          onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
+        }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ }))
+      }
 
       // Buffer this turn's texts for the idle LLM settle (bounded to last 200).
       // A5: incremental scan — only process events since last cursor.
@@ -694,12 +701,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     // await runRefine because the route caller wants feedback.
     controls.runNow = async (): Promise<RunNowResult> => {
       let refined = false
-      try {
-        await runRefine(true)
-        refined = true
-      } catch (err) {
-        if (!disposed) console.warn('[dsh-memory] manual refine failed:', err instanceof Error ? err.message : err)
-      }
+      // L12 (audit 2026-09-05): `runRefine` used to be awaited but never
+      // track()ed, so dispose's allSettled could close the store underneath a
+      // manual "立即整理" pass (result silently discarded). Tracking it now lets
+      // dispose wait; the HTTP caller still receives the awaited result.
+      const done = (async (): Promise<void> => {
+        try {
+          await runRefine(true)
+          refined = true
+        } catch (err) {
+          if (!disposed) console.warn('[dsh-memory] manual refine failed:', err instanceof Error ? err.message : err)
+        }
+      })()
+      track(done)
+      await done
       const forget = runForget()
       return {
         refined,
@@ -719,10 +734,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     controls.loadModels = async (): Promise<RefineModelsPayload> => {
       const candidates: RefineModelCandidate[] = []
       const failures: { id: string; name: string; message: string }[] = []
-      let hostDefault: { provider?: string; model?: string } = {}
+      // L7 (audit 2026-09-05): was `let hostDefault`, shadowing the outer const
+      // of the same name (boot-time route) — renamed to remove the misread.
+      let hostDefaultModel: { provider?: string; model?: string } = {}
       try {
         const sel = ctx.agentDefaultModel?.currentSelection?.()
-        if (sel?.provider && sel?.model) hostDefault = { provider: sel.provider, model: sel.model }
+        if (sel?.provider && sel?.model) hostDefaultModel = { provider: sel.provider, model: sel.model }
       } catch { /* no default-model service */ }
       const llm = ctx.llm as unknown as {
         listProviders?: () => { id: string; name?: string }[]
@@ -744,7 +761,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       } catch { /* llm seam missing → empty candidates */ }
       candidates.sort((a, b) => (a.provider === b.provider ? a.model.localeCompare(b.model) : a.provider.localeCompare(b.provider)))
-      return { default: hostDefault, candidates, failures }
+      return { default: hostDefaultModel, candidates, failures }
     }
 
     // Background loops start unconditionally; each run() gates runtime.enabled,

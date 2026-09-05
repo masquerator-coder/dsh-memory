@@ -26,15 +26,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { MemoryStore } from './store.js';
-/** Result of an immediate "整理记忆" pass, returned by the trigger route. */
-export interface RunNowResult {
-    refined: boolean;
-    forgetDemoted: number;
-    forgetArchivedMem: number;
-    forgetDeletedMem: number;
-    forgetArchivedEpi: number;
-    forgetDeletedEpi: number;
-}
+import type { RefineModelsPayload, RunNowResult } from './shared-types.js';
 /** Handlers wired in by the plugin entry (where the actual pass closures live). */
 export interface MemoryControlHandlers {
     /** Run condensation (L1/L2) + identity maintenance + forgetting immediately. */
@@ -42,53 +34,7 @@ export interface MemoryControlHandlers {
     /** R10: enumerate the host LLM registry for the refine-model picker. */
     loadModels: () => Promise<RefineModelsPayload>;
 }
-/** R10: one selectable refine-model candidate (host LLM registry entry). */
-export interface RefineModelCandidate {
-    provider: string;
-    model: string;
-    name?: string;
-}
-/** R10: payload of /memory/models — candidates from the live LLM registry
- *  (the same source the dsh model picker uses) plus the host default route. */
-export interface RefineModelsPayload {
-    /** Host default model route (agentDefaultModel), for the auto hint. */
-    default: {
-        provider?: string;
-        model?: string;
-    };
-    candidates: RefineModelCandidate[];
-    /** Providers whose model list could not be read (kept for the UI hint). */
-    failures: {
-        id: string;
-        name: string;
-        message: string;
-    }[];
-}
-/** One memory row in the viewer digest. */
-export interface ViewMemory {
-    id: string;
-    layer: string;
-    tier: number;
-    kind: string;
-    topic: string;
-    importance: number;
-    content: string;
-    created: number;
-    updated: number;
-    archived: boolean;
-    lowQuality: boolean;
-}
-/** Digest payload for the "查看记忆" viewer window. */
-export interface ViewPayload {
-    memories: ViewMemory[];
-    memoryCount: number;
-    episodeCount: number;
-    topics: {
-        topic: string;
-        count: number;
-    }[];
-    updatedMs: number;
-}
+export type { RefineModelCandidate, RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload, } from './shared-types.js';
 /**
  * Register the dsh-memory HTTP routes. Returns a disposer that only cancels the
  * registration retry timer; each route itself lives in a ctx.effect so the

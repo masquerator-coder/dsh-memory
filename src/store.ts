@@ -759,6 +759,22 @@ export class MemoryStore {
       const target = op.id ? this.get(op.id) : undefined
       if (!target) return { ok: false, error: `no entry with id ${op.id}` }
       if (op.force) {
+        // N1 (audit 2026-09-05): this model-reachable hard-delete path used to
+        // skip BOTH the user-layer immortality guard AND the forget_deleted
+        // snapshot that the active-forgetting hard-delete path guarantees
+        // (P1-13) — so a single `remove force=true` could permanently destroy
+        // even a DESIGN-eternal user-layer fact with zero audit trail.
+        //  1. user layer is immortal: a force hard-delete is refused (the model
+        //     can still soft-archive a user fact via a plain `remove`).
+        //  2. every other force hard-delete snapshots into forget_deleted
+        //     (content + reason) BEFORE the physical delete, matching forgetRun
+        //     — "删了能查、误删能回滚" now holds for the explicit-force face too.
+        if (target.layer === 'user') {
+          return { ok: false, error: `layer=user memories are immortal; force-delete refused — use remove(id) to soft-archive, or replace(id) to amend` }
+        }
+        this.stmt(
+          'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
+        ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now), 'explicit-remove')
         this.hardDeleteMemory(target.id)
       } else {
         this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, target.id)

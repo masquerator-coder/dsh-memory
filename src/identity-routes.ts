@@ -27,6 +27,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
+// L14 (audit 2026-09-05): HTTP-payload types are shared with the browser client
+// via shared-types.ts (pure types → erased at compile time, zero runtime cost).
+import type {
+  RefineModelCandidate,
+  RefineModelsPayload,
+  RunNowResult,
+  ViewMemory,
+  ViewPayload,
+} from './shared-types.js'
 import { readIdentityFiles, writeIdentityFile } from './identity.js'
 import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
@@ -40,16 +49,6 @@ const LOOPBACK_IPS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
  *  identity directory via path traversal. */
 const IDENTITY_FILE = { soul: 'soul.md', user: 'user.md' } as const
 
-/** Result of an immediate "整理记忆" pass, returned by the trigger route. */
-export interface RunNowResult {
-  refined: boolean
-  forgetDemoted: number
-  forgetArchivedMem: number
-  forgetDeletedMem: number
-  forgetArchivedEpi: number
-  forgetDeletedEpi: number
-}
-
 /** Handlers wired in by the plugin entry (where the actual pass closures live). */
 export interface MemoryControlHandlers {
   /** Run condensation (L1/L2) + identity maintenance + forgetting immediately. */
@@ -58,46 +57,16 @@ export interface MemoryControlHandlers {
   loadModels: () => Promise<RefineModelsPayload>
 }
 
-/** R10: one selectable refine-model candidate (host LLM registry entry). */
-export interface RefineModelCandidate {
-  provider: string
-  model: string
-  name?: string
-}
-
-/** R10: payload of /memory/models — candidates from the live LLM registry
- *  (the same source the dsh model picker uses) plus the host default route. */
-export interface RefineModelsPayload {
-  /** Host default model route (agentDefaultModel), for the auto hint. */
-  default: { provider?: string; model?: string }
-  candidates: RefineModelCandidate[]
-  /** Providers whose model list could not be read (kept for the UI hint). */
-  failures: { id: string; name: string; message: string }[]
-}
-
-/** One memory row in the viewer digest. */
-export interface ViewMemory {
-  id: string
-  layer: string
-  tier: number
-  kind: string
-  topic: string
-  importance: number
-  content: string
-  created: number
-  updated: number
-  archived: boolean
-  lowQuality: boolean
-}
-
-/** Digest payload for the "查看记忆" viewer window. */
-export interface ViewPayload {
-  memories: ViewMemory[]
-  memoryCount: number
-  episodeCount: number
-  topics: { topic: string; count: number }[]
-  updatedMs: number
-}
+// RunNowResult / RefineModelCandidate / RefineModelsPayload / ViewMemory /
+// ViewPayload now live in shared-types.ts (L14) and are re-exported so existing
+// consumers importing them from this module (index.ts) keep working unchanged.
+export type {
+  RefineModelCandidate,
+  RefineModelsPayload,
+  RunNowResult,
+  ViewMemory,
+  ViewPayload,
+} from './shared-types.js'
 
 /** Get the remote IP from the request socket (transport-layer, cannot be spoofed). */
 function getRemoteIp(req: unknown): string {

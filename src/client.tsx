@@ -17,6 +17,9 @@
  * inputs — the necessary information only.
  */
 import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
+// L14 (audit 2026-09-05): HTTP-payload types shared with the Node server via
+// shared-types.ts (pure types — erased at compile time, zero bytes in the bundle).
+import type { RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload } from './shared-types.js'
 
 /**
  * Memory/nav glyph — a neuron (soma + radiating dendrites + synapse nodes),
@@ -52,13 +55,6 @@ interface MemorySettingsValue {
   refineModel?: string
 }
 
-/** R10: /memory/models payload for the refine-model picker. */
-interface RefineModelsPayload {
-  default: { provider?: string; model?: string }
-  candidates: { provider: string; model: string; name?: string }[]
-  failures: { id: string; name: string; message: string }[]
-}
-
 interface ScopeSnapshot {
   status: 'loading' | 'ready' | 'unavailable'
   value?: MemorySettingsValue
@@ -79,38 +75,6 @@ interface IdentityFiles {
 interface SaveResult {
   ok: boolean
   error?: string
-}
-
-/** Result of an immediate /memory/trigger pass. */
-interface RunNowResult {
-  refined: boolean
-  forgetDemoted: number
-  forgetArchivedMem: number
-  forgetDeletedMem: number
-  forgetArchivedEpi: number
-  forgetDeletedEpi: number
-}
-
-/** One memory row from /memory/view. */
-interface ViewMemory {
-  id: string
-  layer: string
-  tier: number
-  kind: string
-  topic: string
-  importance: number
-  content: string
-  created: number
-  updated: number
-}
-
-/** Digest payload from /memory/view. */
-interface ViewPayload {
-  memories: ViewMemory[]
-  memoryCount: number
-  episodeCount: number
-  topics: { topic: string; count: number }[]
-  updatedMs: number
 }
 
 interface PanelProps {
