@@ -49,6 +49,8 @@ interface MemorySettingsValue {
   forgetEnabled?: boolean
   refineIntervalMs?: number
   peakHourSuppress?: boolean
+  /** time-injection: prepend current real-world date to the system prompt. */
+  timeInjection?: boolean
   /** R10: refine-model selection ('auto' | 'manual'). */
   refineModelMode?: string
   refineModelProvider?: string
@@ -301,6 +303,13 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         checked={value.enabled ?? true}
         disabled={!ready}
         onChange={(next) => set('enabled', next)}
+      />
+      <Toggle
+        label="系统提示注入当前日期"
+        hint="会话开始时在系统提示词里加上真实世界日期（互联网授时、本机时区），让模型不复陷入‘不知道今天是几号’"
+        checked={value.timeInjection ?? true}
+        disabled={!ready}
+        onChange={(next) => set('timeInjection', next)}
       />
       <Toggle
         label="忙闲时段抑制扫描"

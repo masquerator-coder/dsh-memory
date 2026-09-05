@@ -40,6 +40,9 @@ export interface MemorySettings {
     lessonInstantJudge: boolean;
     /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
     lessonUseLlm: boolean;
+    /** time-injection: prepend the current real-world date (internet-anchored,
+     *  system timezone) to the system prompt. Default true. */
+    timeInjection: boolean;
     /** R10: 'auto' → follow the existing route chain; 'manual' → pin to the pair
      *  below. Incomplete manual (empty provider/model) falls back to auto. */
     refineModelMode: RefineModelMode;
@@ -54,6 +57,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonDraftEnabled: z<boolean, boolean>;
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
+    timeInjection: z<boolean, boolean>;
     refineModelMode: z<"auto" | "manual", "auto" | "manual">;
     refineModelProvider: z<string, string>;
     refineModel: z<string, string>;
@@ -65,6 +69,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonDraftEnabled: z<boolean, boolean>;
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
+    timeInjection: z<boolean, boolean>;
     refineModelMode: z<"auto" | "manual", "auto" | "manual">;
     refineModelProvider: z<string, string>;
     refineModel: z<string, string>;

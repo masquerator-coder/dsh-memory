@@ -129,14 +129,32 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 
 两者通过设置面板的 **保存 / 打开编辑** 或直接手改文件维护（`<memoryHome>/memory/*.md`），作为恒定 section 注入（mtime 变化才重读，KV 缓存友好），不与 memories 表混管（不该被热度/遗忘管）。Windows 写入无 BOM UTF-8。
 
-### 2.4 后台维护
+### 2.4 当前日期注入（time-injection）
+
+解决"大模型不知道自己处于真实世界哪一天"（训练截止 ≠ 现在）。会话开始时在系统提示词里预置一条**当前真实世界日期** section（`name: memory:time`，order 5，置于大多 section 之前）：
+
+- **日期来自互联网**：后台刷新循环（默认每 15 分钟一次，`timeRefreshIntervalMs`）从公开授时 API 取权威 UTC 时刻（`worldtimeapi.org` → `timeapi.io` 依次尝试，单次超时 5s），再套用**当前系统时区**渲染成本地日期。
+- **联网失败兜底**：离线/被墙/超时时回退到**本机时钟**继续注入（来源标注为"本机"，模型永远看得到日期），绝不让该节整体缺席。
+- **只注入日期，不含时刻**（KV 友好）：文本在一天内字节稳定，前缀尽量命中缓存而非每次装配抖动。
+- **live 开关**：设置面板「系统提示注入当前日期」，或 cordis 配置 `timeInjection: false` 关闭；关时该节输出空串即时消失，无需重启。
+- 示例：
+  ```
+  # 当前真实世界日期
+  今天是 2026年9月5日 星期六。
+  > 日期来源：互联网授时校准（权威）。时区：Asia/Shanghai
+  > 上述日期为真实世界日期，非模型训练截止知识；……
+  ```
+
+> 定位说明：DSH 自身另有 `@deepseek-ai/dsh-time-context`（按请求往会话历史追加"采样时刻"，本机时间、非系统提示、非互联网授时）。本插件的 `memory:time` 是**系统提示内置、互联网授时、本机时区**的日期节，二者定位不同、可共存。/ 新增 `smoke.mjs` 断言组 G40（22 断言）全绿。
+
+### 2.5 后台维护
 
 - **L0 会话收口**：turn-end 只做零 LLM 规则留痕；会话空闲 ≥ `l0IdleMinutes` 后一次性 LLM 收口为 episode 摘要。
 - **L1/L2 凝练**（情景→事实抽取 + 语义簇合并/去重）：由 `scheduleRefine` 按 `refineIntervalMs`（默认 1h，设置面板可自定义）周期扫描；新会话摘要落库后约 10 秒即时触发一次（M6 kick，不受间隔影响）。可随时用面板「立即整理记忆」手动触发（绕过忙闲时段）。
 - **每日主动遗忘**：`runForget` 按热度/重要性/时间执行三级阶梯，受 `enabled` 与 `forgetEnabled` 双闸门实时控制。
 - **峰时抑制**：默认北京 09–12 / 14–18 点（含前 15 分钟）跳过后台 LLM 凝练，省 API 费用。
 
-### 2.5 关于 KV Cache（配置注意事项）
+### 2.6 关于 KV Cache（配置注意事项）
 
 Tier0 section 每次装配现算。写入路径会按"从第一个变动的 token 起复用失效"影响前缀缓存命中：**append-only** 代价最小；**replace/remove** 位置之后的 token 全量重算。因此建议：跨会话稳定的记忆尽量在会话早期写入；频繁检索走 `memory_recall`（不落盘、不动 section）；不要在会话中途反复改预算/开关。
 
@@ -239,11 +257,15 @@ peakHourSuppress: true       # false → 任何时段都跑后台 LLM
 # --- M9 身份块 ---
 enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section
 
+# --- time-injection：系统提示注入当前日期 ---
+timeInjection: true                  # 注入真实世界日期（互联网授时 / 本机时区）
+timeRefreshIntervalMs: 900000        # 互联网日期重校间隔 ms（默认 15 分钟）
+
 # --- R3-total：记忆总开关 ---
 enabled: true                # false → 清洁会话，后台全部停；memory 工具保留
 ```
 
-**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress` / `lessonDraftEnabled` / `lessonInstantJudge` / `lessonUseLlm` / `refineModelMode` + `refineModelProvider` + `refineModel`（R10 凝练模型）——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
+**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress` / `lessonDraftEnabled` / `lessonInstantJudge` / `lessonUseLlm` / `timeInjection` / `refineModelMode` + `refineModelProvider` + `refineModel`（R10 凝练模型）——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
 
 ---
 
@@ -301,7 +323,7 @@ npm run smoke   # 等价于 node smoke.mjs
 - **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）、教训沉淀管道、整库备份导出/导入——`smoke.mjs` 全部断言组（219 项，G1–G35）全绿、稳定连跑，`tsc` 零错误。
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
 - **后台凝练 L1/L2**：周期性运行（默认 1h，面板可自定义间隔），情景→事实抽取 + 语义簇合并/去重，受忙闲时段抑制；新会话落库 10 秒内即时触发一次；亦可面板「立即整理记忆」手动触发。LLM 降级时不退化为纯规则硬抽（标记 degraded）。
-- **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.5）。
+- **KV Cache**：Tier0 现算，写路径会按变动位置影响前缀缓存命中（见 §2.6）。
 - **去重 + 身份权威化（2026-08-31）**：① 写时近重复合并 `findCanonical`（严格门）+ L1 同通道受益；② `isNearDupCandidate` token 宽松门支撑跨 topic 分组；③ `crossTopicNearDupGroups` 接入 L2 周期，破除按 topic 聚类边界；④ `layer=user` 移出 Tier0 注入 —— user.md 转人写权威（画像只经 user.md 呈现）。
 - **user.md 按需加载（2026-09-02）**：完整画像不再内联注入系统提示（省上下文、稳 KV 前缀），系统提示仅留一条指引；模型确需了解用户画像时调用 `memory_read_user` 工具读取 user.md。
 - **设置面板控制面（2026-09-02）**：soul/user 编辑器新增「打开编辑」（`/memory/identity/open` 默认编辑器打开磁盘文件）；新增「立即整理记忆」（`/memory/trigger`，绕过忙闲时段立即执行凝练+遗忘并回显结果）与「查看记忆」（`/memory/view` 只读弹窗）；「凝练整理时间间隔」可在面板自定义（`refineIntervalMs`），改动 live 生效。新增路由全部 loopback 校验。

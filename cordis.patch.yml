@@ -10,6 +10,8 @@
       name: dsh-memory
       config:
         enableInjection: true # always-on Tier-0 memory section in the system prompt
+        # timeInjection: true         # prepend current real-world date (internet-anchored, local tz) to the system prompt
+        # timeRefreshIntervalMs: 900000  # ms between internet date re-pins (default 15 min)
         # forgetEnabled: true     # active forgetting (demote/archive/hard-delete)
         # forgetDays:             # expected time-to-forget (days until heat ≈ 0.05)
         #   env: 365

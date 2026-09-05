@@ -30,6 +30,7 @@
  *   G24  review fixes 2026-08-31 (P1-1/P2-1/P2-3/P3-4)
  *   G25  review fixes 2026-09-02 (S1 truncation / G4 cross-layer flip)
  *   G38  audit fixes 2026-09-03 (C1 replace metadata / M1 blank query / M3 no-route skip / M4 honest reject / M6 newest draft)
+ *   G40  time-injection (internet-anchored date → local tz, local fallback)
  *
  * Run: node smoke.mjs
  */
@@ -43,6 +44,7 @@ import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerd
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
 import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
+import { fetchInternetEpochMs, formatLocalDate, renderDateSection, resolveSystemTimeZone, TimeSource } from './lib/time-ctx.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -842,6 +844,76 @@ group('G23 R3-ui identity file read/write')
   // The writer is narrowed to soul/user — no path escape.
   assert('G23 write only accepts soul/user', existsSync(join(t, 'soul.md')) && existsSync(join(t, 'user.md')))
   rmSync(t, { recursive: true, force: true })
+}
+
+// G40 — time-injection (internet-anchored date, local tz, local fallback)
+group('G40 time-injection (internet date → local tz, local fallback)')
+{
+  // fetchInternetEpochMs: parses a worldtimeapi-style unixtime (seconds).
+  const okFetch = async () => ({ ok: true, json: async () => ({ unixtime: 1_700_000_000 }) })
+  const epoch = await fetchInternetEpochMs(['https://x.example/utc'], 1000, okFetch)
+  assert('G40 parses unixtime seconds → epoch ms', epoch === 1_700_000_000_000)
+
+  // milliseconds field is passed through, seconds field ×1000.
+  const msFetch = async () => ({ ok: true, json: async () => ({ epochSeconds: 2_000_000_000 }) })
+  const epochMs = await fetchInternetEpochMs(['https://x.example/utc'], 1000, msFetch)
+  assert('G40 parses epochSeconds seconds → epoch ms', epochMs === 2_000_000_000_000)
+
+  // non-ok / parse failure / unsupported fetch → null (caller degrades to local).
+  const badResponse = async () => ({ ok: false, json: async () => ({}) })
+  assert('G40 non-ok response → null', await fetchInternetEpochMs(['https://x.example/utc'], 1000, badResponse) === null)
+  assert('G40 missing fetch impl → null', await fetchInternetEpochMs(['https://x.example/utc'], 1000, undefined) === null)
+  assert('G40 throwing fetch → null (tries next, then null)', await fetchInternetEpochMs(['https://a/x', 'https://b/x'], 1000, async () => { throw new Error('boom') }) === null)
+
+  // Endpoint fallback: first endpoint fails, second succeeds.
+  const flipping = ((n) => async () => {
+    n[0] += 1
+    if (n[0] === 1) throw new Error('first down')
+    return { ok: true, json: async () => ({ unixtime: 3_000_000_000 }) }
+  })([0])
+  const fall = await fetchInternetEpochMs(['https://a/x', 'https://b/x'], 1000, flipping)
+  assert('G40 falls through to second endpoint', fall === 3_000_000_000_000)
+
+  // TimeSource: internet pin sets skew; current() extrapolates with local now().
+  let t = 123_456_789_012
+  const clock = () => t
+  const src = new TimeSource({ fetchImpl: async () => ({ ok: true, json: async () => ({ unixtime: 123_456_790 }) }), now: clock, refreshIntervalMs: 60_000 })
+  assert('G40 fresh source (no pin yet) → local', src.current().source === 'local')
+  const pinned = await src.refresh()
+  assert('G40 refresh succeeded', pinned === true)
+  assert('G40 after pin → internet source', src.current().source === 'internet')
+  // unixtime 123456790 s = 123456790000 ms; local = 123456789012 → skew = +988
+  assert('G40 skew applied to a later local now', src.current().epochMs === t + 988)
+  t += 1000
+  assert('G40 current() tracks local clock + skew (≈instant)', src.current().epochMs === t + 988)
+  src.dispose()
+
+  // TimeSource: all-fetch-fail keeps source local, current() still resolves.
+  let calls = 0
+  const dead = new TimeSource({ fetchImpl: async () => { calls++; throw new Error('offline') }, now: clock, refreshIntervalMs: 60_000 })
+  await dead.refresh()
+  assert('G40 failed pin stays local source', dead.current().source === 'local')
+  assert('G40 failed pin current() still returns local instant', Number.isFinite(dead.current().epochMs))
+  dead.dispose()
+
+  // Renderer: date-only, system/local timezone, data-not-instruction framing.
+  const tz = resolveSystemTimeZone()
+  assert('G40 resolveSystemTimeZone returns a non-empty zone', tz.length > 0)
+  const disabled = renderDateSection(false, { epochMs: Date.now(), source: 'internet' }, tz)
+  assert('G40 disabled → empty string', disabled === '')
+  const rd = renderDateSection(true, { epochMs: Date.now(), source: 'internet' }, tz)
+  assert('G40 enabled section has header', rd.includes('# 当前真实世界日期'))
+  assert('G40 enabled section contains 今天是', rd.includes('今天是'))
+  assert('G40 internet source annotated', rd.includes('互联网授时'))
+  assert('G40 section embeds the resolved timezone', rd.includes(tz))
+  const rl = renderDateSection(true, { epochMs: Date.now(), source: 'local' }, tz)
+  assert('G40 local source annotated as local-clock', rl.includes('本机时钟') && rl.includes('以本机为准'))
+  // date-only → no time-of-day digits (no ':' hour boundaries) keeps it day-stable
+  assert('G40 section is date-only (no clock minutes "分")', !rd.includes('分：') && !/:(\d{2})/.test(rd))
+  // formatLocalDate determinism for a fixed instant
+  const d1 = formatLocalDate(1_700_000_000_000, 'UTC')
+  const d2 = formatLocalDate(1_700_000_000_000, 'UTC')
+  assert('G40 formatLocalDate is deterministic', d1 === d2 && d1.includes('2023'))
 }
 
 // G24 — review fixes 2026-08-31 (P1-1 near-dup merge survival / P2-1 metadata

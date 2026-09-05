@@ -27,6 +27,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
 import { buildIdentitySection, buildSection, protocolSectionText } from './inject.js'
+import { resolveSystemTimeZone, renderDateSection, TimeSource } from './time-ctx.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0 } from './l0.js'
 import { isSuppressed, manualRefineOverride, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type RefineRoute, type SuppressCfg } from './refine.js'
@@ -126,6 +127,11 @@ export interface Config {
   timeZone?: string
   /** M9: inject constant soul.md / user.md identity sections. Default true. */
   enableIdentity?: boolean
+  /** Time-injection: prepend the current real-world DATE (internet-anchored,
+   *  system timezone) to the system prompt. Default true. */
+  timeInjection?: boolean
+  /** ms between internet date re-pins. Default 15 min. */
+  timeRefreshIntervalMs?: number
   /** R3-total: master memory switch. false → new sessions inject no memory
    *  (clean sessions) and background condensation/forgetting stop; the memory /
    *  memory_recall tools stay available for explicit use. Default true. */
@@ -181,6 +187,8 @@ export const Config: z<Config> = z.object({
   suppressLeadMinutes: z.number(),
   timeZone: z.string(),
   enableIdentity: z.boolean(),
+  timeInjection: z.boolean(),
+  timeRefreshIntervalMs: z.number(),
   enabled: z.boolean(),
   lessonDraftEnabled: z.boolean(),
   lessonInstantJudge: z.boolean(),
@@ -232,6 +240,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l0IdleMinutes = config.l0IdleMinutes ?? 30
   const checkMinutes = config.checkMinutes ?? 5
   const enableIdentity = config.enableIdentity ?? true
+  const timeInjection = config.timeInjection ?? true
+  const timeRefreshIntervalMs = config.timeRefreshIntervalMs ?? 15 * 60 * 1000
   const suppressCfg: SuppressCfg = {
     suppressWindows: config.suppressWindows ?? [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
     suppressLeadMinutes: config.suppressLeadMinutes ?? 15,
@@ -249,6 +259,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     lessonDraftEnabled: config.lessonDraftEnabled ?? MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled,
     lessonInstantJudge: config.lessonInstantJudge ?? MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge,
     lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
+    // time-injection: overwritten from the settings document when present.
+    timeInjection: timeInjection,
     // R10: refine-model selection lives in the settings document (not cordis
     // config) — auto by default, manual pin set from the settings panel.
     refineModelMode: MEMORY_SETTINGS_DEFAULTS.refineModelMode,
@@ -274,6 +286,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.lessonDraftEnabled = seed.lessonDraftEnabled
     runtime.lessonInstantJudge = seed.lessonInstantJudge
     runtime.lessonUseLlm = seed.lessonUseLlm
+    runtime.timeInjection = seed.timeInjection
     runtime.refineModelMode = seed.refineModelMode === 'manual' ? 'manual' : 'auto'
     runtime.refineModelProvider = seed.refineModelProvider ?? ''
     runtime.refineModel = seed.refineModel ?? ''
@@ -288,6 +301,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.lessonDraftEnabled = next.lessonDraftEnabled
       runtime.lessonInstantJudge = next.lessonInstantJudge
       runtime.lessonUseLlm = next.lessonUseLlm
+      runtime.timeInjection = next.timeInjection
       runtime.refineModelMode = next.refineModelMode === 'manual' ? 'manual' : 'auto'
       runtime.refineModelProvider = next.refineModelProvider ?? ''
       runtime.refineModel = next.refineModel ?? ''
@@ -317,6 +331,9 @@ export function apply(ctx: Context, config: Config = {}): void {
   let refineTimer: ReturnType<typeof setTimeout> | undefined
   let refineKick: ReturnType<typeof setTimeout> | undefined
   let settleTimer: ReturnType<typeof setTimeout> | undefined
+  /** Set by the effect when the time-injection source is created; invoked in the
+   *  effect cleanup so the background internet-refresh timer stops on teardown. */
+  let timeSourceCleanup: (() => void) | undefined
 
   const runForget = (): ForgetResult | undefined => {
     if (disposed || !runtime.enabled || !runtime.forgetEnabled) return undefined
@@ -371,6 +388,29 @@ export function apply(ctx: Context, config: Config = {}): void {
       loadModels: async (): Promise<RefineModelsPayload> => ({ default: {}, candidates: [], failures: [] }),
     }
     const disposeControlRoutes = registerControlRoutes(ctx, store, controls)
+
+    // Time-injection (2026-09-05): prepend the current real-world DATE to the
+    // system prompt. The instant is anchored to internet time by a background
+    // refresh loop (fall back to the local clock when offline — the LLM always
+    // sees a date); the rendered date uses the CURRENT SYSTEM timezone. Date-only
+    // output is byte-stable within a day, so the section rides the KV prefix
+    // cache instead of churning every assembly. Gated on runtime.timeInjection
+    // (live-toggleable via the settings panel).
+    if (timeInjection) {
+      const timeSource = new TimeSource({
+        refreshIntervalMs: timeRefreshIntervalMs,
+        onError: (err) => { if (!disposed) console.warn('[dsh-memory] internet time pin failed:', err instanceof Error ? err.message : err) },
+      })
+      timeSource.start()
+      const timeZone = resolveSystemTimeZone()
+      ctx.systemPrompt.section({
+        name: 'memory:time',
+        order: 5, // very early: after persona(0), before memory:protocol(9)
+        text: () => renderDateSection(runtime.timeInjection, timeSource.current(), timeZone),
+      })
+      // stop the refresh loop on teardown (called in the effect cleanup below)
+      timeSourceCleanup = () => timeSource.dispose()
+    }
 
     // Tier-0 memory + identity sections stay registered; their text thunk reads
     // runtime.enabled so toggling the master switch drops/restores injection live.
@@ -774,6 +814,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       l0Dispose()
       disposeControlRoutes()
       unwatchSettings?.() // P3-6: stop the settings watcher on dispose
+      timeSourceCleanup?.() // stop the internet date-refresh loop
       if (timer) clearTimeout(timer)
       if (refineTimer) clearTimeout(refineTimer)
       if (refineKick) clearTimeout(refineKick)

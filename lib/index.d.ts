@@ -126,6 +126,11 @@ export interface Config {
     timeZone?: string;
     /** M9: inject constant soul.md / user.md identity sections. Default true. */
     enableIdentity?: boolean;
+    /** Time-injection: prepend the current real-world DATE (internet-anchored,
+     *  system timezone) to the system prompt. Default true. */
+    timeInjection?: boolean;
+    /** ms between internet date re-pins. Default 15 min. */
+    timeRefreshIntervalMs?: number;
     /** R3-total: master memory switch. false → new sessions inject no memory
      *  (clean sessions) and background condensation/forgetting stop; the memory /
      *  memory_recall tools stay available for explicit use. Default true. */

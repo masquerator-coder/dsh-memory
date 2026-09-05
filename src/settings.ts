@@ -42,6 +42,9 @@ export interface MemorySettings {
   lessonInstantJudge: boolean
   /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
   lessonUseLlm: boolean
+  /** time-injection: prepend the current real-world date (internet-anchored,
+   *  system timezone) to the system prompt. Default true. */
+  timeInjection: boolean
   /** R10: 'auto' → follow the existing route chain; 'manual' → pin to the pair
    *  below. Incomplete manual (empty provider/model) falls back to auto. */
   refineModelMode: RefineModelMode
@@ -57,6 +60,7 @@ export const memorySettingsSchema = z.object({
   lessonDraftEnabled: z.boolean(),
   lessonInstantJudge: z.boolean(),
   lessonUseLlm: z.boolean(),
+  timeInjection: z.boolean(),
   refineModelMode: z.union(['auto', 'manual']),
   refineModelProvider: z.string(),
   refineModel: z.string(),
@@ -72,6 +76,7 @@ export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   lessonDraftEnabled: true,
   lessonInstantJudge: true,
   lessonUseLlm: true,
+  timeInjection: true,
   refineModelMode: 'auto',
   refineModelProvider: '',
   refineModel: '',
