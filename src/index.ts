@@ -142,6 +142,10 @@ export interface Config {
   lessonInstantJudge?: boolean
   /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
   lessonUseLlm?: boolean
+  /** Master switch for the custom system-prompt injection (2026-09-06). false →
+   *  the memory:custom section is omitted even when `customSystemPrompt` is set.
+   *  Live-toggleable. Default true. */
+  customPromptEnabled?: boolean
   /** CUSTOM system-prompt injection (2026-09-06): user-authored text injected as
    *  a REAL instruction-bearing systemPrompt section on every session. Unlike the
    *  memory / identity blocks (declared data-not-instruction per P0-5), this is
@@ -200,6 +204,7 @@ export const Config: z<Config> = z.object({
   lessonDraftEnabled: z.boolean(),
   lessonInstantJudge: z.boolean(),
   lessonUseLlm: z.boolean(),
+  customPromptEnabled: z.boolean(),
   customSystemPrompt: z.string(),
 })
 
@@ -269,7 +274,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
     // time-injection: overwritten from the settings document when present.
     timeInjection: timeInjection,
-    // custom system-prompt injection: user-authored guidance for every session.
+    // custom system-prompt injection: master switch + user-authored guidance.
+    customPromptEnabled: config.customPromptEnabled ?? true,
     customSystemPrompt: config.customSystemPrompt ?? '',
     // R10: refine-model selection lives in the settings document (not cordis
     // config) — auto by default, manual pin set from the settings panel.
@@ -297,6 +303,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.lessonInstantJudge = seed.lessonInstantJudge
     runtime.lessonUseLlm = seed.lessonUseLlm
     runtime.timeInjection = seed.timeInjection
+    runtime.customPromptEnabled = seed.customPromptEnabled
     runtime.customSystemPrompt = seed.customSystemPrompt
     runtime.refineModelMode = seed.refineModelMode === 'manual' ? 'manual' : 'auto'
     runtime.refineModelProvider = seed.refineModelProvider ?? ''
@@ -313,6 +320,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.lessonInstantJudge = next.lessonInstantJudge
       runtime.lessonUseLlm = next.lessonUseLlm
       runtime.timeInjection = next.timeInjection
+      runtime.customPromptEnabled = next.customPromptEnabled
       runtime.customSystemPrompt = next.customSystemPrompt
       runtime.refineModelMode = next.refineModelMode === 'manual' ? 'manual' : 'auto'
       runtime.refineModelProvider = next.refineModelProvider ?? ''
@@ -478,6 +486,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       order: 8, // guidance before the memory data sections (protocol 9 / tier0 10)
       text: () => {
         if (!runtime.enabled) return ''
+        if (!runtime.customPromptEnabled) return '' // 2026-09-06: master switch for this section
         const raw = runtime.customSystemPrompt
         return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : ''
       },

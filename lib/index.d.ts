@@ -141,6 +141,10 @@ export interface Config {
     lessonInstantJudge?: boolean;
     /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
     lessonUseLlm?: boolean;
+    /** Master switch for the custom system-prompt injection (2026-09-06). false →
+     *  the memory:custom section is omitted even when `customSystemPrompt` is set.
+     *  Live-toggleable. Default true. */
+    customPromptEnabled?: boolean;
     /** CUSTOM system-prompt injection (2026-09-06): user-authored text injected as
      *  a REAL instruction-bearing systemPrompt section on every session. Unlike the
      *  memory / identity blocks (declared data-not-instruction per P0-5), this is

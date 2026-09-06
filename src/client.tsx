@@ -53,6 +53,8 @@ interface MemorySettingsValue {
   timeInjection?: boolean
   /** custom system-prompt injection: user-authored instruction, verbatim. */
   customSystemPrompt?: string
+  /** custom system-prompt injection master switch. false → omit the section. */
+  customPromptEnabled?: boolean
   /** R10: refine-model selection ('auto' | 'manual'). */
   refineModelMode?: string
   refineModelProvider?: string
@@ -107,15 +109,51 @@ function useScope(scope: MemoryScope): ScopeSnapshot {
   return snap
 }
 
-/** A labelled on/off switch backed by a scope field (live-applied). */
+/** A labelled on/off switch backed by a scope field (live-applied). Rendered as
+ *  a sliding switch (track + thumb), not a native checkbox, for a uniform,
+ *  dsh-like control (2026-09-06). Accessible role="switch" + aria-checked. */
 function Toggle(props: { label: string; hint: string; checked: boolean; disabled: boolean; onChange: (next: boolean) => void }): JSX.Element {
+  const { checked, disabled } = props
   return (
     <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0' }}>
-      <input type="checkbox" checked={props.checked} disabled={props.disabled} onChange={(e) => props.onChange(e.target.checked)} />
       <span style={{ flex: 1 }}>
         <div>{props.label}</div>
         <div style={{ fontSize: 12, opacity: 0.7 }}>{props.hint}</div>
       </span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        disabled={disabled}
+        onClick={() => props.onChange(!checked)}
+        style={{
+          position: 'relative',
+          width: 40,
+          height: 22,
+          flex: 'none',
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          borderRadius: 999,
+          border: 'none',
+          padding: 0,
+          transition: 'background-color 0.2s ease',
+          background: checked ? 'var(--dsw-alias-primary, #4f7cff)' : 'var(--dsw-alias-border, rgba(128,128,128,0.6))',
+          opacity: disabled ? 0.5 : 1,
+        }}
+      >
+        <span
+          style={{
+            position: 'absolute',
+            top: 2,
+            left: checked ? 20 : 2,
+            width: 18,
+            height: 18,
+            borderRadius: '50%',
+            background: '#fff',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
+            transition: 'left 0.2s ease',
+          }}
+        />
+      </button>
     </label>
   )
 }
@@ -183,12 +221,14 @@ function FileEditor(props: { label: string; value: string; onSave: (content: str
 }
 
 /**
- * Custom system-prompt editor (2026-09-06): a multi-line input whose content is
- * injected verbatim as a real instruction on every session. Local draft state;
- * saved to the settings scope on click or blur (live-applied by the node
- * watch). Value is trimmed before save and before injection (empty → omitted).
+ * Custom system-prompt editor (2026-09-06): a master switch + multi-line input
+ * whose content is injected verbatim as a real instruction on every session.
+ * The switch sits before the text (this section as a whole), and when off the
+ * editor is disabled and no section is injected. Local draft state; saved to
+ * the settings scope on click or blur (live-applied by the node watch). Value
+ * is trimmed before save and before injection (empty → omitted).
  */
-function CustomPromptEditor(props: { value: string; ready: boolean; onSave: (next: string) => void }): JSX.Element {
+function CustomPromptEditor(props: { value: string; enabled: boolean; ready: boolean; onSetEnabled: (next: boolean) => void; onSave: (next: string) => void }): JSX.Element {
   const [draft, setDraft] = useState(props.value)
   const [saved, setSaved] = useState(false)
   useEffect(() => { setDraft(props.value); setSaved(false) }, [props.value])
@@ -201,18 +241,24 @@ function CustomPromptEditor(props: { value: string; ready: boolean; onSave: (nex
   }
   return (
     <div style={{ borderTop: '1px solid rgba(128,128,128,0.25)', padding: '8px 0', marginTop: 4 }}>
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>自定义系统提示词</div>
+      <Toggle
+        label="自定义系统提示词"
+        hint="开关置前：开启后将该段逐字注入每个会话的系统提示（指令级）；关闭则不注入"
+        checked={props.enabled}
+        disabled={!props.ready}
+        onChange={(next) => props.onSetEnabled(next)}
+      />
       <textarea
         value={draft}
-        disabled={!props.ready}
+        disabled={!props.ready || !props.enabled}
         onChange={(e) => { setDraft(e.target.value); setSaved(false) }}
         onBlur={commit}
         placeholder={'在此输入希望模型在每个会话都遵守的指令/行为准则（将原样注入系统提示词）。\n留空则不注入。'}
         rows={5}
-        style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 13, padding: 8 }}
+        style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 13, padding: 8, opacity: props.enabled ? 1 : 0.6 }}
       />
       <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button type="button" disabled={!props.ready} onClick={commit}>保存</button>
+        <button type="button" disabled={!props.ready || !props.enabled} onClick={commit}>保存</button>
         {saved && <span style={{ fontSize: 12, opacity: 0.8 }}>已保存（下次组装生效）</span>}
       </div>
       <div style={{ fontSize: 12, opacity: 0.7, paddingTop: 4 }}>
@@ -400,7 +446,9 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
           next prompt build (no restart). */}
       <CustomPromptEditor
         value={value.customSystemPrompt ?? ''}
+        enabled={value.customPromptEnabled ?? true}
         ready={ready}
+        onSetEnabled={(next) => set('customPromptEnabled', next)}
         onSave={(next) => set('customSystemPrompt', next)}
       />
       <Toggle

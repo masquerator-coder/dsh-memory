@@ -45,6 +45,9 @@ export interface MemorySettings {
   /** time-injection: prepend the current real-world date (internet-anchored,
    *  system timezone) to the system prompt. Default true. */
   timeInjection: boolean
+  /** Master switch for the custom system-prompt injection (2026-09-06). false →
+   *  omit the memory:custom section even when customSystemPrompt is set. Default true. */
+  customPromptEnabled: boolean
   /** Custom system-prompt injection (2026-09-06): user-authored text injected
    *  VERBATIM as a real instruction before the memory sections on every session.
    *  Empty → section omitted. Distinct from memory/identity blocks: this is
@@ -66,6 +69,7 @@ export const memorySettingsSchema = z.object({
   lessonInstantJudge: z.boolean(),
   lessonUseLlm: z.boolean(),
   timeInjection: z.boolean(),
+  customPromptEnabled: z.boolean(),
   customSystemPrompt: z.string(),
   refineModelMode: z.union(['auto', 'manual']),
   refineModelProvider: z.string(),
@@ -83,6 +87,7 @@ export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   lessonInstantJudge: true,
   lessonUseLlm: true,
   timeInjection: true,
+  customPromptEnabled: true,
   customSystemPrompt: '',
   refineModelMode: 'auto',
   refineModelProvider: '',
