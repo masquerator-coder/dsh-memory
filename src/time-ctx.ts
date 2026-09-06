@@ -220,17 +220,13 @@ export function formatLocalDate(epochMs: number, timeZone = resolveSystemTimeZon
 }
 
 /** The injected section text. Byte-stable for a full calendar day; empty when
- *  the feature is disabled. Declared as data, not instruction (P0-5 spirit). */
+ *  the feature is disabled. Declared as data, not instruction (P0-5 spirit).
+ *  Single-line since 2026-09-06. A minimal source mark —（互联网授时）/
+ *  （本机时钟）— sits right after the timezone so offline degradation stays
+ *  transparent to the LLM without the old verbose source note. */
 export function renderDateSection(enabled: boolean, snap: InstantSnapshot, timeZone = resolveSystemTimeZone()): string {
   if (!enabled) return ''
   const date = formatLocalDate(snap.epochMs, timeZone)
-  const srcLine = snap.source === 'internet'
-    ? '> 日期来源：互联网授时校准（权威）。时区：' + timeZone
-    : '> 日期来源：本机时钟（互联网授时暂不可用，以本机为准）。时区：' + timeZone
-  return (
-    '# 当前真实世界日期\n' +
-    `今天是 ${date}。\n` +
-    srcLine + '\n' +
-    '> 上述日期为真实世界日期，非模型训练截止知识；涉及『今天』/『今天星期几』/日期相关判断时以此为准。'
-  )
+  const srcMark = snap.source === 'internet' ? '（互联网授时）' : '（本机时钟）'
+  return `当前真实世界日期是 ${date}，时区：${timeZone}${srcMark}。该日期非模型训练截止知识；涉及『今天』/『今天星期几』/日期相关判断时以此为准。`
 }

@@ -139,18 +139,15 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 解决"大模型不知道自己处于真实世界哪一天"（训练截止 ≠ 现在）。会话开始时在系统提示词里预置一条**当前真实世界日期** section（`name: memory:time`，order 5，置于大多 section 之前）：
 
 - **日期来自互联网**：后台刷新循环（默认每 15 分钟一次，`timeRefreshIntervalMs`）从公开授时 API 取权威 UTC 时刻（`worldtimeapi.org` → `timeapi.io` 依次尝试，单次超时 5s），再套用**当前系统时区**渲染成本地日期。
-- **联网失败兜底**：离线/被墙/超时时回退到**本机时钟**继续注入（来源标注为"本机"，模型永远看得到日期），绝不让该节整体缺席。
+- **联网失败兜底**：离线/被墙/超时时回退到**本机时钟**继续注入（渲染在时区后带极简标记`（本机时钟）`），绝不让该节整体缺席。
 - **只注入日期，不含时刻**（KV 友好）：文本在一天内字节稳定，前缀尽量命中缓存而非每次装配抖动。
 - **live 开关**：设置面板「系统提示注入当前日期」，或 cordis 配置 `timeInjection: false` 关闭；关时该节输出空串即时消失，无需重启。
-- 示例：
+- 示例（2026-09-06 起为单行数据节：无 markdown 标题，仅日期+时区+极简来源标记+护栏）：
   ```
-  # 当前真实世界日期
-  今天是 2026年9月5日 星期六。
-  > 日期来源：互联网授时校准（权威）。时区：Asia/Shanghai
-  > 上述日期为真实世界日期，非模型训练截止知识；……
+  当前真实世界日期是 2026年9月5日星期六，时区：Asia/Shanghai（互联网授时）。该日期非模型训练截止知识；涉及『今天』/『今天星期几』/日期相关判断时以此为准。
   ```
 
-> 定位说明：DSH 自身另有 `@deepseek-ai/dsh-time-context`（按请求往会话历史追加"采样时刻"，本机时间、非系统提示、非互联网授时）。本插件的 `memory:time` 是**系统提示内置、互联网授时、本机时区**的日期节，二者定位不同、可共存。/ 新增 `smoke.mjs` 断言组 G40（22 断言）全绿。
+> 定位说明：DSH 自身另有 `@deepseek-ai/dsh-time-context`（按请求往会话历史追加"采样时刻"，本机时间、非系统提示、非互联网授时）。本插件的 `memory:time` 是**系统提示内置、互联网授时、本机时区**的日期节，二者定位不同、可共存。/ 新增 `smoke.mjs` 断言组 G40（23 断言）全绿。
 
 ### 2.4b 自定义系统提示词注入（custom prompt injection）
 
@@ -364,7 +361,7 @@ npm run smoke   # 等价于 node smoke.mjs
 - **凝练模型可选手动固定（R10，2026-09-03）**：设置面板「记忆」新增「凝练模型」——**自动**（跟随会话所用模型 → dsh 默认，含 cordis 显式 l1/l2/l0 路由）或**手动指定**（下拉从 `GET /memory/models` 枚举的 dsh LLM registry 已配置模型中选择，或选「自定义…」手填 provider/model）。手动完整 pair 通过 `manualRefineOverride` 成为 L1/L2/教训升格/会话收口全部整理 LLM 路由的**最高优先**来源（`src/index.ts` 5 处 resolveRefineRoute 统一接入）；未填完整自动回落、绝不硬降级。改动经设置文档 live 生效（免重启）。新增 `smoke.mjs` R10 断言（G16 扩展，+7 全绿）。
 - **L1 解析漂移一次纠错重试（R8，2026-09-03）**：`runRefineL1` 在硬解析失败（模型返回散文/fence/截断数组而非 JSON）时，把坏输出回灌做**一次有界纠错重试**再降级（不循环，最坏 ≤2×timeout；raw=null 超时/断流不重试，交给 R9）。同时**手动「立即整理」force=true 强制 `retryDegraded`**（R9）——降级（extracted=2）episode 不再永久跳过，每次手动整理都会复活重试；后台周期仍遵循 `l1RetryDegraded` 配置（默认 false）。
 
-- **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除，保留单条≤300 提示）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（4 断言）全绿。
+- **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除；`单条≤300字符` 元提示于 2026-09-06 删除——上限由写入侧 clamp，注入文本无需告知模型）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（5 断言）全绿。
 
 - **记忆分层导出 Markdown（MD-EXPORT，2026-09-06，docs/MD-EXPORT.md）**：设置面板「记忆」新增「导出 Markdown」按钮（`/memory/export/markdown`，只读、零 LLM，同受 loopback 信任模型约束），分层导出全部记忆为 3 个 Markdown 档案——`01-memories.md`（全部语义记忆，按 **状态→layer→kind→importance** 分节，**含已归档与低质量**）、`02-episodes.md`（全部会话摘要，含已归档，时间倒序）、`03-identity.md`（soul.md / user.md 原文）。数据源与「查看记忆」弹窗同口径（所见即所得）；模型写的不可信 `content` 经 `mdSafe` 转义防伪造 markdown 结构。注册后浏览器逐个下载（不打 zip、零新增依赖）。新增 `docs/MD-EXPORT.md` 设计稿 + `smoke.mjs` 断言组 G41（20 断言）全绿。
 

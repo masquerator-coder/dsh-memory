@@ -903,12 +903,14 @@ group('G40 time-injection (internet date → local tz, local fallback)')
   const disabled = renderDateSection(false, { epochMs: Date.now(), source: 'internet' }, tz)
   assert('G40 disabled → empty string', disabled === '')
   const rd = renderDateSection(true, { epochMs: Date.now(), source: 'internet' }, tz)
-  assert('G40 enabled section has header', rd.includes('# 当前真实世界日期'))
-  assert('G40 enabled section contains 今天是', rd.includes('今天是'))
-  assert('G40 internet source annotated', rd.includes('互联网授时'))
+  assert('G40 enabled section reads as a single date sentence', rd.includes('当前真实世界日期是') && rd.includes('年'))
   assert('G40 section embeds the resolved timezone', rd.includes(tz))
+  assert('G40 section carries the not-training-cutoff guard', rd.includes('非模型训练截止知识') && rd.includes('『今天』'))
   const rl = renderDateSection(true, { epochMs: Date.now(), source: 'local' }, tz)
-  assert('G40 local source annotated as local-clock', rl.includes('本机时钟') && rl.includes('以本机为准'))
+  assert('G40 internet mark rendered', rd.includes('（互联网授时）') && !rd.includes('（本机时钟）'))
+  assert('G40 local mark rendered', rl.includes('（本机时钟）') && !rl.includes('（互联网授时）'))
+  assert('G40 marks sit at the date-clause end, single line, no separate note line',
+    rd.split('。')[0].endsWith('（互联网授时）') && !rd.includes('\n'))
   // date-only → no time-of-day digits (no ':' hour boundaries) keeps it day-stable
   assert('G40 section is date-only (no clock minutes "分")', !rd.includes('分：') && !/:(\d{2})/.test(rd))
   // formatLocalDate determinism for a fixed instant
@@ -1227,7 +1229,7 @@ group('G35 备份导入拒绝非法文件（不清空现有数据）')
 // ---------------------------------------------------------------------------
 group('G36 memory:protocol static rules section')
 {
-  assert('PROTOCOL_TEXT non-empty constant', PROTOCOL_TEXT.length > 200)
+  assert('PROTOCOL_TEXT non-empty constant', PROTOCOL_TEXT.length > 150)
   assert('contains all three tool names',
     ['memory_recall', 'memory add', 'memory_read_user'].every(t => PROTOCOL_TEXT.includes(t)))
   assert('marks itself operative rules (not data)',
@@ -1252,7 +1254,9 @@ group('G37 tier0 buildSection noise trims')
   assert('redundant recall/add guidance removed (now owned by memory:protocol)',
     !txt.includes('需要详情用 memory_recall') && !txt.includes('学到稳定事实'))
   assert('single compact usage line (P2 converged stats, no raw char count)',
-    txt.includes('单条≤300') && txt.includes('占用') && txt.includes('情景'))
+    txt.includes('占用') && txt.includes('情景'))
+  assert('no per-entry char-cap meta note (write-side clamps already; LLM need not know)',
+    !txt.includes('单条≤300'))
   assert('does not duplicate raw-char usage in header', !txt.includes('占用 25字符'))
   s.close()
 }

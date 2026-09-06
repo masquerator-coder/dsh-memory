@@ -107,5 +107,8 @@ export declare function resolveSystemTimeZone(): string;
  */
 export declare function formatLocalDate(epochMs: number, timeZone?: string): string;
 /** The injected section text. Byte-stable for a full calendar day; empty when
- *  the feature is disabled. Declared as data, not instruction (P0-5 spirit). */
+ *  the feature is disabled. Declared as data, not instruction (P0-5 spirit).
+ *  Single-line since 2026-09-06. A minimal source mark —（互联网授时）/
+ *  （本机时钟）— sits right after the timezone so offline degradation stays
+ *  transparent to the LLM without the old verbose source note. */
 export declare function renderDateSection(enabled: boolean, snap: InstantSnapshot, timeZone?: string): string;

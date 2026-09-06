@@ -35,7 +35,7 @@ dsh-memory 注入到系统提示词的六段（time / custom / protocol / tier0 
 |---|---|---|---|
 | 今天日期 | `memory:time`（5）| `time-ctx.ts` | 数据（KV 稳定，按天）|
 | 资深科研助理身份 | `memory:custom`（8）| `settings.customSystemPrompt` | 用户指令（逐字注入）|
-| 记忆使用指引 | `memory:protocol`（9）| `inject.ts PROTOCOL_TEXT` | 插件唯一指令段 |
+| 记忆工具调用 | `memory:protocol`（9）| `inject.ts PROTOCOL_TEXT` | 插件唯一指令段 |
 | Persistent memory | `memory:tier0`（10）| `inject.ts buildSection` | 数据（受控）|
 | 身份AI 本人 | `memory:soul`（11）| `identity.ts` soul.md | 数据（人写）|
 | 用户画像指针 | `memory:user`（12）| `identity.ts` user.md | 数据（指针）|
