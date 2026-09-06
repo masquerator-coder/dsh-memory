@@ -142,6 +142,13 @@ export interface Config {
   lessonInstantJudge?: boolean
   /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
   lessonUseLlm?: boolean
+  /** CUSTOM system-prompt injection (2026-09-06): user-authored text injected as
+   *  a REAL instruction-bearing systemPrompt section on every session. Unlike the
+   *  memory / identity blocks (declared data-not-instruction per P0-5), this is
+   *  written by the USER, so it is trusted and injected verbatim as the model's
+   *  behavioural guidance. Empty/whitespace → section omitted. Live-toggleable
+   *  via the settings panel (thunk re-reads runtime on every assembly). */
+  customSystemPrompt?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -193,6 +200,7 @@ export const Config: z<Config> = z.object({
   lessonDraftEnabled: z.boolean(),
   lessonInstantJudge: z.boolean(),
   lessonUseLlm: z.boolean(),
+  customSystemPrompt: z.string(),
 })
 
 const FORGET_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
@@ -261,6 +269,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
     // time-injection: overwritten from the settings document when present.
     timeInjection: timeInjection,
+    // custom system-prompt injection: user-authored guidance for every session.
+    customSystemPrompt: config.customSystemPrompt ?? '',
     // R10: refine-model selection lives in the settings document (not cordis
     // config) — auto by default, manual pin set from the settings panel.
     refineModelMode: MEMORY_SETTINGS_DEFAULTS.refineModelMode,
@@ -287,6 +297,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.lessonInstantJudge = seed.lessonInstantJudge
     runtime.lessonUseLlm = seed.lessonUseLlm
     runtime.timeInjection = seed.timeInjection
+    runtime.customSystemPrompt = seed.customSystemPrompt
     runtime.refineModelMode = seed.refineModelMode === 'manual' ? 'manual' : 'auto'
     runtime.refineModelProvider = seed.refineModelProvider ?? ''
     runtime.refineModel = seed.refineModel ?? ''
@@ -302,6 +313,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.lessonInstantJudge = next.lessonInstantJudge
       runtime.lessonUseLlm = next.lessonUseLlm
       runtime.timeInjection = next.timeInjection
+      runtime.customSystemPrompt = next.customSystemPrompt
       runtime.refineModelMode = next.refineModelMode === 'manual' ? 'manual' : 'auto'
       runtime.refineModelProvider = next.refineModelProvider ?? ''
       runtime.refineModel = next.refineModel ?? ''
@@ -452,6 +464,24 @@ export function apply(ctx: Context, config: Config = {}): void {
       })
     }
     registerMemoryTools(ctx, store, { epistemicWeighting })
+
+    // Custom system-prompt injection (2026-09-06): one user-authored, real
+    // instruction section active on every session. It is USER-written, so unlike
+    // the memory/identity blocks it is trusted and injected verbatim (no
+    // data-not-instruction wrapper — that is the point). Registered
+    // unconditionally; the thunk re-reads runtime.customSystemPrompt every
+    // assembly, so edits in the settings panel take effect on the NEXT prompt
+    // build without a restart (live). Gated on runtime.enabled so the master
+    // switch (clean-session mode) also tears this section down/up live.
+    ctx.systemPrompt.section({
+      name: 'memory:custom',
+      order: 8, // guidance before the memory data sections (protocol 9 / tier0 10)
+      text: () => {
+        if (!runtime.enabled) return ''
+        const raw = runtime.customSystemPrompt
+        return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : ''
+      },
+    })
 
     // ---- L0 episodic condensation + L1/L2 background refinement ----
     // Host default model route (idiot-proof auto-route): read once at boot so the

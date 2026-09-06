@@ -141,6 +141,13 @@ export interface Config {
     lessonInstantJudge?: boolean;
     /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
     lessonUseLlm?: boolean;
+    /** CUSTOM system-prompt injection (2026-09-06): user-authored text injected as
+     *  a REAL instruction-bearing systemPrompt section on every session. Unlike the
+     *  memory / identity blocks (declared data-not-instruction per P0-5), this is
+     *  written by the USER, so it is trusted and injected verbatim as the model's
+     *  behavioural guidance. Empty/whitespace → section omitted. Live-toggleable
+     *  via the settings panel (thunk re-reads runtime on every assembly). */
+    customSystemPrompt?: string;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config?: Config): void;

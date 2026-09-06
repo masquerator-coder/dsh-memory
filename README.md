@@ -105,6 +105,8 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 | 开关 / 控件 | 字段 | 作用 |
 |---|---|---|
 | 记忆总开关 | `enabled` | 关 → 清洁会话（不注入任何记忆），后台整理/遗忘全停 |
+| 系统提示注入当前日期 | `timeInjection` | 关 → 系统提示不注入真实世界日期节 |
+| 自定义系统提示词 | `customSystemPrompt` | 用户自编指令，**逐字注入**系统提示词，每个会话生效（见 §2.4b）；留空不注入 |
 | 主动遗忘 | `forgetEnabled` | 关 → 暂停降级/归档/硬删，**不清理已有记忆** |
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
 | 凝练整理时间间隔（小时） | `refineIntervalMs` | 自定义 L1/L2 抽取与去重的周期扫描间隔（默认 1h，0.1h 起）；改小更及时更费 API、改大更省。新会话后 10 秒内仍会即时凝练一次（不受此间隔影响） |
@@ -148,6 +150,21 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
   ```
 
 > 定位说明：DSH 自身另有 `@deepseek-ai/dsh-time-context`（按请求往会话历史追加"采样时刻"，本机时间、非系统提示、非互联网授时）。本插件的 `memory:time` 是**系统提示内置、互联网授时、本机时区**的日期节，二者定位不同、可共存。/ 新增 `smoke.mjs` 断言组 G40（22 断言）全绿。
+
+### 2.4b 自定义系统提示词注入（custom prompt injection）
+
+允许你在会话开始前注入一条**自定义系统提示词**——用户直接编写的、希望模型在每个会话都遵守的指令/行为准则（如沟通风格、输出格式、工作纪律）。它作为系统提示里独立的一条 section（`name: memory:custom`，order 8，位于记忆数据段之前）注入，**逐字、不加任何"数据非指令"包裹**——这与记忆 / 身份 / user.md 等区块（按 P0-5 声明为 data-not-instruction）**语义相反**：这里的内容是你亲笔写的、可信的指令，模型应当遵守。
+
+- **为什么不受 P0-5 约束**：P0-5 防的是「LLM 自己写的内容混入系统提示被误读为指令」。而你自定义的提示词本来就是指令，作者是可信的人类，故直接作为最高信任级指令注入。
+- **生效范围**：所有新会话（每次 prompt 组装现算，非常驻冻结）；受「记忆总开关」`enabled` 控制——关闭总开关（清洁会话）时该节随之消失。
+- **live 编辑**：设置面板「自定义系统提示词」多行输入，保存/失焦即写入；节点端 `watch` 实时更新，_下一个_ prompt 组装即生效，无需重启。
+- **配置入口**：`cordis.patch.yml` 的 `customSystemPrompt`（多行字符串，见 §四）与设置面板双入口；留空/纯空白 → 该节不注入。
+- 示例：
+  ```
+  customSystemPrompt: |
+    先给结论，再给依据。
+    中文为主，句中保留英文术语/代码/URL 原样。
+  ```
 
 ### 2.5 后台维护
 
@@ -263,11 +280,17 @@ enableIdentity: true         # 注入恒定 soul.md / user.md 身份 section
 timeInjection: true                  # 注入真实世界日期（互联网授时 / 本机时区）
 timeRefreshIntervalMs: 900000        # 互联网日期重校间隔 ms（默认 15 分钟）
 
+# --- 自定义系统提示词注入 ---
+customSystemPrompt: |                # 用户自编指令，逐字注入每个会话的系统提示（§2.4b）
+  先给结论，再给依据。
+  中文为主，句中保留英文术语/代码/URL 原样。
+  # 留空/不写 → 不注入
+
 # --- R3-total：记忆总开关 ---
 enabled: true                # false → 清洁会话，后台全部停；memory 工具保留
 ```
 
-**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress` / `lessonDraftEnabled` / `lessonInstantJudge` / `lessonUseLlm` / `timeInjection` / `refineModelMode` + `refineModelProvider` + `refineModel`（R10 凝练模型）——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
+**哪些可在设置面板实时切换（免重启）**：`enabled` / `forgetEnabled` / `refineIntervalMs` / `peakHourSuppress` / `lessonDraftEnabled` / `lessonInstantJudge` / `lessonUseLlm` / `timeInjection` / `customSystemPrompt` / `refineModelMode` + `refineModelProvider` + `refineModel`（R10 凝练模型）——这些经 dsh 设置页「记忆」面板读写，settings 用户层覆盖 cordis config，改动 live 生效、写入设置文档持久化。
 
 ---
 

@@ -51,6 +51,8 @@ interface MemorySettingsValue {
   peakHourSuppress?: boolean
   /** time-injection: prepend current real-world date to the system prompt. */
   timeInjection?: boolean
+  /** custom system-prompt injection: user-authored instruction, verbatim. */
+  customSystemPrompt?: string
   /** R10: refine-model selection ('auto' | 'manual'). */
   refineModelMode?: string
   refineModelProvider?: string
@@ -176,6 +178,46 @@ function FileEditor(props: { label: string; value: string; onSave: (content: str
         {note && <span style={{ fontSize: 12, opacity: 0.8 }}>{note}</span>}
       </div>
       {error && <div style={{ marginTop: 6, color: '#c00', fontSize: 12 }}>{error}</div>}
+    </div>
+  )
+}
+
+/**
+ * Custom system-prompt editor (2026-09-06): a multi-line input whose content is
+ * injected verbatim as a real instruction on every session. Local draft state;
+ * saved to the settings scope on click or blur (live-applied by the node
+ * watch). Value is trimmed before save and before injection (empty → omitted).
+ */
+function CustomPromptEditor(props: { value: string; ready: boolean; onSave: (next: string) => void }): JSX.Element {
+  const [draft, setDraft] = useState(props.value)
+  const [saved, setSaved] = useState(false)
+  useEffect(() => { setDraft(props.value); setSaved(false) }, [props.value])
+  const commit = (): void => {
+    if (!props.ready) return
+    const next = draft.trim()
+    if (next === (typeof props.value === 'string' ? props.value.trim() : '')) return
+    props.onSave(next)
+    setSaved(true)
+  }
+  return (
+    <div style={{ borderTop: '1px solid rgba(128,128,128,0.25)', padding: '8px 0', marginTop: 4 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>自定义系统提示词</div>
+      <textarea
+        value={draft}
+        disabled={!props.ready}
+        onChange={(e) => { setDraft(e.target.value); setSaved(false) }}
+        onBlur={commit}
+        placeholder={'在此输入希望模型在每个会话都遵守的指令/行为准则（将原样注入系统提示词）。\n留空则不注入。'}
+        rows={5}
+        style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 13, padding: 8 }}
+      />
+      <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <button type="button" disabled={!props.ready} onClick={commit}>保存</button>
+        {saved && <span style={{ fontSize: 12, opacity: 0.8 }}>已保存（下次组装生效）</span>}
+      </div>
+      <div style={{ fontSize: 12, opacity: 0.7, paddingTop: 4 }}>
+        与记忆/身份段不同，这里的内容以<b>指令</b>身份进入系统提示词（最高信任级），由你直接编写，模型需遵守。
+      </div>
     </div>
   )
 }
@@ -352,6 +394,14 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         checked={value.timeInjection ?? true}
         disabled={!ready}
         onChange={(next) => set('timeInjection', next)}
+      />
+      {/* Custom system-prompt injection (2026-09-06): user-authored guidance,
+          written live to the settings scope → node watch re-applies it on the
+          next prompt build (no restart). */}
+      <CustomPromptEditor
+        value={value.customSystemPrompt ?? ''}
+        ready={ready}
+        onSave={(next) => set('customSystemPrompt', next)}
       />
       <Toggle
         label="忙闲时段抑制扫描"

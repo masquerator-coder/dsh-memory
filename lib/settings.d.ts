@@ -43,6 +43,11 @@ export interface MemorySettings {
     /** time-injection: prepend the current real-world date (internet-anchored,
      *  system timezone) to the system prompt. Default true. */
     timeInjection: boolean;
+    /** Custom system-prompt injection (2026-09-06): user-authored text injected
+     *  VERBATIM as a real instruction before the memory sections on every session.
+     *  Empty → section omitted. Distinct from memory/identity blocks: this is
+     *  trusted user guidance, not data-not-instruction content. */
+    customSystemPrompt: string;
     /** R10: 'auto' → follow the existing route chain; 'manual' → pin to the pair
      *  below. Incomplete manual (empty provider/model) falls back to auto. */
     refineModelMode: RefineModelMode;
@@ -58,6 +63,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
     timeInjection: z<boolean, boolean>;
+    customSystemPrompt: z<string, string>;
     refineModelMode: z<"auto" | "manual", "auto" | "manual">;
     refineModelProvider: z<string, string>;
     refineModel: z<string, string>;
@@ -70,6 +76,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
     timeInjection: z<boolean, boolean>;
+    customSystemPrompt: z<string, string>;
     refineModelMode: z<"auto" | "manual", "auto" | "manual">;
     refineModelProvider: z<string, string>;
     refineModel: z<string, string>;
