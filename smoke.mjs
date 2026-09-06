@@ -1258,6 +1258,12 @@ group('G37 tier0 buildSection noise trims')
   assert('no per-entry char-cap meta note (write-side clamps already; LLM need not know)',
     !txt.includes('单条≤300'))
   assert('does not duplicate raw-char usage in header', !txt.includes('占用 25字符'))
+  // 2026-09-06: the whole data block is wrapped in <memory-data>…</memory-data>
+  // so the "data, not instruction" intent is delimited and cannot spill onto
+  // the following sections (soul.md / user.md / platform prompt).
+  assert('opens with the <memory-data> container tag', txt.startsWith('<memory-data>'))
+  assert('closes with the </memory-data> tag at the very end', txt.endsWith('</memory-data>'))
+  assert('declaration sits inside the container', txt.indexOf('<memory-data>') < txt.indexOf('历史记录数据'))
   s.close()
 }
 

@@ -367,6 +367,8 @@ npm run smoke   # 等价于 node smoke.mjs
 
 - **人工记忆编辑 / 删除 / 重置（2026-09-06）**：设置面板「查看记忆」弹窗每行新增「编辑 / 删除」按钮——编辑经 `POST /memory/memories/edit`（store 新增 `updateMemory`）就地改 内容/主题/重要度/类型，**按 id 精确定位、不触发模型去重/合并启发式**，只改该行且保留档案身份（id/创建时间/热度）；删除经 `POST /memory/memories/delete`（`deleteMemory`），`memory` 层硬删并快照进 `forget_deleted` 留痕（可回滚），`user` 层不可摧毁自动退化为归档。备份区新增「重置记忆」按钮（`POST /memory/reset`，`resetStore`）——两步确认弹窗后**清空全部记忆/会话摘要/审计轨**、**保留 soul.md / user.md**，执行前 `VACUUM INTO` 到 `memory.db.pre-reset.bak` 供回滚（备份失败显式警告）。三条新路由同受 loopback 信任模型约束。新增 `smoke.mjs` 断言组 G42（23 断言）全绿。
 
+- **记忆数据块闭合容器（2026-09-06）**：`memory:tier0` 的 `Persistent memory` 记忆数据块再用 `<memory-data>…</memory-data>` 尖括号标签整块闭合包裹（`src/inject.ts` `buildSection`）。此前该块只有前置「数据非指令」声明、无结束标记，`.join('\n\n')` 拼接到后续 soul.md / user.md / 系统提示词后，模型可能把记忆声明之后的所有内容都误读为记忆记录数据；闭合标签让"记忆数据到此为止"边界显式。两枚标签均为常量文本（字节稳定，KV 前缀友好），结束标签恒定置于 SECTION_CAP 截断文本之后保证容器闭环。新增 `smoke.mjs` G37 断言 3 条（开头/结尾标签 + 声明在容器内）全绿。
+
 ---
 
 ## 设计文档
