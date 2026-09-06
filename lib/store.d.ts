@@ -9,6 +9,14 @@ export declare const SIM_DUP = 0.85;
 export declare function resolveDshHome(): string;
 /** Hard-content id: identical facts collapse instead of duplicating. */
 export declare function contentId(content: string): string;
+/** L1 (2026-09-07): render an absolute filesystem path as a SQL single-quoted
+ *  string literal for `VACUUM INTO '<path>'`. SQLite does NOT support bound
+ *  parameters for VACUUM INTO, so the path MUST be escaped inline: single
+ *  quotes doubled (''), backslashes → forward slashes (backslash is not a SQL
+ *  escape and breaks parsing on Windows). Kept as one single point of truth so
+ *  every call site can't drift — grep `VACUUM INTO` and route every use through
+ *  this helper rather than hand-escaping again. */
+export declare function sqlPathLiteral(path: string): string;
 export interface ListFilter {
     layer?: Layer;
     tier?: Tier;
@@ -48,6 +56,12 @@ export declare class MemoryStore {
     readonly budget: MemoryBudget;
     readonly windowDays: number;
     readonly forgetDays: ForgetDays;
+    /** Minimum importance for a preference/env memory to render into the system
+     *  prompt (audit ②, 2026-09-07). Mirrors the injection threshold used by
+     *  buildSection so the memory-injection budget bucket counts exactly what will
+     *  actually be injected. Default 1 = structural kind-based set; index.ts passes
+     *  the configured importanceThreshold. */
+    readonly injectThreshold: number;
     private db;
     private upsertMemStmt;
     private upsertFtsStmt;
@@ -62,7 +76,11 @@ export declare class MemoryStore {
      *  and they sit on the add / enforceBudget / forgetRun hot paths. Clause-
      *  combination SQL (list/recall) yields a bounded, structural key set. */
     private readonly stmtCache;
-    constructor(home?: string, budget?: MemoryBudget, windowDays?: number, forgetDays?: ForgetDays);
+    constructor(home?: string, budget?: MemoryBudget, windowDays?: number, forgetDays?: ForgetDays, injectThreshold?: number);
+    /** Sliding-window length in ms for the heat frequency signal (audit 2026-09-07).
+     *  Passed to {@link heatOf} so an expired window's stale `window_freq` no longer
+     *  lifts heat and stalls demotion. */
+    private windowMs;
     /**
      * (Re-)prepare every hot-path prepared statement. Called from the constructor
      * and from {@link replaceWithBackup} after the underlying DB connection is
@@ -182,6 +200,22 @@ export declare class MemoryStore {
      * resident core and is never demoted — so if those alone overflow a bucket, the
      * batch is rejected (overflow becomes truly reachable, P1-8). Returns the ids
      * demoted and whether budget still exceeds after demotion (P1-9 surfaces them).
+     *
+     * Audit ② (2026-09-07): the memory bucket previously counted EVERY memory-layer
+     * tier0 entry regardless of kind, while buildSection only injects
+     * kind∈{preference,env} (isInjectableKind) above the injection threshold. So an
+     * uninjectable protected (importance≥5) lesson/decision/general ate the injection
+     * budget and could even force a reject of an *injectable* add (budget gate targets
+     * something the injection gate never renders). Fix — direction A: the memory
+     * bucket now counts only what buildSection actually injects
+     * (isInjectableKind && importance>=injectThreshold, decided by the SAME
+     * predicate as injection), and its squeeze demotes only injectable cold entries.
+     * Uninjectable tier0 still counts toward the global tier0 cap and is handled over
+     * time by forgetRun's heat demote/archive — but it can no longer consume the
+     * injection quota or trigger injection overflow. Three independent uses tracked:
+     *   injectUse = memory-layer entries that would render (the injection gate)
+     *   usrUse    = user-layer entries (immortality-resident set)
+     *   totalUse  = ALL tier0 (injection + storage cap)
      */
     private enforceBudget;
     /** Model-facing write batch; lands globally and immediately.

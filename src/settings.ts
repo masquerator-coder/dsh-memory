@@ -43,10 +43,10 @@ export interface MemorySettings {
   /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
   lessonUseLlm: boolean
   /** time-injection: prepend the current real-world date (internet-anchored,
-   *  system timezone) to the system prompt. Default true. */
+   *  system timezone) to the system prompt. Default false. */
   timeInjection: boolean
   /** Master switch for the custom system-prompt injection (2026-09-06). false →
-   *  omit the memory:custom section even when customSystemPrompt is set. Default true. */
+   *  omit the memory:custom section even when customSystemPrompt is set. Default false. */
   customPromptEnabled: boolean
   /** Custom system-prompt injection (2026-09-06): user-authored text injected
    *  VERBATIM as a real instruction before the memory sections on every session.
@@ -86,8 +86,8 @@ export const MEMORY_SETTINGS_DEFAULTS: MemorySettings = {
   lessonDraftEnabled: true,
   lessonInstantJudge: true,
   lessonUseLlm: true,
-  timeInjection: true,
-  customPromptEnabled: true,
+  timeInjection: false,
+  customPromptEnabled: false,
   customSystemPrompt: '',
   refineModelMode: 'auto',
   refineModelProvider: '',

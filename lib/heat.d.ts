@@ -28,12 +28,27 @@ export declare function resolveForgetDays(partial?: Partial<ForgetDays>): Forget
 export declare function lambdaOf(kind: Kind, forgetDays: ForgetDays): number;
 /** Frequency boost: log-scale so a few recalls matter, many don't swamp. */
 export declare function freqBoost(windowFreq: number): number;
-/** heat = e^(-λ·Δt) × (1 + ln(1 + window_freq)). user layer pinned to 1. */
-export declare function heatOf(e: Pick<MemoryEntry, 'layer' | 'kind' | 'last_accessed' | 'window_freq'>, forgetDays: ForgetDays, now?: number): number;
-/** Auto-demote tier0→tier1: cold (≈ forgetDays unaccessed) + not top-importance. */
-export declare function shouldDemote(e: MemoryEntry, forgetDays: ForgetDays, now?: number): boolean;
+/** heat = e^(-λ·Δt) × (1 + ln(1 + window_freq)). user layer pinned to 1.
+ *
+ *  Audit fix (2026-09-07): the frequency boost used to read `window_freq`
+ *  verbatim without checking whether the sliding window had expired. Because
+ *  `touchAccess` only resets `window_freq` on the NEXT recall, an entry recalled
+ *  often in one window then left cold kept its high freqBoost forever — lifting
+ *  heat and stalling demotion long past where recency alone would have demoted
+ *  it (e.g. general: 100 recalls then 90d quiet → heat 0.063 vs the 0.05 gate).
+ *  Now, when `window_start` is set (>0) AND `windowMs` is supplied AND the window
+ *  has elapsed, the boost uses freq 0. When `window_start` is absent/0 (no
+ *  window yet — e.g. freshly written) or `windowMs` is omitted, the stored freq
+ *  is used as before, so this stays backward-compatible with callers that only
+ *  carry `window_freq`. */
+export declare function heatOf(e: Pick<MemoryEntry, 'layer' | 'kind' | 'last_accessed' | 'window_freq' | 'window_start'>, forgetDays: ForgetDays, now?: number, windowMs?: number): number;
+/** Auto-demote tier0→tier1: cold (≈ forgetDays unaccessed) + not top-importance.
+ *  `windowMs` (optional, audit 2026-09-07) is forwarded to heatOf so an expired
+ *  recall window's stale freq doesn't block demotion. Omitted → legacy heatOf
+ *  (no window expiry check). */
+export declare function shouldDemote(e: MemoryEntry, forgetDays: ForgetDays, now?: number, windowMs?: number): boolean;
 /** Soft-archive: colder (≈ 1.54 × forgetDays) + low importance. */
-export declare function shouldArchive(e: MemoryEntry, forgetDays: ForgetDays, now?: number): boolean;
+export declare function shouldArchive(e: MemoryEntry, forgetDays: ForgetDays, now?: number, windowMs?: number): boolean;
 /**
  * Hard-delete gate (all conditions must hold — the importance gate is the real
  * "can we afford to delete this" check, heat only got it into the candidate set).

@@ -14,7 +14,7 @@
  *  - per-entry and whole-section length caps bound the injection volume
  */
 import type { MemoryStore } from './store.js';
-import type { MemoryEntry } from './types.js';
+import { type MemoryEntry } from './types.js';
 export interface SectionBuild {
     text: string;
     empty: boolean;
@@ -23,6 +23,32 @@ export interface SectionBuild {
 export declare const ENTRY_CAP = 300;
 /** Whole-section cap (chars) — hard stop on injected volume regardless of count. */
 export declare const SECTION_CAP = 8000;
+/** Cap (chars) for the user-authored `memory:custom` instruction block (P1/M1,
+ *  2026-09-07). Every other injected section is budget-gated (SECTION_CAP /
+ *  ENTRY_CAP / identity mtime cache); this was the only one injected verbatim
+ *  with no ceiling, so a very long customSystemPrompt could bloat the resident
+ *  system prompt and ride every KV prefix. Injected text is clamped here; the
+ *  length guard is the injection-side hard floor — see index.ts memory:custom. */
+export declare const CUSTOM_CAP = 8000;
+/** Cap (chars) for a single identity file body (soul.md / user.md) injected into
+ *  the system prompt (audit 2026-09-07, item ③). The tier0 path had
+ *  sanitize + escHtml + SECTION_CAP, but buildIdentitySection injected the raw
+ *  file verbatim — a large user.md can bloat the resident prompt and a literal
+ *  `</identity-data>` could break the container. */
+export declare const IDENTITY_CAP = 8000;
+/** Newline-preserving sanitizer for identity markdown (audit 2026-09-07, item ③).
+ *  Deliberately NOT the tier0 `sanitizeText`: that folds `\s+` → single space,
+ *  which would flatten soul.md/user.md line structure (titles, lists). Identity
+ *  files keep their author-authored markdown lines; we only strip control
+ *  characters (keeping \n \r \t), normalize CRLF/CR → LF, and truncate to
+ *  `cap`. Escaping of structural `& < > "` is applied separately via escHtml. */
+export declare function sanitizeIdentity(raw: string, cap?: number): string;
+/** M1 (2026-09-07): clamp the user-authored custom system-prompt block to
+ *  `cap` (default CUSTOM_CAP) for injection. Non-string or blank → '' (no
+ *  section); longer text is trimmed then truncated so it can't bloat the
+ *  resident system prompt. Kept a pure function so the memory:custom thunk and
+ *  the smoke suite share one implementation. */
+export declare function clampCustomPrompt(raw: unknown, cap?: number): string;
 /** Collapse newlines/control chars, trim, clamp length, and neutralize leading
  *  markdown structure — the content may not inject lines or fake structure. */
 export declare function sanitizeText(raw: string, cap?: number): string;

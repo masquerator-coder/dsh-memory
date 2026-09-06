@@ -4,6 +4,14 @@ export type Kind = 'preference' | 'env' | 'lesson' | 'decision' | 'general';
 export type Tier = 0 | 1;
 export type Importance = 1 | 2 | 3 | 4 | 5;
 export type Epistemic = 'observed' | 'inferred' | 'subjective';
+/** The only kinds buildSection renders into the system prompt (audit ②,
+ *  2026-09-07). Budget alignment: `enforceBudget`'s memory-injection bucket counts
+ *  exactly these, so uninjectable kinds (lesson/decision/general) never eat the
+ *  budget quota that gates preference/env injection. Shared single source of the
+ *  injection-kind axis — store.ts and inject.ts both read it, so the budget gate
+ *  and the injection gate can't drift apart again. */
+export declare const INJECT_KINDS: readonly Kind[];
+export declare function isInjectableKind(kind: Kind | undefined): boolean;
 /** One durable fact in the semantic (global) memory store. */
 export interface MemoryEntry {
     id: string;

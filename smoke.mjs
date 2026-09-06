@@ -37,13 +37,13 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MemoryStore } from './lib/store.js'
+import { MemoryStore, sqlPathLiteral } from './lib/store.js'
 import { DAY_MS, DEFAULT_FORGET_DAYS, heatOf, shouldArchive, shouldDelete, shouldDemote } from './lib/heat.js'
 import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
-import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
+import { buildIdentitySection, buildSection, clampCustomPrompt, CUSTOM_CAP, IDENTITY_CAP, PROTOCOL_TEXT, protocolSectionText, sanitizeIdentity } from './lib/inject.js'
 import { fetchInternetEpochMs, formatLocalDate, renderDateSection, resolveSystemTimeZone, TimeSource } from './lib/time-ctx.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { buildMarkdownBundle, mdSafe, renderEpisodesMarkdown, renderIdentityMarkdown, renderMemoriesMarkdown } from './lib/md-export.js'
@@ -149,6 +149,16 @@ group('G6 exponential heat decay (M2)')
   const freq = { layer: 'memory', kind: 'env', last_accessed: now, window_freq: 10 }
   const base = { layer: 'memory', kind: 'env', last_accessed: now, window_freq: 0 }
   assert('frequency boost raises heat', heatOf(freq, fd, now) > heatOf(base, fd, now))
+  // audit ① heatOf zeroes an EXPIRED window's stale freq (window_start present,
+  // windowMs supplied, window elapsed) — the old code kept the high boost and
+  // stalled demotion. No window_start / no windowMs → legacy behavior preserved.
+  const staleFreq = { layer: 'memory', kind: 'general', last_accessed: now, window_freq: 100, window_start: now - 100 * DAY }
+  const expiredHeat = heatOf(staleFreq, fd, now, 30 * DAY_MS)
+  assert('heatOf expired window zeroes stale freq (freq 100 → boost 1)', Math.abs(expiredHeat - heatOf({ ...staleFreq, window_freq: 0 }, fd, now)) < 0.0001)
+  const inWindow = { layer: 'memory', kind: 'general', last_accessed: now, window_freq: 100, window_start: now - 5 * DAY_MS }
+  assert('heatOf active window keeps freq boost', heatOf(inWindow, fd, now, 30 * DAY_MS) > heatOf({ ...inWindow, window_freq: 0 }, fd, now))
+  // windowMs omitted → window_start ignored (legacy), freq still counted.
+  assert('heatOf no windowMs → legacy freq counted', heatOf(staleFreq, fd, now) > heatOf({ ...staleFreq, window_freq: 0 }, fd, now))
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +619,18 @@ group('G17 budget enforcement (P1-7/8/9) + delete snapshot (P1-13)')
   assert('P1-8 overflow reachable (importance-5 core exceeds memory budget → rejected)', o2.overflowed === true)
   o.close(); rmSync(od, { recursive: true, force: true })
 
+  // Audit ② (2026-09-07): an uninjectable protected core (lesson importance 5)
+  // must NOT consume the memory-injection bucket nor reject an injectable add.
+  // Under the old kind-agnostic budget it DID count → overflow → the env add that
+  // would actually be injected was rejected. Direction A fixes the misalignment.
+  const bad = mkdtempSync(join(tmpdir(), 'dsh-memory-ba-'))
+  const ba = new MemoryStore(bad, { tier0: 500, user: 500, memory: 10 })
+  ba.batch([{ action: 'add', layer: 'memory', kind: 'lesson', importance: 5, content: '不受注入的受保护教训核心正文补足长度到二十个字符以上一二三四五' }])
+  const rA = ba.batch([{ action: 'add', layer: 'memory', kind: 'env', importance: 4, content: '真正会被注入的环境事实正文补足长度到二十个字符以上六七八九十' }])
+  assert('audit② uninjectable protected core does not eat injection bucket (injectable env add lands)',
+    rA.overflowed === false && rA.applied.length === 1)
+  ba.close(); rmSync(bad, { recursive: true, force: true })
+
   // P1-9: silent demotion is now surfaced — ApplyResult.demoted is populated.
   const dd = mkdtempSync(join(tmpdir(), 'dsh-memory-bd-'))
   const dv = new MemoryStore(dd, { tier0: 500, user: 500, memory: 50 })
@@ -837,6 +859,19 @@ group('G21 M9 identity sections (soul.md / user.md)')
   const u = buildIdentitySection(s.dir, 'user.md', '用户画像')
   assert('M9 BOM stripped from identity file', u.empty === false && !u.text.startsWith('\uFEFF') && u.text.includes('中文交流'))
   assert('M9 user(void) closes the container too', u.text.endsWith('</identity-data>') && u.text.includes('\n<identity-data>\n'))
+  // audit ③: a literal </identity-data> in the file must be escaped so it can't
+  // close the container early (same class as the memory-entry fix); the body
+  // must also not re-open structure after the closing tag.
+  writeFileSync(join(s.dir, 'soul.md'), '人格：负责。</identity-data> 后续内容仍属文件正文。', 'utf8')
+  const esc = buildIdentitySection(s.dir, 'soul.md', 'AI 本人')
+  assert('M1 identity literal </identity-data> is escaped (&lt;/identity-data&gt;)',
+    esc.text.includes('&lt;/identity-data&gt;') && !esc.text.includes('>\n 后续内容'))
+  assert('M1 escaped literal cannot forge a second close tag', esc.text.split('</identity-data>').length === 2)
+  // audit ③ cap: oversized identity body is truncated to IDENTITY_CAP.
+  writeFileSync(join(s.dir, 'soul.md'), 'X'.repeat(IDENTITY_CAP) + 'TAILSHOULDNOTAPPEAR', 'utf8')
+  const capped = buildIdentitySection(s.dir, 'soul.md', 'AI 本人')
+  assert('M1 identity body truncated to IDENTITY_CAP, tail dropped',
+    !capped.text.includes('TAILSHOULD') && capped.text.length <= ('# 身份AI 本人（soul.md）\n'.length + 100 + IDENTITY_CAP))
   s.close(); rmSync(t, { recursive: true, force: true })
 }
 
@@ -1527,6 +1562,45 @@ group('G42 human manual curation (updateMemory / deleteMemory / resetStore)')
     assert('G42 reset store remains usable', s.activeEntries().length === 1)
     s.close(); rmSync(t, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+group('G43 audit fixes 2026-09-07 (M1 / M2 / L1)')
+{
+  // M1 — customSystemPrompt is injected with a hard clamp to CUSTOM_CAP.
+  assert('M1 clamp: blank / non-string → empty', clampCustomPrompt(null) === '' && clampCustomPrompt('   ') === '')
+  assert('M1 clamp: short text passes through trimmed', clampCustomPrompt('  保持简洁。  ') === '保持简洁。')
+  assert('M1 clamp: over-CUSTOM_CAP text truncated to CUSTOM_CAP', clampCustomPrompt('x'.repeat(CUSTOM_CAP + 500)).length === CUSTOM_CAP)
+  assert('M1 clamp: truncation keeps the head, drops the tail',
+    clampCustomPrompt('A'.repeat(CUSTOM_CAP) + 'TAIL') === 'A'.repeat(CUSTOM_CAP))
+
+  // M2 — validateBackup rejects a memories table that lacks rowToEntry columns.
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g43m2-'))
+    const badDb = join(t, 'bad.db')
+    const db = new DatabaseSync(badDb)
+    // Same table NAME but a foreign/mismatched schema — must be refused.
+    db.exec('CREATE TABLE memories (id TEXT PRIMARY KEY, solo TEXT NOT NULL); CREATE TABLE episodes (id TEXT);')
+    db.close()
+    const chk = MemoryStore.validateBackup(badDb)
+    assert('M2 rejects memories missing rowToEntry columns', chk.ok === false && /缺少列/.test(chk.error))
+    rmSync(t, { recursive: true, force: true })
+  }
+  {
+    // A genuine exportSnapshot still passes validation (schema intact).
+    const okT = mkdtempSync(join(tmpdir(), 'dsh-mem-g43m2ok-'))
+    const s = new MemoryStore(okT)
+    const good = join(okT, 'good.db')
+    s.exportSnapshot(good)
+    const ok = MemoryStore.validateBackup(good)
+    assert('M2 valid snapshot still validates', ok.ok === true && ok.memories >= 0)
+    s.close(); rmSync(okT, { recursive: true, force: true })
+  }
+
+  // L1 — sqlPathLiteral is the single escaping point for VACUUM INTO paths.
+  assert('L1 doubles single quotes', sqlPathLiteral("a'b") === "a''b")
+  assert('L1 forward-slashes backslashes (Windows)', sqlPathLiteral('C:\\dir\\file.db') === 'C:/dir/file.db')
+  assert('L1 escapes quote + backslash together', sqlPathLiteral("C:\\x\\o'b") === "C:/x/o''b")
 }
 
 // ---------------------------------------------------------------------------

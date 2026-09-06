@@ -26,7 +26,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
-import { buildIdentitySection, buildSection, protocolSectionText, WRITE_BOUNDARY_TEXT } from './inject.js'
+import { buildIdentitySection, buildSection, clampCustomPrompt, protocolSectionText, WRITE_BOUNDARY_TEXT } from './inject.js'
 import { resolveSystemTimeZone, renderDateSection, TimeSource } from './time-ctx.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0 } from './l0.js'
@@ -255,13 +255,13 @@ export const Config: z<Config> = z.object({
   suppressLeadMinutes: z.number().default(SUPPRESS_LEAD_MINUTES),
   timeZone: z.string().default(TIME_ZONE),
   enableIdentity: z.boolean().default(true),
-  timeInjection: z.boolean().default(true),
+  timeInjection: z.boolean().default(false),
   timeRefreshIntervalMs: z.number().default(TIME_REFRESH_INTERVAL_MS),
   enabled: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.enabled),
   lessonDraftEnabled: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled),
   lessonInstantJudge: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge),
   lessonUseLlm: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonUseLlm),
-  customPromptEnabled: z.boolean().default(true),
+  customPromptEnabled: z.boolean().default(false),
   customSystemPrompt: z.string().default(''),
 })
 
@@ -293,6 +293,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       memory: config.budgetMemory ?? BUDGET_MEMORY,
     },
     config.windowDays ?? WINDOW_DAYS,
+    undefined, // forgetDays default
+    config.importanceThreshold ?? IMPORTANCE_THRESHOLD,
   )
 
   const enableInjection = config.enableInjection ?? true
@@ -316,7 +318,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   const l0IdleMinutes = config.l0IdleMinutes ?? L0_IDLE_MINUTES
   const checkMinutes = config.checkMinutes ?? CHECK_MINUTES
   const enableIdentity = config.enableIdentity ?? true
-  const timeInjection = config.timeInjection ?? true
+  const timeInjection = config.timeInjection ?? false
   const timeRefreshIntervalMs = config.timeRefreshIntervalMs ?? TIME_REFRESH_INTERVAL_MS
   const suppressCfg: SuppressCfg = {
     suppressWindows: config.suppressWindows ?? SUPPRESS_WINDOWS,
@@ -338,7 +340,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     // time-injection: overwritten from the settings document when present.
     timeInjection: timeInjection,
     // custom system-prompt injection: master switch + user-authored guidance.
-    customPromptEnabled: config.customPromptEnabled ?? true,
+    customPromptEnabled: config.customPromptEnabled ?? false,
     customSystemPrompt: config.customSystemPrompt ?? '',
     // R10: refine-model selection lives in the settings document (not cordis
     // config) — auto by default, manual pin set from the settings panel.
@@ -560,8 +562,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       text: () => {
         if (!runtime.enabled) return ''
         if (!runtime.customPromptEnabled) return '' // 2026-09-06: master switch for this section
-        const raw = runtime.customSystemPrompt
-        return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : ''
+        // M1 (2026-09-07): injection-side hard floor — clamp the user block to
+        // CUSTOM_CAP so a very long customSystemPrompt can't bloat the resident
+        // system prompt (all other injected sections are budget-gated).
+        return clampCustomPrompt(runtime.customSystemPrompt)
       },
     })
 

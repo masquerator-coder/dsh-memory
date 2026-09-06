@@ -36,6 +36,7 @@ import type {
   RecallHit,
   Tier,
 } from './types.js'
+import { isInjectableKind } from './types.js'
 import { DAY_MS, heatOf, resolveForgetDays, shouldArchive, shouldDelete, shouldDemote } from './heat.js'
 import { contentSimilarity, isNearDupCandidate, isLowQuality, qualityScore } from './quality.js'
 import { DDL, rebuildFts } from './schema.js'
@@ -75,6 +76,17 @@ export function contentId(content: string): string {
 /** Escape SQL LIKE wildcards for use with an `ESCAPE '\'` clause. */
 function escapeLike(s: string): string {
   return String(s).replace(/[\\%_]/g, '\\$&')
+}
+
+/** L1 (2026-09-07): render an absolute filesystem path as a SQL single-quoted
+ *  string literal for `VACUUM INTO '<path>'`. SQLite does NOT support bound
+ *  parameters for VACUUM INTO, so the path MUST be escaped inline: single
+ *  quotes doubled (''), backslashes → forward slashes (backslash is not a SQL
+ *  escape and breaks parsing on Windows). Kept as one single point of truth so
+ *  every call site can't drift — grep `VACUUM INTO` and route every use through
+ *  this helper rather than hand-escaping again. */
+export function sqlPathLiteral(path: string): string {
+  return String(path).replace(/\\/g, '/').replace(/'/g, "''")
 }
 
 export interface ListFilter {
@@ -126,6 +138,12 @@ export class MemoryStore {
   readonly budget: MemoryBudget
   readonly windowDays: number
   readonly forgetDays: ForgetDays
+  /** Minimum importance for a preference/env memory to render into the system
+   *  prompt (audit ②, 2026-09-07). Mirrors the injection threshold used by
+   *  buildSection so the memory-injection budget bucket counts exactly what will
+   *  actually be injected. Default 1 = structural kind-based set; index.ts passes
+   *  the configured importanceThreshold. */
+  readonly injectThreshold: number
   private db: DatabaseSync
   // P3-1: these statements are (re)assigned by prepareStatements() — not readonly
   // so a backup import can hot-swap the connection (see replaceWithBackup).
@@ -146,13 +164,14 @@ export class MemoryStore {
    *  combination SQL (list/recall) yields a bounded, structural key set. */
   private readonly stmtCache = new Map<string, ReturnType<DatabaseSync['prepare']>>()
 
-  constructor(home = resolveDshHome(), budget: MemoryBudget = DEFAULT_BUDGET, windowDays = 30, forgetDays: ForgetDays = resolveForgetDays()) {
+  constructor(home = resolveDshHome(), budget: MemoryBudget = DEFAULT_BUDGET, windowDays = 30, forgetDays: ForgetDays = resolveForgetDays(), injectThreshold = 1) {
     this.dir = join(home, 'memory')
     mkdirSync(this.dir, { recursive: true })
     this.dbPath = join(this.dir, 'memory.db')
     this.budget = budget
     this.windowDays = windowDays
     this.forgetDays = forgetDays
+    this.injectThreshold = injectThreshold
     // P1-15: node:sqlite is experimental before Node 24 and unavailable before
     // 22.5. Give a clear error (vs. a raw crash) and rely on `engines`/ability.
     try {
@@ -168,6 +187,13 @@ export class MemoryStore {
     rebuildFts(this.db)
 
     this.prepareStatements()
+  }
+
+  /** Sliding-window length in ms for the heat frequency signal (audit 2026-09-07).
+   *  Passed to {@link heatOf} so an expired window's stale `window_freq` no longer
+   *  lifts heat and stalls demotion. */
+  private windowMs(): number {
+    return this.windowDays * DAY_MS
   }
 
   /**
@@ -225,10 +251,7 @@ export class MemoryStore {
    * restorable later via {@link replaceWithBackup}. Zero dependency.
    */
   exportSnapshot(destPath: string): BackupStats {
-    // Single-quote SQL string literal escaping; forward-slash the path so it
-    // parses cleanly on every platform (backslashes are not SQL escapes).
-    const abs = destPath.replace(/\\/g, '/').replace(/'/g, "''")
-    this.db.exec(`VACUUM INTO '${abs}'`)
+    this.db.exec(`VACUUM INTO '${sqlPathLiteral(destPath)}'`)
     const st = statSync(destPath)
     return {
       size: st.size,
@@ -259,6 +282,22 @@ export class MemoryStore {
       if (!names.has('memories') || !names.has('episodes')) {
         return { ok: false, error: '不是 dsh-memory 备份（缺少 memories / episodes 表）' }
       }
+      // M2 (2026-09-07): beyond table existence, the hot-swap reopens this file
+      // as the live store and rowToEntry reads its columns straight off (via
+      // `as` casts that never throw). A same-named-table but differently-shaped
+      // backup (corrupt, foreign, or an older schema) would otherwise pass and
+      // yield garbage reads/behaviour after import. Cheap PRAGMA read on the
+      // already-open read-only handle — reject if any column rowToEntry depends
+      // on is missing.
+      const colNames = (db.prepare('PRAGMA table_info(memories)').all() as { name: string }[]).map((c) => c.name)
+      const requiredCols = [
+        'id', 'layer', 'kind', 'tier', 'topic', 'content', 'importance', 'quality',
+        'epistemic', 'heat', 'created', 'updated', 'last_accessed', 'archived', 'low_quality',
+      ] as const
+      const missing = requiredCols.filter((c) => !colNames.includes(c))
+      if (missing.length > 0) {
+        return { ok: false, error: `不是 dsh-memory 备份（memories 表缺少列: ${missing.join('，')}）` }
+      }
       const mc = db.prepare('SELECT COUNT(*) AS c FROM memories').get() as { c: number }
       const ec = db.prepare('SELECT COUNT(*) AS c FROM episodes').get() as { c: number }
       return { ok: true, memories: Number(mc.c), episodes: Number(ec.c) }
@@ -284,8 +323,7 @@ export class MemoryStore {
     // 1. Safety net: snapshot the current state before clobbering it.
     const bakPath = join(this.dir, 'memory.db.pre-import.bak')
     try {
-      const bak = bakPath.replace(/\\/g, '/').replace(/'/g, "''")
-      this.db.exec(`VACUUM INTO '${bak}'`)
+      this.db.exec(`VACUUM INTO '${sqlPathLiteral(bakPath)}'`)
     } catch (e) {
       // Non-fatal: import proceeds, but surface so the user knows rollback is unavailable.
       console.warn('[dsh-memory] pre-import safety backup failed:', e instanceof Error ? e.message : e)
@@ -680,7 +718,7 @@ export class MemoryStore {
             importance: op.importance ?? existing.importance,
             quality,
             epistemic: op.epistemic ?? existing.epistemic,
-            heat: heatOf(existing, this.forgetDays), created: existing.created, updated: now,
+            heat: heatOf(existing, this.forgetDays, now, this.windowMs()), created: existing.created, updated: now,
             // R1 (review 2026-08-30): re-adding content that matches an ARCHIVED
             // entry reactivates it — the tool says "已记入", so the fact must become
             // visible/recallable again. Keeping the old archived=1 silently broke
@@ -746,7 +784,7 @@ export class MemoryStore {
         tier, topic: newTopic, content,
         importance: op.importance ?? target.importance,
         quality, epistemic: op.epistemic ?? target.epistemic,
-        heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
+        heat: heatOf(target, this.forgetDays, now, this.windowMs()), created: target.created, updated: now,
         last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
         window_freq: target.window_freq, window_start: target.window_start,
         archived_at: target.archived_at, session_id: op.sessionId ?? target.session_id,
@@ -774,7 +812,7 @@ export class MemoryStore {
         }
         this.stmt(
           'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
-        ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now), 'explicit-remove')
+        ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now, this.windowMs()), 'explicit-remove')
         this.hardDeleteMemory(target.id)
       } else {
         this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, target.id)
@@ -793,6 +831,22 @@ export class MemoryStore {
    * resident core and is never demoted — so if those alone overflow a bucket, the
    * batch is rejected (overflow becomes truly reachable, P1-8). Returns the ids
    * demoted and whether budget still exceeds after demotion (P1-9 surfaces them).
+   *
+   * Audit ② (2026-09-07): the memory bucket previously counted EVERY memory-layer
+   * tier0 entry regardless of kind, while buildSection only injects
+   * kind∈{preference,env} (isInjectableKind) above the injection threshold. So an
+   * uninjectable protected (importance≥5) lesson/decision/general ate the injection
+   * budget and could even force a reject of an *injectable* add (budget gate targets
+   * something the injection gate never renders). Fix — direction A: the memory
+   * bucket now counts only what buildSection actually injects
+   * (isInjectableKind && importance>=injectThreshold, decided by the SAME
+   * predicate as injection), and its squeeze demotes only injectable cold entries.
+   * Uninjectable tier0 still counts toward the global tier0 cap and is handled over
+   * time by forgetRun's heat demote/archive — but it can no longer consume the
+   * injection quota or trigger injection overflow. Three independent uses tracked:
+   *   injectUse = memory-layer entries that would render (the injection gate)
+   *   usrUse    = user-layer entries (immortality-resident set)
+   *   totalUse  = ALL tier0 (injection + storage cap)
    */
   private enforceBudget(now: number): { demoted: string[]; over: boolean } {
     const demoted: string[] = []
@@ -801,14 +855,19 @@ export class MemoryStore {
     // protected resident core (never demoted) but still counts toward usage.
     const all = this.list({ tier: 0, includeArchived: false, includeLowQuality: false })
     const demotable = all.filter(e => e.importance < 5)
-      .sort((a, b) => heatOf(a, this.forgetDays, now) - heatOf(b, this.forgetDays, now) || a.importance - b.importance)
+      .sort((a, b) => heatOf(a, this.forgetDays, now, this.windowMs()) - heatOf(b, this.forgetDays, now, this.windowMs()) || a.importance - b.importance)
     const totalOf = (pred: (e: MemoryEntry) => boolean): number => {
       let n = 0
       for (const e of all) { if (!done.has(e.id) && pred(e)) n += e.content.length }
       return n
     }
-    const memUse = (): number => totalOf(e => e.layer !== 'user')
+    // SAME predicate buildSection uses (audit ②), so the injection gate and the
+    // budget gate cannot drift apart. Circular-import-free via types.ts.
+    const injectable = (e: MemoryEntry): boolean =>
+      e.layer !== 'user' && isInjectableKind(e.kind) && e.importance >= this.injectThreshold
+    const injectUse = (): number => totalOf(injectable)
     const usrUse = (): number => totalOf(e => e.layer === 'user')
+    const totalUse = (): number => totalOf(() => true)
     const demote = (e: MemoryEntry): void => {
       this.stmt('UPDATE memories SET tier = 1 WHERE id = ?').run(e.id)
       done.add(e.id)
@@ -820,10 +879,10 @@ export class MemoryStore {
         demote(e)
       }
     }
-    squeeze(e => e.layer !== 'user', () => memUse() > this.budget.memory)
+    squeeze(injectable, () => injectUse() > this.budget.memory)
     squeeze(e => e.layer === 'user', () => usrUse() > this.budget.user)
-    squeeze(() => true, () => memUse() + usrUse() > this.budget.tier0)
-    const over = memUse() > this.budget.memory || usrUse() > this.budget.user || (memUse() + usrUse()) > this.budget.tier0
+    squeeze(() => true, () => totalUse() > this.budget.tier0)
+    const over = injectUse() > this.budget.memory || usrUse() > this.budget.user || totalUse() > this.budget.tier0
     return { demoted, over }
   }
 
@@ -932,7 +991,7 @@ export class MemoryStore {
     this.writeMemory(target.id, {
       layer, kind, tier: low ? 1 : target.tier, topic, content: newContent,
       importance, quality, epistemic: target.epistemic,
-      heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
+      heat: heatOf(target, this.forgetDays, now, this.windowMs()), created: target.created, updated: now,
       last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
       window_freq: target.window_freq, window_start: target.window_start,
       archived_at: target.archived_at, session_id: target.session_id,
@@ -955,7 +1014,7 @@ export class MemoryStore {
     }
     this.stmt(
       'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
-    ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now), 'manual-delete')
+    ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now, this.windowMs()), 'manual-delete')
     this.hardDeleteMemory(id)
     return { ok: true, archived: false }
   }
@@ -978,8 +1037,7 @@ export class MemoryStore {
     let backedUp = true
     try {
       const bakPath = join(this.dir, 'memory.db.pre-reset.bak')
-      const bak = bakPath.replace(/\\/g, '/').replace(/'/g, "''")
-      this.db.exec(`VACUUM INTO '${bak}'`)
+      this.db.exec(`VACUUM INTO '${sqlPathLiteral(bakPath)}'`)
     } catch (e) {
       backedUp = false
       console.warn('[dsh-memory] pre-reset safety backup failed:', e instanceof Error ? e.message : e)
@@ -1112,7 +1170,7 @@ export class MemoryStore {
         else if (hit >= Math.max(1, Math.ceil(cjkKw.length / 2))) base += 3
       }
       if (base === 0) continue
-      const heat = heatOf(e, this.forgetDays, now)
+      const heat = heatOf(e, this.forgetDays, now, this.windowMs())
       const score = base * (weighting ? epiMult(e.epistemic) : 1) * (0.5 + 0.5 * heat)
       scored.push({ entry: e, score })
     }
@@ -1522,7 +1580,7 @@ export class MemoryStore {
     try {
       // 1. demote cold tier-0 memories
       for (const e of this.list({ tier: 0, includeArchived: false, includeLowQuality: true })) {
-        if (shouldDemote(e, forgetDays, now)) {
+        if (shouldDemote(e, forgetDays, now, this.windowMs())) {
           this.stmt('UPDATE memories SET tier = 1, updated = ? WHERE id = ?').run(now, e.id)
           demoted += 1
           decisions.push(`demote:${e.id}`)
@@ -1530,7 +1588,7 @@ export class MemoryStore {
       }
       // 2. archive cold memories
       for (const e of this.activeEntries()) {
-        if (shouldArchive(e, forgetDays, now)) {
+        if (shouldArchive(e, forgetDays, now, this.windowMs())) {
           this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, e.id)
           archivedMem += 1
           decisions.push(`archive:${e.id}`)
@@ -1549,7 +1607,7 @@ export class MemoryStore {
           // hardDeleteMemory, so this row is the only durable evidence for rollback.
           this.stmt(
             'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
-          ).run(now, e.id, e.content, e.topic, e.importance, e.quality, heatOf(e, this.forgetDays, now), 'observed-observation-passed')
+          ).run(now, e.id, e.content, e.topic, e.importance, e.quality, heatOf(e, this.forgetDays, now, this.windowMs()), 'observed-observation-passed')
           this.hardDeleteMemory(e.id)
           deletedMem += 1
           decisions.push(`delete:${e.id}`)
