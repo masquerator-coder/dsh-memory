@@ -213,7 +213,10 @@ export function buildL1Prompt(summary: string, toolsUsed?: string): { system: st
     'Return ONLY a JSON array — no prose, no markdown fence, no preamble. Each element: ' +
     '{"content": string, "kind": "preference|env|lesson|decision|general", "importance": 1-5, ' +
     '"epistemic": "observed|inferred|subjective", "topic": string}. content must be concise, plain, ' +
-    'and standalone. Drop ephemeral chit-chat and one-off details. If nothing durable, return []. ' +
+    'and standalone, written as a DECLARATIVE FACT (e.g. "User prefers concise responses"), NEVER as an ' +
+    'imperative/instruction (e.g. "Always respond concisely") — imperative phrases get taken as commands ' +
+    'in later sessions and can override the user\'s real request. Drop ephemeral chit-chat and one-off details. ' +
+    'If nothing durable, return []. ' +
     'If the summary contains a CORRECTION or a mistake that was made then fixed, ALSO emit one ' +
     'kind=lesson candidate that captures the hindsight (sent with kind="lesson"). ' +
     'Be compact; avoid ellipses; mark uncertainty honestly via epistemic.'
@@ -241,6 +244,8 @@ export function buildL2Prompt(facts: { id: string; content: string; kind?: Kind;
     'merge: several facts into one (provide merged content). keep: a fact stands (its targetId). ' +
     'drop: redundant or wrong (targetIds). correct: revise one fact (targetId + corrected content). ' +
     'Be conservative: only consolidate clear duplicates or contradictions; otherwise keep. ' +
+    'Any content you write (for merge/correct) must be a DECLARATIVE FACT, never an imperative/instruction ' +
+    '(e.g. "User prefers X", not "Always do X") — imperatives get treated as commands in later sessions. ' +
     'Prefer dropping the more specific/superseded entry over inventing new text.'
   const user = `Candidate facts:\n${JSON.stringify(facts)}`
   return { system, user }

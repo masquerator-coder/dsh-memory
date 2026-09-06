@@ -14,6 +14,7 @@
  *  - per-entry and whole-section length caps bound the injection volume
  */
 import type { MemoryStore } from './store.js';
+import type { MemoryEntry } from './types.js';
 export interface SectionBuild {
     text: string;
     empty: boolean;
@@ -25,6 +26,19 @@ export declare const SECTION_CAP = 8000;
 /** Collapse newlines/control chars, trim, clamp length, and neutralize leading
  *  markdown structure — the content may not inject lines or fake structure. */
 export declare function sanitizeText(raw: string, cap?: number): string;
+/** FOLD (P1, 2026-09-06): collapse near-duplicate tier-0 entries before
+ *  injection so one fact — even if it was re-written/duplicated in the store by
+ *  a non-findCanonical path — is presented only once in the system prompt.
+ *
+ *  Conservative: folds only within the SAME kind and only when
+ *  `isNearDupCandidate` fires. That gate needs BOTH a contiguous run (LCS>=0.55)
+ *  AND a shared token mass (tokenContain>=0.55), so it catches re-worded
+ *  duplicates that strict SIM_DUP would miss, yet does NOT collapse distinct
+ *  facts that merely share boilerplate (verified: two different workspace paths
+ *  score tokenContain 0.44 / LCS 0.21 → not folded). Earlier entries (list() is
+ *  ordered `updated DESC`, newest first) win as the canonical representative.
+ *  Pure rule, zero LLM, bounded — safe for the hot injection path. */
+export declare function foldNearDuplicates(entries: MemoryEntry[]): MemoryEntry[];
 export declare function buildSection(store: MemoryStore, opts?: {
     importanceThreshold?: number;
 }): SectionBuild;

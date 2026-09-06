@@ -1251,7 +1251,8 @@ group('G37 tier0 buildSection noise trims')
   assert('tail keeps write-guard (only non-protocol part)', txt.includes('避免记录任务进度与一次性过程'))
   assert('redundant recall/add guidance removed (now owned by memory:protocol)',
     !txt.includes('需要详情用 memory_recall') && !txt.includes('学到稳定事实'))
-  assert('single usage report (header drops raw char count)', txt.includes('单条≤300') && txt.includes('记忆占用'))
+  assert('single compact usage line (P2 converged stats, no raw char count)',
+    txt.includes('单条≤300') && txt.includes('占用') && txt.includes('情景'))
   assert('does not duplicate raw-char usage in header', !txt.includes('占用 25字符'))
   s.close()
 }
