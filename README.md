@@ -122,6 +122,8 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 - **导出备份** —— 下载一个「整库」一致快照 `.db`（`VACUUM INTO`，含记忆、会话摘要、FTS 与全部审计轨，WAL 无关），可离线保存/迁移。
 - **导入备份** —— 选择一个 `.db` 快照**替换全部**现有数据；导入前先读-only 校验（非 SQLite 或缺 `memories`/`episodes` 表直接拒绝、不清空现有数据），成功后热切换连接——既有路由/工具/后台 pass 无需重启即针对恢复后数据继续工作，同时把导入前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚。
 
+面板另有 **导出 Markdown**（`/memory/export/markdown`，MD-EXPORT，2026-09-06，同受 loopback 信任模型约束）——**分层导出**全部记忆为 3 个 Markdown 档案：`01-memories.md`（**全部**语义记忆，按 状态→layer→kind→importance 分节，含**已归档与低质量**）、`02-episodes.md`（全部会话摘要，含已归档，时间倒序）、`03-identity.md`（soul.md / user.md 原文）。**只读、零 LLM**：任何时点导出一致，不触发凝练/遗忘、不改库；数据源与「查看记忆」弹窗同口径，UI 所见即所得。注册为前端 `fetch` 后逐个浏览器下载（不打 zip、零新增依赖）。
+
 ### 2.3 身份文件（soul.md / user.md）
 
 - **soul.md**：AI 人格 / 行为准则，**只由人写**，插件永不自动改写。
@@ -193,7 +195,7 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
-**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/models`（R10：读取 dsh 已配置模型清单）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
+**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/models`（R10：读取 dsh 已配置模型清单）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）、`/memory/export/markdown`（MD-EXPORT：分层导出 Markdown 档案）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
 
 ---
 
@@ -337,9 +339,12 @@ npm run smoke   # 等价于 node smoke.mjs
 
 - **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除，保留单条≤300 提示）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（4 断言）全绿。
 
+- **记忆分层导出 Markdown（MD-EXPORT，2026-09-06，docs/MD-EXPORT.md）**：设置面板「记忆」新增「导出 Markdown」按钮（`/memory/export/markdown`，只读、零 LLM，同受 loopback 信任模型约束），分层导出全部记忆为 3 个 Markdown 档案——`01-memories.md`（全部语义记忆，按 **状态→layer→kind→importance** 分节，**含已归档与低质量**）、`02-episodes.md`（全部会话摘要，含已归档，时间倒序）、`03-identity.md`（soul.md / user.md 原文）。数据源与「查看记忆」弹窗同口径（所见即所得）；模型写的不可信 `content` 经 `mdSafe` 转义防伪造 markdown 结构。注册后浏览器逐个下载（不打 zip、零新增依赖）。新增 `docs/MD-EXPORT.md` 设计稿 + `smoke.mjs` 断言组 G41（20 断言）全绿。
+
 ---
 
 ## 设计文档
 
 - `docs/DESIGN.md` —— v3 设计稿（设计哲学、双信号热度推导、主动遗忘门槛、凝练管道）。
 - `docs/REFINE-REDESIGN.md` —— 凝练管道重构方案（L0/L1/L2 触发与降级）。
+- `docs/MD-EXPORT.md` —— 记忆分层导出为 Markdown 的设计方案（分层文件布局、格式、路由、测试）。

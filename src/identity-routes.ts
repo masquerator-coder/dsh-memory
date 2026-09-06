@@ -13,6 +13,7 @@
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
  *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
  *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
+ *   GET  /memory/export/markdown → { ok: true, ...summary } — layered Markdown archive (MD-EXPORT 2026-09-06)
  *
  * SECURITY (P1-3/G2/G3, review 2026-09-01): every route requires a loopback
  * source. The check uses socket.remoteAddress (transport-layer fact, cannot be
@@ -37,6 +38,7 @@ import type {
   ViewPayload,
 } from './shared-types.js'
 import { readIdentityFiles, writeIdentityFile } from './identity.js'
+import { buildMarkdownBundle } from './md-export.js'
 import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -367,6 +369,26 @@ export function registerControlRoutes(
     })()
   }
 
+  /** Layered Markdown archive of the whole store (MD-EXPORT 2026-09-06).
+   *  Pure read: all semantic memories (incl. archived/low-quality) + all
+   *  episodes (incl. archived) + soul/user identity → three ordered .md files,
+   *  returned as a JSON payload for the browser to download one by one. */
+  const markdownExport: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'GET') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const memories = store.list({ includeArchived: true })
+        const episodes = store.listEpisodes({ includeArchived: true })
+        const files = readIdentityFiles(store.dir)
+        const summary = buildMarkdownBundle({ memories, episodes, soul: files.soul, user: files.user })
+        writeJson(res, 200, { ok: true, ...summary })
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
   /** Return the refine-model catalog for the settings picker (R10). */
   const models: RouteHandler = (req: unknown, res: unknown): void => {
     void (async () => {
@@ -387,6 +409,7 @@ export function registerControlRoutes(
     { path: '/memory/trigger', handler: trigger },
     { path: '/memory/view', handler: view },
     { path: '/memory/models', handler: models },
+    { path: '/memory/export/markdown', handler: markdownExport },
     { path: '/memory/backup/export', handler: backupExport },
     { path: '/memory/backup/import', handler: backupImport },
   ]

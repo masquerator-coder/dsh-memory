@@ -66,3 +66,24 @@ export interface ViewPayload {
   topics: { topic: string; count: number }[]
   updatedMs: number
 }
+
+/** One Markdown file in the layered export bundle (/memory/export/markdown). */
+export interface MarkdownExportFile {
+  /** Stable, ordered file name (01-/02-/03- prefix keeps natural sort). */
+  name: string
+  content: string
+  /** Human label shown in the UI completion note. */
+  label: string
+  /** Item counts for the completion summary. */
+  counts: { memories?: number; episodes?: number }
+}
+
+/** Bundle-level summary returned by /memory/export/markdown. */
+export interface MarkdownExportSummary {
+  files: MarkdownExportFile[]
+  effective: number
+  archived: number
+  lowQuality: number
+  episodes: number
+  hasIdentity: boolean
+}

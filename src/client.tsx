@@ -19,7 +19,7 @@
 import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
 // L14 (audit 2026-09-05): HTTP-payload types shared with the Node server via
 // shared-types.ts (pure types — erased at compile time, zero bytes in the bundle).
-import type { RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload } from './shared-types.js'
+import type { MarkdownExportSummary, RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload } from './shared-types.js'
 
 /**
  * Memory/nav glyph — a neuron (soma + radiating dendrites + synapse nodes),
@@ -219,6 +219,10 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const [backupNote, setBackupNote] = useState<string | null>(null)
   const [backupError, setBackupError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  // MD-EXPORT: layered Markdown archive
+  const [mdExporting, setMdExporting] = useState(false)
+  const [mdExportNote, setMdExportNote] = useState<string | null>(null)
+  const [mdExportError, setMdExportError] = useState<string | null>(null)
   // R10: refine-model picker
   const [models, setModels] = useState<RefineModelsPayload>({ default: {}, candidates: [], failures: [] })
   useEffect(() => {
@@ -288,6 +292,44 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
     } finally {
       setImporting(false)
       if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  /** Download the layered Markdown archive (3 .md files, MD-EXPORT).
+   *  Fetches the bundle summary, then triggers a browser download per file. */
+  const downloadMarkdown = async (): Promise<SaveResult> => {
+    try {
+      setMdExporting(true)
+      setMdExportNote(null)
+      setMdExportError(null)
+      const resp = await fetch('/memory/export/markdown', { cache: 'no-store' })
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        return { ok: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      }
+      const summary = await resp.json() as Partial<MarkdownExportSummary & { ok: boolean; error?: string }>
+      if (summary.ok === false) return { ok: false, error: summary.error ?? '导出失败' }
+      const files = Array.isArray(summary.files) ? summary.files : []
+      for (const f of files) {
+        const blob = new Blob([f.content], { type: 'text/markdown;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = f.name
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+      }
+      const note = `已下载 ${files.length} 个 Markdown 档案：` +
+        files.map((f) => `${f.label}(${f.counts?.memories ?? f.counts?.episodes ?? ''})`).join('、') +
+        `。语义记忆 ${summary.effective ?? 0} 有效 / ${summary.archived ?? 0} 归档 / ${summary.lowQuality ?? 0} 低质，会话 ${summary.episodes ?? 0} 条。`
+      setMdExportNote(note)
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '网络错误' }
+    } finally {
+      setMdExporting(false)
     }
   }
 
@@ -468,6 +510,15 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
       </div>
       {backupNote && <div style={{ fontSize: 12, color: '#0a7a2f' }}>{backupNote}</div>}
       {backupError && <div style={{ fontSize: 12, color: '#c00' }}>{backupError}</div>}
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '10px 0', borderTop: '1px solid rgba(128,128,128,0.25)', marginTop: 4 }}>
+        <button type="button" disabled={mdExporting} onClick={() => { void downloadMarkdown() }} style={{ padding: '6px 10px' }}>
+          {mdExporting ? '导出中…' : '导出 Markdown'}
+        </button>
+        <span style={{ fontSize: 12, opacity: 0.7 }}>分层导出为 3 个 Markdown 档案：语义记忆（01）/ 情景摘要（02）/ 身份（03）。含已归档与低质量，只读不修改库。</span>
+      </div>
+      {mdExportNote && <div style={{ fontSize: 12, color: '#0a7a2f' }}>{mdExportNote}</div>}
+      {mdExportError && <div style={{ fontSize: 12, color: '#c00' }}>{mdExportError}</div>}
 
       {viewOpen && (
         <PanelModal title="记忆查看" onClose={() => setViewOpen(false)}>

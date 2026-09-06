@@ -46,6 +46,7 @@ import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, pa
 import { buildIdentitySection, buildSection, PROTOCOL_TEXT, protocolSectionText } from './lib/inject.js'
 import { fetchInternetEpochMs, formatLocalDate, renderDateSection, resolveSystemTimeZone, TimeSource } from './lib/time-ctx.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
+import { buildMarkdownBundle, mdSafe, renderEpisodesMarkdown, renderIdentityMarkdown, renderMemoriesMarkdown } from './lib/md-export.js'
 import { DatabaseSync } from 'node:sqlite'
 
 let passed = 0
@@ -1355,6 +1356,68 @@ group('G39 audit fixes 2026-09-05 (N1 force-remove snapshot + user-layer guard)'
     assert('G39 N1 snapshot reason is explicit-remove', snap && snap.reason === 'explicit-remove')
     s.close(); rmSync(t, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+group('G41 layered Markdown export (MD-EXPORT, pure)')
+{
+  // mdSafe: content is model-written untrusted text — must not forge md structure
+  const evil = '# 伪造标题\n- 伪造列表\n*强调* `code` [link](x)'
+  const safe = mdSafe(evil)
+  assert('G41 mdSafe collapses newline (single line)', !safe.includes('\n'))
+  assert('G41 mdSafe escapes # at line start', safe.includes('\\#'))
+  assert('G41 mdSafe escapes - / * / backtick / bracket', ['\\-', '\\*', '\\`', '\\['].every((t) => safe.includes(t)))
+
+  // A helper to build a minimal MemoryEntry for pure render tests.
+  const mk = (p) => ({
+    id: p.id, layer: p.layer, kind: p.kind, tier: p.tier ?? 1,
+    topic: p.topic, content: p.content, importance: p.importance,
+    quality: 80, epistemic: 'observed', heat: 1,
+    created: p.created ?? 1600000000000, updated: p.updated ?? 1600000000000,
+    last_accessed: 1600000000000, archived: p.archived ?? false,
+    low_quality: p.low_quality ?? false, window_freq: 0, window_start: 0,
+  })
+  const rows = [
+    mk({ id: 'v1', layer: 'memory', kind: 'lesson', topic: '部署', content: 'harness 推送 master 到 gitcode', importance: 5 }),
+    mk({ id: 'v2', layer: 'user', kind: 'preference', topic: '风格', content: '用户偏爱简洁中文回答', importance: 4 }),
+    mk({ id: 'a1', layer: 'memory', kind: 'general', topic: '旧事', content: '已归档的一次性内容', importance: 2, archived: true }),
+    mk({ id: 'l1', layer: 'memory', kind: 'env', topic: '配置', content: '低质量占位内容只用于测试', importance: 1, low_quality: true }),
+  ]
+  const md = renderMemoriesMarkdown(rows)
+  assert('G41 01 file has three state sections', ['一、有效记忆', '二、已归档记忆', '三、低质量记忆'].every((s) => md.includes(s)))
+  assert('G41 01 groups by layer + kind', md.includes('### 用户记忆') && md.includes('#### preference') && md.includes('#### lesson'))
+  assert('G41 01 contains ids (reversibly linkable)', ['`v1`', '`v2`', '`a1`', '`l1`'].every((id) => md.includes(id)))
+  assert('G41 01 header tallies counts', md.includes('有效 2 条') && md.includes('已归档 1 条') && md.includes('低质量 1 条'))
+  // importance ordering inside a kind section (lesson: only v1) — use user/preference not critical here
+
+  const eps = [
+    { id: 'ep2', session_id: 'sess-b', ts: 1700000000000, summary: '第二次迁移讨论', topic: '迁移', tools_used: '["memory"]', extracted: 1, archived: false, created: 1700000000000 },
+    { id: 'ep1', session_id: 'sess-a', ts: 1600000000000, summary: '第一次初始化', topic: '搭建', tools_used: undefined, extracted: 0, archived: false, created: 1600000000000 },
+  ]
+  const emd = renderEpisodesMarkdown(eps)
+  assert('G41 02 renders summary + session + tool + state', emd.includes('第二次迁移讨论') && emd.includes('sess-b') && emd.includes('memory') && emd.includes('已抽取'))
+  assert('G41 02 renders header', emd.includes('# dsh-memory 导出 — 情景会话摘要') && emd.includes('会话摘要 2 条'))
+  // newer first (ep2 before ep1 in output order)
+  assert('G41 02 newer episode appears above older', emd.indexOf('第二次迁移讨论') < emd.indexOf('第一次初始化'))
+
+  const imd = renderIdentityMarkdown('我是 soul。', '我是 user。')
+  assert('G41 03 embeds soul + user verbatim', imd.includes('我是 soul。') && imd.includes('我是 user。'))
+  assert('G41 03 renders section headers', imd.includes('## soul.md') && imd.includes('## user.md'))
+  const imdEmpty = renderIdentityMarkdown('   ', '')
+  assert('G41 03 empty identity shows placeholder', imdEmpty.includes('未创建'))
+
+  // buildMarkdownBundle assembles 3 ordered files + summary
+  const bundle = buildMarkdownBundle({ memories: rows, episodes: eps, soul: '我是 soul。', user: '我是 user。' })
+  assert('G41 bundle has exactly 3 files in order', bundle.files.map((f) => f.name).join(',') === '01-memories.md,02-episodes.md,03-identity.md')
+  assert('G41 bundle effective/archived/lowQuality/eps tallies', bundle.effective === 2 && bundle.archived === 1 && bundle.lowQuality === 1 && bundle.episodes === 2)
+  assert('G41 bundle hasIdentity true when soul/user non-empty', bundle.hasIdentity === true)
+  // empty store still yields 3 files, no throw
+  const empty = buildMarkdownBundle({ memories: [], episodes: [], soul: '', user: '' })
+  assert('G41 empty store → 3 files, no throw', empty.files.length === 3)
+  assert('G41 empty store → hasIdentity false', empty.hasIdentity === false)
+  assert('G41 empty memories still split states', renderMemoriesMarkdown([]).includes('（暂无）'))
+  // full integration sanity: what the route would send is JSON-serializable
+  assert('G41 bundle is JSON-serializable (route payload)', (() => { try { JSON.stringify(bundle.files); return true } catch { return false } })())
 }
 
 // ---------------------------------------------------------------------------

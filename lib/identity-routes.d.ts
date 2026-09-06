@@ -13,6 +13,7 @@
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
  *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
  *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
+ *   GET  /memory/export/markdown → { ok: true, ...summary } — layered Markdown archive (MD-EXPORT 2026-09-06)
  *
  * SECURITY (P1-3/G2/G3, review 2026-09-01): every route requires a loopback
  * source. The check uses socket.remoteAddress (transport-layer fact, cannot be
