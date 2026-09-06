@@ -44,7 +44,14 @@ export declare function buildSection(store: MemoryStore, opts?: {
 }): SectionBuild;
 /** Build an identity section from `<storeDir>/<file>` (e.g. soul.md / user.md).
  *  Missing/empty file → empty section (host omits it). File text is declared as
- *  data, not instructions (same untrusted-content rule as the tier0 section). */
+ *  data, not instructions (same untrusted-content rule as the tier0 section).
+ *  P0-5: like the tier0 `<memory-data>` container, the data BODY (the raw
+ *  human-authored markdown) is wrapped in an explicit `<identity-data>…</identity-data>`
+ *  container (2026-09-07). The title + declaration live OUTSIDE the container,
+ *  describing it; the closing tag makes the "identity data ends here" boundary
+ *  explicit so the model never reads the following segments (platform system
+ *  prompt / tool guidance / other sections) as identity/portrait data. Both tags
+ *  are constant literals → byte-stable per mtime (KV-prefix friendly). */
 export declare function buildIdentitySection(dir: string, file: string, label: string): SectionBuild;
 export declare const PROTOCOL_TEXT: string;
 /** Gate helper: returns the constant rules when enabled, '' when the master
