@@ -11,6 +11,9 @@
  *   POST /memory/identity/open   → { ok: true, path }    body: { file: 'soul'|'user' }  — open in a local editor
  *   POST /memory/trigger         → { ok: true, result }  — run an immediate condensation/identity/forget pass
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
+ *   POST /memory/memories/edit   → { ok: true }          body: { id, content?, topic?, importance?, kind?, layer? } — human manual edit
+ *   POST /memory/memories/delete → { ok: true, archived? } body: { id } — human manual delete
+ *   POST /memory/reset           → { ok: true, memories, episodes, backedUp } — FULL reset (keeps identity files)
  *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
  *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
  *   GET  /memory/export/markdown → { ok: true, ...summary } — layered Markdown archive (MD-EXPORT 2026-09-06)

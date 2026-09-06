@@ -190,6 +190,47 @@ export declare class MemoryStore {
      *  writeEpisode, P1-12). The old BEGIN IMMEDIATE threw "cannot start a
      *  transaction within a transaction" when composed. */
     batch(ops: MemoryOp[], sessionId?: string): ApplyResult;
+    /** Human manual edit — amend content / topic / importance / kind / layer of
+     *  one existing memory by its id. Preserves the row identity, created time,
+     *  access/heart stats and archived state; only the supplied fields change
+     *  (content/topic are the safety-critical ones and are validated). Returns
+     *  { ok } or a typed rejection. */
+    updateMemory(id: string, fields: {
+        content?: string;
+        topic?: string;
+        importance?: Importance;
+        kind?: Kind;
+        layer?: Layer;
+    }): {
+        ok: boolean;
+        error?: string;
+    };
+    /** Human manual delete — HARD-deletes a memory with a durable forget_deleted
+     *  snapshot (recoverable like active-forgetting hard-deletes, DESIGN §5.2).
+     *  user-layer facts are immortal: the delete falls back to a SOFT archive so
+     *  a manual "删除" can never permanently destroy a DESIGN-eternal fact.
+     *  Returns whether it hard-deleted (true) or soft-archived (false). */
+    deleteMemory(id: string): {
+        ok: boolean;
+        archived?: boolean;
+        error?: string;
+    };
+    /** FULL reset of the memory store (人力资源管理-style "重置记忆"). Wipes every
+     *  semantic memory, episode summary, correction/refine/forget audit trail and
+     *  lesson draft — returning the store to a blank slate. Identity FILES
+     *  (soul.md / user.md) live beside memory.db and are NOT touched: the user's
+     *  hand-written persona/画像 survive a reset, which is the expected semantics
+     *  for a "reset memories, keep my identity" action.
+     *
+     *  DESTRUCTIVE. A safety snapshot of the pre-reset state is VACUUM'd to
+     *  `memory.db.pre-reset.bak` first so a regretful reset can be undone manually
+     *  (same contract as replaceWithBackup's .pre-import.bak). Returns the counts
+     *  wiped. */
+    resetStore(): {
+        memories: number;
+        episodes: number;
+        backedUp: boolean;
+    };
     /** Refresh last_accessed + sliding-window frequency for recalled entries. */
     private touchAccess;
     recall(query: string, opts?: RecallOpts): RecallHit[];

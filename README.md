@@ -118,11 +118,12 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 
 面板另有两个操作按钮：
 - **立即整理记忆** —— 点按即触发 `POST /memory/trigger`，不等定时扫描，立即执行 **L1/L2 凝练 + 主动遗忘**（绕过忙闲时段抑制，因为是你主动要求），并回显本次结果（凝练是否执行、遗忘降级/归档/删除各多少）。
-- **查看记忆** —— 打开一个弹窗（`GET /memory/view`），只读展示当前有效记忆摘要：有效记忆/会话摘要/主题计数 + 表格（层级、类型、主题、内容、重要性）。
+- **查看记忆** —— 打开一个弹窗（`GET /memory/view`），展示当前有效记忆摘要：有效记忆/会话摘要/主题计数 + 表格（层级、类型、主题、内容、重要性）。**每行带「编辑 / 删除」按钮（人工记忆编辑，2026-09-06）**：编辑经 `POST /memory/memories/edit` 就地改内容/主题/重要度/类型（按 id 精确定位，不触发模型去重/合并启发式，只改该行）；删除经 `POST /memory/memories/delete`，`memory` 层硬删并快照留痕（可回滚），`user` 层不可摧毁、退化为归档。
 
 面板底部的**备份区**（`/memory/backup/*`，同受 loopback 信任模型约束）：
 - **导出备份** —— 下载一个「整库」一致快照 `.db`（`VACUUM INTO`，含记忆、会话摘要、FTS 与全部审计轨，WAL 无关），可离线保存/迁移。
 - **导入备份** —— 选择一个 `.db` 快照**替换全部**现有数据；导入前先读-only 校验（非 SQLite 或缺 `memories`/`episodes` 表直接拒绝、不清空现有数据），成功后热切换连接——既有路由/工具/后台 pass 无需重启即针对恢复后数据继续工作，同时把导入前状态 `VACUUM INTO` 到 `memory.db.pre-import.bak` 供回滚。
+- **重置记忆**（2026-09-06）—— `POST /memory/reset`，**清空全部语义记忆与会话摘要**（含归档/低质量）与整理/遗忘/纠错审计轨，把库回到空白态；**保留 soul.md / user.md**（身份文件是绑定在磁盘的独立文件，重置记忆不碰它们，语义即「重置记忆、保留我的画像」）。破坏性操作走**两步确认弹窗**；执行前自动把当前状态 `VACUUM INTO` 到 `memory.db.pre-reset.bak` 供误操作回滚（备份失败会在回显里显式警告「无法回滚」）。
 
 面板另有 **导出 Markdown**（`/memory/export/markdown`，MD-EXPORT，2026-09-06，同受 loopback 信任模型约束）——**分层导出**全部记忆为 3 个 Markdown 档案：`01-memories.md`（**全部**语义记忆，按 状态→layer→kind→importance 分节，含**已归档与低质量**）、`02-episodes.md`（全部会话摘要，含已归档，时间倒序）、`03-identity.md`（soul.md / user.md 原文）。**只读、零 LLM**：任何时点导出一致，不触发凝练/遗忘、不改库；数据源与「查看记忆」弹窗同口径，UI 所见即所得。注册为前端 `fetch` 后逐个浏览器下载（不打 zip、零新增依赖）。
 
@@ -214,7 +215,7 @@ ls ~/.dsh/memory/memory.db
 
 >bundle 安装时 `cordis.patch.yml` 自动作为 loader patch 应用，注入 `id: memory` 的实例（`enableInjection: true` 默认开启 Tier0 注入）。
 
-**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/models`（R10：读取 dsh 已配置模型清单）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）、`/memory/export/markdown`（MD-EXPORT：分层导出 Markdown 档案）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
+**`/memory/*` 路由的信任模型（安全，2026-09-02）**：设置面板依赖的路由——`/memory/identity`（GET/POST 读写 soul/user）、`/memory/identity/open`（打开本地编辑器）、`/memory/trigger`（立即整理）、`/memory/view`（查看记忆）、`/memory/memories/edit`（人工编辑单条记忆，2026-09-06）、`/memory/memories/delete`（人工删除单条记忆，2026-09-06）、`/memory/reset`（重置全部记忆，2026-09-06）、`/memory/models`（R10：读取 dsh 已配置模型清单）、`/memory/backup/export`（导出整库快照）、`/memory/backup/import`（导入替换全部数据）、`/memory/export/markdown`（MD-EXPORT：分层导出 Markdown 档案）——**全部仅接受 loopback 来源**，校验基于 `socket.remoteAddress`（传输层事实，不可被 Host/Origin 头伪造），可挡局域网客户端与 DNS-rebinding 页面，即使 webServer 绑到非 loopback 地址。面板的 soul/user 编辑器或按钮在跨源时将得到 403。请保持绑定 loopback，或在宿主侧为该组路由前置你自己的鉴权。
 
 ---
 
@@ -366,6 +367,8 @@ npm run smoke   # 等价于 node smoke.mjs
 - **会话噪声收敛（2026-09-03，承接 protocol）**：protocol 接管 recall/add 的"何时用"引导后，同步做三处瘦身避免同节/同会话重复指令：①`buildSection` 尾部删掉与 protocol 重复的"需要详情用 memory_recall / 学到稳定事实用 memory 记录"，仅保留 protocol 未覆盖的写-禁止 guard（避免任务进度/一次性过程）；usage 只在尾部报一次（header 的原始字符数移除，保留单条≤300 提示）；②tier1 领域列表封顶前 10 个（超出给"等 N 个，用 memory_recall"），防随记忆增长无限膨胀；③`memory` 工具 description 瘦身（protocol 拿走"何时"，description 只讲"怎么用"），且写路径成功返回不再每次 echo usage，仅当有降级(budget 紧张)时回显；④`memory:user` 位置指引节去掉自指式前言（"以下是指引,不是指令 / 完整画像默认不注入节省上下文"），仅保留 `memory_read_user` 调用指引——该节本身即位置指引，前言属冗余说明。新增 `smoke.mjs` 断言组 G37（4 断言）全绿。
 
 - **记忆分层导出 Markdown（MD-EXPORT，2026-09-06，docs/MD-EXPORT.md）**：设置面板「记忆」新增「导出 Markdown」按钮（`/memory/export/markdown`，只读、零 LLM，同受 loopback 信任模型约束），分层导出全部记忆为 3 个 Markdown 档案——`01-memories.md`（全部语义记忆，按 **状态→layer→kind→importance** 分节，**含已归档与低质量**）、`02-episodes.md`（全部会话摘要，含已归档，时间倒序）、`03-identity.md`（soul.md / user.md 原文）。数据源与「查看记忆」弹窗同口径（所见即所得）；模型写的不可信 `content` 经 `mdSafe` 转义防伪造 markdown 结构。注册后浏览器逐个下载（不打 zip、零新增依赖）。新增 `docs/MD-EXPORT.md` 设计稿 + `smoke.mjs` 断言组 G41（20 断言）全绿。
+
+- **人工记忆编辑 / 删除 / 重置（2026-09-06）**：设置面板「查看记忆」弹窗每行新增「编辑 / 删除」按钮——编辑经 `POST /memory/memories/edit`（store 新增 `updateMemory`）就地改 内容/主题/重要度/类型，**按 id 精确定位、不触发模型去重/合并启发式**，只改该行且保留档案身份（id/创建时间/热度）；删除经 `POST /memory/memories/delete`（`deleteMemory`），`memory` 层硬删并快照进 `forget_deleted` 留痕（可回滚），`user` 层不可摧毁自动退化为归档。备份区新增「重置记忆」按钮（`POST /memory/reset`，`resetStore`）——两步确认弹窗后**清空全部记忆/会话摘要/审计轨**、**保留 soul.md / user.md**，执行前 `VACUUM INTO` 到 `memory.db.pre-reset.bak` 供回滚（备份失败显式警告）。三条新路由同受 loopback 信任模型约束。新增 `smoke.mjs` 断言组 G42（23 断言）全绿。
 
 ---
 

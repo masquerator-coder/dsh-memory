@@ -11,6 +11,9 @@
  *   POST /memory/identity/open   → { ok: true, path }    body: { file: 'soul'|'user' }  — open in a local editor
  *   POST /memory/trigger         → { ok: true, result }  — run an immediate condensation/identity/forget pass
  *   GET  /memory/view            → { ok: true, ...digest } — memory digest for the viewer window
+ *   POST /memory/memories/edit   → { ok: true }          body: { id, content?, topic?, importance?, kind?, layer? } — human manual edit
+ *   POST /memory/memories/delete → { ok: true, archived? } body: { id } — human manual delete
+ *   POST /memory/reset           → { ok: true, memories, episodes, backedUp } — FULL reset (keeps identity files)
  *   GET  /memory/backup/export   → attachment .db        — download a full VACUUM INTO snapshot
  *   POST /memory/backup/import   → { ok: true, memories, episodes }  body: raw .db bytes — REPLACES all data
  *   GET  /memory/export/markdown → { ok: true, ...summary } — layered Markdown archive (MD-EXPORT 2026-09-06)
@@ -31,6 +34,9 @@ import type { MemoryEntry } from './types.js'
 // L14 (audit 2026-09-05): HTTP-payload types are shared with the browser client
 // via shared-types.ts (pure types → erased at compile time, zero runtime cost).
 import type {
+  MemoryDeleteResult,
+  MemoryEditResult,
+  MemoryResetResult,
   RefineModelCandidate,
   RefineModelsPayload,
   RunNowResult,
@@ -389,6 +395,65 @@ export function registerControlRoutes(
     })()
   }
 
+  /** Human manual edit of one memory (settings-UI memory viewer). */
+  const memoryEdit: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'POST') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const body = await readJsonBody(req) as { id?: unknown; content?: unknown; topic?: unknown; importance?: unknown; kind?: unknown; layer?: unknown }
+        const id = typeof body.id === 'string' && body.id.length > 0 ? body.id : undefined
+        if (!id) { writeJson(res, 400, { ok: false, error: 'id is required' }); return }
+        const result: MemoryEditResult = store.updateMemory(id, {
+          content: typeof body.content === 'string' ? body.content : undefined,
+          topic: typeof body.topic === 'string' ? body.topic : undefined,
+          importance: typeof body.importance === 'number' ? body.importance as 1 | 2 | 3 | 4 | 5 : undefined,
+          kind: typeof body.kind === 'string' ? body.kind as MemoryEntry['kind'] : undefined,
+          layer: typeof body.layer === 'string' ? body.layer as MemoryEntry['layer'] : undefined,
+        })
+        if (!result.ok) { writeJson(res, 400, { ok: false, error: result.error }); return }
+        writeJson(res, 200, { ok: true })
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
+  /** Human manual delete of one memory (settings-UI memory viewer). */
+  const memoryDelete: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'POST') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const body = await readJsonBody(req) as { id?: unknown }
+        const id = typeof body.id === 'string' && body.id.length > 0 ? body.id : undefined
+        if (!id) { writeJson(res, 400, { ok: false, error: 'id is required' }); return }
+        const result: MemoryDeleteResult = store.deleteMemory(id)
+        if (!result.ok) { writeJson(res, 400, { ok: false, error: result.error }); return }
+        writeJson(res, 200, { ok: true, archived: result.archived })
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
+  /** FULL reset of the memory store (settings-UI "重置记忆" button). Wipes all
+   *  memories/episodes/audit trails; identity files are untouched. Destructive —
+   *  the store writes a .pre-reset.bak safety snapshot first. */
+  const memoryReset: RouteHandler = (req: unknown, res: unknown): void => {
+    void (async () => {
+      try {
+        if (!isTrustedRequest(req)) { writeJson(res, 403, { ok: false, error: 'access only allowed from loopback (127.0.0.1/::1)' }); return }
+        if ((req as { method?: string }).method !== 'POST') { writeJson(res, 405, { ok: false, error: 'method not allowed' }); return }
+        const r = store.resetStore()
+        const result: MemoryResetResult = { ok: true, memories: r.memories, episodes: r.episodes, backedUp: r.backedUp }
+        writeJson(res, 200, result)
+      } catch (e) {
+        writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    })()
+  }
+
   /** Return the refine-model catalog for the settings picker (R10). */
   const models: RouteHandler = (req: unknown, res: unknown): void => {
     void (async () => {
@@ -408,6 +473,9 @@ export function registerControlRoutes(
     { path: '/memory/identity/open', handler: identityOpen },
     { path: '/memory/trigger', handler: trigger },
     { path: '/memory/view', handler: view },
+    { path: '/memory/memories/edit', handler: memoryEdit },
+    { path: '/memory/memories/delete', handler: memoryDelete },
+    { path: '/memory/reset', handler: memoryReset },
     { path: '/memory/models', handler: models },
     { path: '/memory/export/markdown', handler: markdownExport },
     { path: '/memory/backup/export', handler: backupExport },

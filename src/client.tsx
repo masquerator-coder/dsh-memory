@@ -19,7 +19,7 @@
 import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
 // L14 (audit 2026-09-05): HTTP-payload types shared with the Node server via
 // shared-types.ts (pure types — erased at compile time, zero bytes in the bundle).
-import type { MarkdownExportSummary, RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload } from './shared-types.js'
+import type { MarkdownExportSummary, MemoryEditResult, MemoryDeleteResult, MemoryResetResult, RefineModelsPayload, RunNowResult, ViewMemory, ViewPayload } from './shared-types.js'
 
 /**
  * Memory/nav glyph — a neuron (soma + radiating dendrites + synapse nodes),
@@ -83,6 +83,14 @@ interface SaveResult {
   error?: string
 }
 
+/** Draft state for the inline memory editor (Human curation, 2026-09-06). */
+interface EditDraftState {
+  content: string
+  topic: string
+  importance: number
+  kind: string
+}
+
 interface PanelProps {
   close?: () => void
   scope: MemoryScope
@@ -98,6 +106,12 @@ interface PanelProps {
   exportBackup: () => Promise<SaveResult>
   /** Restore the store from a backup .db file (REPLACES all current data). */
   importBackup: (file: File) => Promise<{ ok: boolean; memories: number; episodes: number; error?: string }>
+  /** Human manual edit of one memory (by id). */
+  editMemory: (id: string, fields: { content?: string; topic?: string; importance?: number; kind?: string; layer?: string }) => Promise<MemoryEditResult>
+  /** Human manual delete of one memory (by id). */
+  deleteMemory: (id: string) => Promise<MemoryDeleteResult>
+  /** FULL reset of the memory store (wipes memories/episodes; keeps identity). */
+  resetMemory: () => Promise<MemoryResetResult>
   /** R10: fetch the host refine-model catalog for the model picker. */
   loadModels: () => Promise<RefineModelsPayload>
 }
@@ -311,6 +325,21 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const [mdExporting, setMdExporting] = useState(false)
   const [mdExportNote, setMdExportNote] = useState<string | null>(null)
   const [mdExportError, setMdExportError] = useState<string | null>(null)
+  // 手动编辑 / 删除 / 重置（Human curation，2026-09-06）
+  const [editTarget, setEditTarget] = useState<string | null>(null)
+  const [editDraft, setEditDraft] = useState<EditDraftState>({ content: '', topic: '', importance: 3, kind: 'general' })
+  const [resetConfirm, setResetConfirm] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [curationNote, setCurationNote] = useState<string | null>(null)
+  const [curationError, setCurationError] = useState<string | null>(null)
+
+  /** Open the inline editor for a row, seeding the draft from the current row. */
+  const beginEdit = (m: ViewMemory): void => {
+    setEditTarget(m.id)
+    setEditDraft({ content: m.content, topic: m.topic, importance: m.importance, kind: m.kind })
+    setCurationNote(null)
+    setCurationError(null)
+  }
   // R10: refine-model picker
   const [models, setModels] = useState<RefineModelsPayload>({ default: {}, candidates: [], failures: [] })
   useEffect(() => {
@@ -380,6 +409,72 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
     } finally {
       setImporting(false)
       if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  /** Re-read the viewer digest (used after a manual edit/delete/reset so the
+   *  table reflects the change). No-op when the viewer is closed. */
+  const refreshView = async (): Promise<void> => {
+    if (!viewOpen) return
+    try {
+      setView(await props.loadMemoryView())
+    } catch { /* keep the last digest; the next open re-reads */ }
+  }
+
+  /** Manually delete one memory. Hard-deletes (recoverable) for memory-layer,
+   *  soft-archives immortal user-layer facts. Confirms first. */
+  const performDelete = async (m: ViewMemory): Promise<void> => {
+    if (!window.confirm(`确定删除这条记忆？\n\n层：${m.layer === 'user' ? '用户' : '记忆'} · 类型：${kindLabel(m.kind)}\n内容：${m.content.slice(0, 80)}${m.content.length > 80 ? '…' : ''}\n\n删除将被快照留痕（可回滚恢复）${m.layer === 'user' ? '；用户层为不可删除事实，将转为归档' : ''}。`)) return
+    setCurationNote(null)
+    setCurationError(null)
+    const r = await props.deleteMemory(m.id)
+    if (!r.ok) {
+      setCurationError(r.error ?? '删除失败')
+      return
+    }
+    setCurationNote(r.archived ? '已删除（用户层不可硬删，已转为归档）。' : '已删除（已留痕，可回滚）。')
+    void refreshView()
+  }
+
+  /** Manually edit one memory's content/topic/importance/kind. */
+  const performEdit = async (): Promise<void> => {
+    const id = editTarget
+    if (!id) return
+    const r = await props.editMemory(id, {
+      content: editDraft.content,
+      topic: editDraft.topic,
+      importance: editDraft.importance,
+      kind: editDraft.kind,
+    })
+    if (!r.ok) {
+      setCurationError(r.error ?? '保存失败')
+      return
+    }
+    setCurationNote('记忆已更新。')
+    setEditTarget(null)
+    void refreshView()
+  }
+
+  /** Full reset of the memory store. Two-step confirm before the destructive
+   *  wipe; identity files (soul.md / user.md) are preserved. */
+  const performReset = async (): Promise<void> => {
+    setResetting(true)
+    setCurationNote(null)
+    setCurationError(null)
+    try {
+      const r = await props.resetMemory()
+      if (r.ok) {
+        setCurationNote(
+          `已重置记忆：清除 ${r.memories} 条语义记忆、${r.episodes} 条会话摘要。身份文件（soul.md/user.md）保留。` +
+          (r.backedUp ? '重置前状态已存为 memory.db.pre-reset.bak 以便回滚。' : '⚠ 重置前安全备份失败，无法回滚！'),
+        )
+      } else {
+        setCurationError(r.error ?? '重置失败')
+      }
+      setResetConfirm(false)
+      void refreshView()
+    } finally {
+      setResetting(false)
     }
   }
 
@@ -597,6 +692,9 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         <button type="button" disabled={importing} onClick={() => fileRef.current?.click()} style={{ padding: '6px 10px' }}>
           {importing ? '导入中…' : '导入备份'}
         </button>
+        <button type="button" disabled={resetting} onClick={() => { setResetConfirm(true) }} style={{ padding: '6px 10px', borderColor: 'rgba(200,60,60,0.6)', color: '#c0392b' }}>
+          {resetting ? '重置中…' : '重置记忆'}
+        </button>
         <input
           ref={fileRef}
           type="file"
@@ -604,10 +702,12 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
           style={{ display: 'none' }}
           onChange={(e) => { void doImport(e.target.files?.[0]) }}
         />
-        <span style={{ fontSize: 12, opacity: 0.7 }}>导出为完整 .db 快照（含记忆、会话摘要、审计与纠错轨迹）；导入将<b>替换</b>全部现有数据，导入前自动存回滚备份。</span>
+        <span style={{ fontSize: 12, opacity: 0.7 }}>导出为完整 .db 快照；导入将<b>替换</b>全部现有数据（自动存回滚备份）；<b>重置记忆</b>清空全部记忆与会话摘要（保留 soul.md/user.md，重置前自动存回滚备份）。</span>
       </div>
       {backupNote && <div style={{ fontSize: 12, color: '#0a7a2f' }}>{backupNote}</div>}
       {backupError && <div style={{ fontSize: 12, color: '#c00' }}>{backupError}</div>}
+      {curationNote && <div style={{ fontSize: 12, color: '#0a7a2f' }}>{curationNote}</div>}
+      {curationError && <div style={{ fontSize: 12, color: '#c00' }}>{curationError}</div>}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '10px 0', borderTop: '1px solid rgba(128,128,128,0.25)', marginTop: 4 }}>
         <button type="button" disabled={mdExporting} onClick={() => { void downloadMarkdown() }} style={{ padding: '6px 10px' }}>
@@ -645,6 +745,7 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
                         <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.2)' }}>主题</th>
                         <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.2)' }}>内容</th>
                         <th style={{ textAlign: 'right', padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.2)' }}>重要</th>
+                        <th style={{ textAlign: 'right', padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.2)' }}>操作</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -657,6 +758,10 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
                           <td style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>{m.topic}</td>
                           <td style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>{m.content}</td>
                           <td style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.06)', textAlign: 'right' }}>{m.importance}</td>
+                          <td style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.06)', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            <button type="button" style={{ padding: '1px 7px', fontSize: 12, marginRight: 4 }} onClick={() => beginEdit(m)}>编辑</button>
+                            <button type="button" style={{ padding: '1px 7px', fontSize: 12, color: '#c0392b' }} onClick={() => { void performDelete(m) }}>删除</button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -664,6 +769,80 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
                 )}
             </>
           )}
+        </PanelModal>
+      )}
+
+      {editTarget && (
+        <PanelModal title="编辑记忆" onClose={() => setEditTarget(null)}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 12 }}>内容（必填）</span>
+              <textarea
+                value={editDraft.content}
+                onChange={(e) => setEditDraft((d) => ({ ...d, content: e.target.value }))}
+                rows={4}
+                style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 13, padding: 8 }}
+              />
+            </label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 12 }}>主题</span>
+              <input
+                value={editDraft.topic}
+                onChange={(e) => setEditDraft((d) => ({ ...d, topic: e.target.value }))}
+                style={{ padding: '6px 8px', fontSize: 13 }}
+              />
+            </label>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontSize: 12 }}>重要度</span>
+                <select
+                  value={editDraft.importance}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, importance: Number(e.target.value) }))}
+                  style={{ padding: '6px 8px', fontSize: 13 }}
+                >
+                  {[1, 2, 3, 4, 5].map((i) => <option key={i} value={i}>{i}</option>)}
+                </select>
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontSize: 12 }}>类型</span>
+                <select
+                  value={editDraft.kind}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, kind: e.target.value }))}
+                  style={{ padding: '6px 8px', fontSize: 13 }}
+                >
+                  {(['preference', 'env', 'lesson', 'decision', 'general'] as const).map((k) => (
+                    <option key={k} value={k}>{kindLabel(k)}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button type="button" onClick={() => { void performEdit() }}>保存</button>
+              <button type="button" onClick={() => setEditTarget(null)}>取消</button>
+            </div>
+          </div>
+        </PanelModal>
+      )}
+
+      {resetConfirm && (
+        <PanelModal title="重置记忆" onClose={() => { if (!resetting) setResetConfirm(false) }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 13, color: '#c0392b', fontWeight: 600 }}>此操作不可撤销！</div>
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              将<b>清空全部语义记忆与会话摘要</b>（含归档/低质量），并清除整理/遗忘/纠错审计轨迹。<br />
+              soul.md 与 user.md <b>保留不变</b>。<br /><br />
+              重置前会自动把当前状态保存为 <code>memory.db.pre-reset.bak</code>，以便误操作后手动回滚。
+            </div>
+            <div style={{ fontSize: 13, opacity: 0.7 }}>
+              即将清除 {view?.memoryCount ?? 0} 条记忆、{view?.episodeCount ?? 0} 条会话摘要。
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button type="button" disabled={resetting} onClick={() => { void performReset() }} style={{ color: '#c0392b' }}>
+                {resetting ? '重置中…' : '确认清空'}
+              </button>
+              <button type="button" disabled={resetting} onClick={() => setResetConfirm(false)}>取消</button>
+            </div>
+          </div>
         </PanelModal>
       )}
     </div>
@@ -807,6 +986,54 @@ export function apply(ctx: ClientContext): () => void {
     }
   }
 
+  /** Human manual edit of one memory (by id) — settings viewer action. */
+  const editMemory = async (id: string, fields: { content?: string; topic?: string; importance?: number; kind?: string; layer?: string }): Promise<MemoryEditResult> => {
+    try {
+      const resp = await fetch('/memory/memories/edit', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id, ...fields }),
+      })
+      const data = await resp.json().catch(() => ({})) as MemoryEditResult
+      if (!resp.ok || !data.ok) return { ok: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '网络错误' }
+    }
+  }
+
+  /** Human manual delete of one memory (by id) — settings viewer action. */
+  const deleteMemory = async (id: string): Promise<MemoryDeleteResult> => {
+    try {
+      const resp = await fetch('/memory/memories/delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      const data = await resp.json().catch(() => ({})) as MemoryDeleteResult
+      if (!resp.ok || !data.ok) return { ok: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      return { ok: true, archived: data.archived }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '网络错误' }
+    }
+  }
+
+  /** FULL reset of the memory store (wipes memories/episodes; keeps identity). */
+  const resetMemory = async (): Promise<MemoryResetResult> => {
+    try {
+      const resp = await fetch('/memory/reset', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await resp.json().catch(() => ({})) as MemoryResetResult
+      if (!resp.ok || !data.ok) return { ok: false, memories: 0, episodes: 0, backedUp: false, error: data.error ?? `HTTP ${resp.status}: ${resp.statusText}` }
+      return data
+    } catch (e) {
+      return { ok: false, memories: 0, episodes: 0, backedUp: false, error: e instanceof Error ? e.message : '网络错误' }
+    }
+  }
+
   const dispose = ctx.slots.inject('settings.section', () => ctx.slots.register(
     {
       name: 'settings.section',
@@ -814,7 +1041,7 @@ export function apply(ctx: ClientContext): () => void {
       order: 50,
       label: () => '记忆',
       icon: <MemoryIcon />,
-      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView, exportBackup, importBackup, loadModels }),
+      inject: () => ({ scope, loadIdentity, saveIdentity, openEditor, runNow, loadMemoryView, exportBackup, importBackup, editMemory, deleteMemory, resetMemory, loadModels }),
     },
     MemorySettingsPanel,
   ))

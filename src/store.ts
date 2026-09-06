@@ -878,6 +878,130 @@ export class MemoryStore {
     }
   }
 
+  // ---- human manual curation (edit / delete / reset) -----------------------
+  // Direct, auditable operations for the settings-UI memory viewer. These are
+  // HUMAN actions, so unlike the model-facing `batch` ops they do NOT run the
+  // dedup/merge heuristics (findCanonical / near-duplicate merge / reworded
+  // grouping) — the user edits exactly the row they point at, by id.
+
+  /** Human manual edit — amend content / topic / importance / kind / layer of
+   *  one existing memory by its id. Preserves the row identity, created time,
+   *  access/heart stats and archived state; only the supplied fields change
+   *  (content/topic are the safety-critical ones and are validated). Returns
+   *  { ok } or a typed rejection. */
+  updateMemory(
+    id: string,
+    fields: {
+      content?: string
+      topic?: string
+      importance?: Importance
+      kind?: Kind
+      layer?: Layer
+    },
+  ): { ok: boolean; error?: string } {
+    const target = this.get(id)
+    if (!target) return { ok: false, error: `no entry with id ${id}` }
+    if (target.layer === 'user' && fields.layer === 'memory') {
+      // A user-layer fact is immortal (tier-0 protected); allow downgrading its
+      // layer only via the explicit model-facing replace contract. The human
+      // editor coerces through the same gate to keep the invariant single-sourced.
+      return { ok: false, error: 'layer=user memories are immortal; editing them to layer=memory is refused' }
+    }
+    const content = fields.content !== undefined ? fields.content.trim() : undefined
+    if (content !== undefined && content.length === 0) return { ok: false, error: 'content is required' }
+    if (fields.importance !== undefined && ![1, 2, 3, 4, 5].includes(fields.importance)) {
+      return { ok: false, error: 'importance must be 1–5' }
+    }
+    if (fields.kind !== undefined && !['preference', 'env', 'lesson', 'decision', 'general'].includes(fields.kind)) {
+      return { ok: false, error: `invalid kind ${fields.kind}` }
+    }
+    if (fields.layer !== undefined && fields.layer !== 'user' && fields.layer !== 'memory') {
+      return { ok: false, error: `invalid layer ${fields.layer}` }
+    }
+    const now = Date.now()
+    const newContent = content ?? target.content
+    const quality = qualityScore(newContent, this.nearCandidates(newContent))
+    const low = isLowQuality(quality)
+    const topic = fields.topic !== undefined && fields.topic.trim() !== ''
+      ? fields.topic.trim().slice(0, TOPIC_MAX) || DEFAULT_TOPIC
+      : target.topic
+    const kind = fields.kind ?? target.kind
+    const layer = fields.layer ?? target.layer
+    const importance = fields.importance ?? target.importance
+    if (newContent !== target.content) this.recordFailure(target.id, target.content, newContent)
+    this.writeMemory(target.id, {
+      layer, kind, tier: low ? 1 : target.tier, topic, content: newContent,
+      importance, quality, epistemic: target.epistemic,
+      heat: heatOf(target, this.forgetDays), created: target.created, updated: now,
+      last_accessed: target.last_accessed, archived: target.archived, low_quality: low,
+      window_freq: target.window_freq, window_start: target.window_start,
+      archived_at: target.archived_at, session_id: target.session_id,
+    })
+    return { ok: true }
+  }
+
+  /** Human manual delete — HARD-deletes a memory with a durable forget_deleted
+   *  snapshot (recoverable like active-forgetting hard-deletes, DESIGN §5.2).
+   *  user-layer facts are immortal: the delete falls back to a SOFT archive so
+   *  a manual "删除" can never permanently destroy a DESIGN-eternal fact.
+   *  Returns whether it hard-deleted (true) or soft-archived (false). */
+  deleteMemory(id: string): { ok: boolean; archived?: boolean; error?: string } {
+    const target = this.get(id)
+    if (!target) return { ok: false, error: `no entry with id ${id}` }
+    const now = Date.now()
+    if (target.layer === 'user') {
+      this.stmt('UPDATE memories SET archived = 1, archived_at = ?, updated = ? WHERE id = ?').run(now, now, id)
+      return { ok: true, archived: true }
+    }
+    this.stmt(
+      'INSERT INTO forget_deleted(ts, memory_id, content, topic, importance, quality, heat, reason) VALUES (?,?,?,?,?,?,?,?)',
+    ).run(now, target.id, target.content, target.topic, target.importance, target.quality, heatOf(target, this.forgetDays, now), 'manual-delete')
+    this.hardDeleteMemory(id)
+    return { ok: true, archived: false }
+  }
+
+  /** FULL reset of the memory store (人力资源管理-style "重置记忆"). Wipes every
+   *  semantic memory, episode summary, correction/refine/forget audit trail and
+   *  lesson draft — returning the store to a blank slate. Identity FILES
+   *  (soul.md / user.md) live beside memory.db and are NOT touched: the user's
+   *  hand-written persona/画像 survive a reset, which is the expected semantics
+   *  for a "reset memories, keep my identity" action.
+   *
+   *  DESTRUCTIVE. A safety snapshot of the pre-reset state is VACUUM'd to
+   *  `memory.db.pre-reset.bak` first so a regretful reset can be undone manually
+   *  (same contract as replaceWithBackup's .pre-import.bak). Returns the counts
+   *  wiped. */
+  resetStore(): { memories: number; episodes: number; backedUp: boolean } {
+    const memCount = this.stmt('SELECT COUNT(*) AS c FROM memories').get() as { c: number }
+    const epiCount = this.stmt('SELECT COUNT(*) AS c FROM episodes').get() as { c: number }
+    // 1. Safety net: snapshot current state before clobbering it.
+    let backedUp = true
+    try {
+      const bakPath = join(this.dir, 'memory.db.pre-reset.bak')
+      const bak = bakPath.replace(/\\/g, '/').replace(/'/g, "''")
+      this.db.exec(`VACUUM INTO '${bak}'`)
+    } catch (e) {
+      backedUp = false
+      console.warn('[dsh-memory] pre-reset safety backup failed:', e instanceof Error ? e.message : e)
+    }
+    // 2. Wipe the store in one transaction, then rebuild FTS shadow tables.
+    this.db.exec(`
+      DELETE FROM memories;
+      DELETE FROM episodes;
+      DELETE FROM failure_memories;
+      DELETE FROM lesson_drafts;
+      DELETE FROM refine_runs;
+      DELETE FROM l2_refined;
+      DELETE FROM forget_runs;
+      DELETE FROM forget_deleted;
+      DELETE FROM forget_deleted_episodes;
+      DELETE FROM mem_fts;
+      DELETE FROM ep_fts;
+    `)
+    rebuildFts(this.db)
+    return { memories: Number(memCount.c), episodes: Number(epiCount.c), backedUp }
+  }
+
   // ---- recall (memories) ---------------------------------------------------
 
   /** Refresh last_accessed + sliding-window frequency for recalled entries. */

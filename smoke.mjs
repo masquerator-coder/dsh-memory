@@ -1422,6 +1422,84 @@ group('G41 layered Markdown export (MD-EXPORT, pure)')
 }
 
 // ---------------------------------------------------------------------------
+// G42: human manual curation (edit / delete / reset) — 2026-09-06
+group('G42 human manual curation (updateMemory / deleteMemory / resetStore)')
+{
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g42-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'memory', kind: 'env', content: '原始记忆内容', importance: 3, topic: '环境' }])
+    const id = s.activeEntries()[0].id
+
+    // edit content + importance
+    const e1 = s.updateMemory(id, { content: '编辑后的新内容', importance: 5 })
+    assert('G42 edit ok', e1.ok === true)
+    const edited = s.get(id)
+    assert('G42 edit amends content', edited.content === '编辑后的新内容')
+    assert('G42 edit amends importance', edited.importance === 5)
+    assert('G42 edit keeps id', edited.id === id)
+    assert('G42 edit keeps kind when unset', edited.kind === 'env')
+
+    // edit topic + kind
+    const e2 = s.updateMemory(id, { topic: '新主题', kind: 'preference' })
+    assert('G42 edit topic/kind ok', e2.ok === true)
+    const edited2 = s.get(id)
+    assert('G42 edit amends topic', edited2.topic === '新主题')
+    assert('G42 edit amends kind', edited2.kind === 'preference')
+
+    // invalid edits rejected
+    assert('G42 edit missing id rejected', s.updateMemory('nope', { content: 'x' }).ok === false)
+    assert('G42 edit blank content rejected', s.updateMemory(id, { content: '   ' }).ok === false)
+    assert('G42 edit bad importance rejected', s.updateMemory(id, { importance: 9 }).ok === false)
+    assert('G42 edit bad kind rejected', s.updateMemory(id, { kind: 'bogus' }).ok === false)
+
+    // add a second memory, hard-delete it (memory layer)
+    s.batch([{ action: 'add', layer: 'memory', kind: 'general', content: '待删除的记忆内容第二条', importance: 3 }])
+    const delId = s.activeEntries().find((e) => e.content.includes('待删除'))?.id
+    const d = s.deleteMemory(delId)
+    assert('G42 delete memory-layer ok + hard', d.ok === true && d.archived === false)
+    assert('G42 delete removes row', s.get(delId) === undefined)
+
+    // user-layer fact: delete soft-archives (immortal)
+    s.batch([{ action: 'add', layer: 'user', content: '不可销毁的用户层事实内容', importance: 5 }])
+    const uid = s.activeEntries().find((e) => e.layer === 'user')?.id
+    const du = s.deleteMemory(uid)
+    assert('G42 delete user-layer falls back to archive', du.ok === true && du.archived === true)
+    assert('G42 user-layer row survives as archived', s.get(uid) !== undefined && s.get(uid).archived === true)
+
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+
+  // resetStore wipes memories + episodes + trails, keeps identity files
+  {
+    const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g42b-'))
+    const s = new MemoryStore(t)
+    s.batch([{ action: 'add', layer: 'memory', content: '将被重置的记忆一', importance: 4 }])
+    s.batch([{ action: 'add', layer: 'user', content: '将被重置的用户层记忆二', importance: 5 }])
+    s.writeEpisode('epA', { session_id: 's1', summary: '会话摘要内容', topic: '一般', ts: Date.now(), extracted: 1, archived: false, created: Date.now() })
+    s.recordFailure('mx', '旧', '新') // failure trail
+    // identity file beside the db (not in store tables)
+    const soulPath = join(t, 'memory', 'soul.md')
+    writeFileSync(soulPath, '# 人格不变')
+    const before = s.list({ includeArchived: true }).length
+
+    const r = s.resetStore()
+    assert('G42 reset returns wiped counts', r.memories === before && r.episodes === 1)
+    assert('G42 reset clears semantic memory', s.list({ includeArchived: true }).length === 0)
+    assert('G42 reset clears episodes', s.episodeCount() === 0)
+    assert('G42 reset clears episodes table too', s.listEpisodes({ includeArchived: true }).length === 0)
+    // identity file preserved (file untouched by reset)
+    assert('G42 reset keeps identity file', readFileSync(soulPath, 'utf8') === '# 人格不变')
+    // safety backup written (recoverable)
+    assert('G42 reset wrote pre-reset backup', existsSync(join(t, 'memory', 'memory.db.pre-reset.bak')))
+    // store still usable after reset
+    s.batch([{ action: 'add', content: '重置后可继续写入的内容', importance: 3 }])
+    assert('G42 reset store remains usable', s.activeEntries().length === 1)
+    s.close(); rmSync(t, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(50)}`)
 console.log(`passed: ${passed}  failed: ${failed}`)
 try { rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }

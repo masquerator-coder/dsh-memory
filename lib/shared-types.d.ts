@@ -71,6 +71,39 @@ export interface ViewPayload {
     }[];
     updatedMs: number;
 }
+/** Body of POST /memory/memories/edit — human manual edit of one memory. */
+export interface MemoryEditPayload {
+    id: string;
+    content?: string;
+    topic?: string;
+    importance?: number;
+    kind?: string;
+    layer?: string;
+}
+/** Result of POST /memory/memories/edit. */
+export interface MemoryEditResult {
+    ok: boolean;
+    error?: string;
+}
+/** Body of POST /memory/memories/delete — human manual delete of one memory. */
+export interface MemoryDeletePayload {
+    id: string;
+}
+/** Result of POST /memory/memories/delete. `archived` true ⇒ a user-layer fact
+ *  was soft-archived instead of hard-deleted (immortal). */
+export interface MemoryDeleteResult {
+    ok: boolean;
+    archived?: boolean;
+    error?: string;
+}
+/** Result of POST /memory/reset — the full "重置记忆" wipe. */
+export interface MemoryResetResult {
+    ok: boolean;
+    memories: number;
+    episodes: number;
+    backedUp: boolean;
+    error?: string;
+}
 /** One Markdown file in the layered export bundle (/memory/export/markdown). */
 export interface MarkdownExportFile {
     /** Stable, ordered file name (01-/02-/03- prefix keeps natural sort). */
