@@ -51,3 +51,4 @@ export declare const PROTOCOL_TEXT: string;
  *  switch is off (clean sessions) — read inside the section's text thunk so the
  *  R3-total live-toggle tears the section down/up without a restart. */
 export declare function protocolSectionText(enabled: boolean): string;
+export declare const WRITE_BOUNDARY_TEXT: string;

@@ -26,7 +26,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
-import { buildIdentitySection, buildSection, protocolSectionText } from './inject.js'
+import { buildIdentitySection, buildSection, protocolSectionText, WRITE_BOUNDARY_TEXT } from './inject.js'
 import { resolveSystemTimeZone, renderDateSection, TimeSource } from './time-ctx.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0 } from './l0.js'
@@ -511,6 +511,16 @@ export function apply(ctx: Context, config: Config = {}): void {
         name: 'memory:tier0',
         order: 10,
         text: () => (runtime.enabled ? buildSection(store, { importanceThreshold }).text : ''),
+      })
+      // memory:write-boundary — anti-pollution guard appended at the END of the
+      // system prompt (order 99999 puts it after every host/memory section).
+      // Constant static text → KV prefix free after first build. Tells the model
+      // that everything before it (runtime context, memory/identity blocks, etc.)
+      // is system-provided, not "facts worth saving" via memory add (2026-09-06).
+      ctx.systemPrompt.section({
+        name: 'memory:write-boundary',
+        order: 99999,
+        text: () => (runtime.enabled ? WRITE_BOUNDARY_TEXT : ''),
       })
     }
     // M9: constant identity blocks (soul.md / user.md) — mtime-cached, KV friendly.
