@@ -315,6 +315,11 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const [viewLoading, setViewLoading] = useState(false)
   const [view, setView] = useState<ViewPayload | null>(null)
   const [viewError, setViewError] = useState<string | null>(null)
+  // T0-viewer (2026-09-08): view-tab switch between all memories and the
+  // resident (tier-0 / 常驻区) grid. 'all' shows the full digest; 'resident'
+  // narrows the displayed rows to tier-0 only (查看/编辑/删除 still work — the
+  // backend now guarantees resident rows are present in the digest).
+  const [viewTab, setViewTab] = useState<'all' | 'resident'>('all')
   // 备份
   const [exporting, setExporting] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -371,6 +376,7 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
   const openViewer = async (): Promise<void> => {
     setViewOpen(true)
     setViewLoading(true)
+    setViewTab('all')
     setViewError(null)
     try {
       setView(await props.loadMemoryView())
@@ -724,19 +730,49 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
           {viewError && <div style={{ color: '#c00', fontSize: 12 }}>{viewError}</div>}
           {!viewLoading && view && (
             <>
+              {/* T0-viewer: view-tab switch between the full digest and the
+                  resident (tier-0) grid. Resident rows are core/injectable, so
+                  they get a dedicated view; 编辑/删除 act on either tab. */}
+              <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                {(['all', 'resident'] as const).map((t) => {
+                  const active = viewTab === t
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => setViewTab(t)}
+                      style={{
+                        padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+                        border: active ? '1px solid var(--dsw-alias-primary, #4f7cff)' : '1px solid rgba(128,128,128,0.4)',
+                        background: active ? 'rgba(79,124,255,0.18)' : 'transparent',
+                        color: active ? 'var(--dsw-alias-primary, #7ea2ff)' : 'inherit',
+                      }}
+                    >
+                      {t === 'all' ? `全部（${view.memoryCount}）` : `常驻区 T0（${view.memories.filter((m) => m.tier === 0).length}）`}
+                    </button>
+                  )
+                })}
+              </div>
               <div style={{ display: 'flex', gap: 16, opacity: 0.85, fontSize: 13, marginBottom: 8 }}>
                 <span>有效记忆 <b>{view.memoryCount}</b> 条</span>
                 <span>会话摘要 <b>{view.episodeCount}</b> 条</span>
                 <span>主题 <b>{view.topics.length}</b> 个</span>
               </div>
-              {view.topics.length > 0 && (
+              {view.topics.length > 0 && viewTab === 'all' && (
                 <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
                   主题：{view.topics.slice(0, 12).map((t) => `${t.topic}(${t.count})`).join('、')}
                 </div>
               )}
-              {view.memories.length === 0
-                ? <div style={{ opacity: 0.6, fontSize: 13 }}>暂无有效记忆。</div>
-                : (
+              {(() => {
+                const rows = viewTab === 'resident' ? view.memories.filter((m) => m.tier === 0) : view.memories
+                if (rows.length === 0) {
+                  return (
+                    <div style={{ opacity: 0.6, fontSize: 13 }}>
+                      {viewTab === 'resident' ? '暂无常驻区（T0）记忆。' : '暂无有效记忆。'}
+                    </div>
+                  )
+                }
+                return (
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                     <thead>
                       <tr>
@@ -749,7 +785,7 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
                       </tr>
                     </thead>
                     <tbody>
-                      {view.memories.map((m) => (
+                      {rows.map((m) => (
                         <tr key={m.id}>
                           <td style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.06)', whiteSpace: 'nowrap' }}>
                             {layerLabel(m.layer)}{m.tier === 0 ? '·T0' : ''}
@@ -766,7 +802,8 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
                       ))}
                     </tbody>
                   </table>
-                )}
+                )
+              })()}
             </>
           )}
         </PanelModal>

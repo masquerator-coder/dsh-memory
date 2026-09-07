@@ -212,10 +212,17 @@ function readRawBody(req: unknown, maxBytes = 100 * 1024 * 1024): Promise<Buffer
 }
 
 /** Build the viewer digest from the store (active memories + episode count +
- *  topic index). Pure read — never mutates the store. */
+ *  topic index). Pure read — never mutates the store.
+ *
+ *  T0-viewer (2026-09-08): the client needs to SEE tier-0 (常驻区/常驻核心)
+ *  memories in the settings "查看记忆" panel, but plain `list().slice(0, 400)`
+ *  ordered by `updated DESC` let a large tier-1 library push the resident grid
+ *  out of the first 400 rows — so resident memories silently vanished from the
+ *  viewer. Fix: return ALL tier-0 rows first, then top up with up to 400 tier-1
+ *  rows. Resident entries are few and core (they're what actually injects into
+ *  the system prompt), so returning them whole beats a flat cap. */
 function buildViewPayload(store: MemoryStore): ViewPayload {
-  const rows: MemoryEntry[] = store.list({ includeArchived: false, includeLowQuality: false })
-  const memories: ViewMemory[] = rows.map((e) => ({
+  const rowToView = (e: MemoryEntry): ViewMemory => ({
     id: e.id,
     layer: e.layer,
     tier: e.tier,
@@ -227,7 +234,11 @@ function buildViewPayload(store: MemoryStore): ViewPayload {
     updated: e.updated,
     archived: e.archived,
     lowQuality: e.low_quality,
-  })).slice(0, 400)
+  })
+  // resident (tier-0) grid always fully returned; recallable (tier-1) capped.
+  const tier0 = store.list({ tier: 0, includeArchived: false, includeLowQuality: false })
+  const tier1 = store.list({ tier: 1, includeArchived: false, includeLowQuality: false }).slice(0, 400)
+  const memories = [...tier0, ...tier1].map(rowToView)
   return {
     memories,
     memoryCount: store.count(),
