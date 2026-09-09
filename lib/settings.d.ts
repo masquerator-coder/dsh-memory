@@ -40,6 +40,9 @@ export interface MemorySettings {
     lessonInstantJudge: boolean;
     /** lessonUseLlm=false → pure-rule template promotion (degraded fallback, no LLM). */
     lessonUseLlm: boolean;
+    /** MEMORY-TRIGGER: event-driven sedimentation draft capture master switch.
+     *  false → no turn-end drafts auto-captured; memory_drafts tool stays available. */
+    draftCaptureEnabled: boolean;
     /** time-injection: prepend the current real-world date (internet-anchored,
      *  system timezone) to the system prompt. Default false. */
     timeInjection: boolean;
@@ -65,6 +68,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonDraftEnabled: z<boolean, boolean>;
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
+    draftCaptureEnabled: z<boolean, boolean>;
     timeInjection: z<boolean, boolean>;
     customPromptEnabled: z<boolean, boolean>;
     customSystemPrompt: z<string, string>;
@@ -79,6 +83,7 @@ export declare const memorySettingsSchema: z<Schemastery.ObjectS<{
     lessonDraftEnabled: z<boolean, boolean>;
     lessonInstantJudge: z<boolean, boolean>;
     lessonUseLlm: z<boolean, boolean>;
+    draftCaptureEnabled: z<boolean, boolean>;
     timeInjection: z<boolean, boolean>;
     customPromptEnabled: z<boolean, boolean>;
     customSystemPrompt: z<string, string>;

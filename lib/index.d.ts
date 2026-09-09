@@ -141,6 +141,10 @@ export interface Config {
     lessonInstantJudge?: boolean;
     /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
     lessonUseLlm?: boolean;
+    /** MEMORY-TRIGGER master switch for the event-driven sedimentation draft
+     *  capture (turn-end pure-rule, zero LLM). false → no drafts are auto-captured;
+     *  the memory_drafts tool stays available for explicit use. Default true. */
+    draftCaptureEnabled?: boolean;
     /** Master switch for the custom system-prompt injection (2026-09-06). false →
      *  the memory:custom section is omitted even when `customSystemPrompt` is set.
      *  Live-toggleable. Default true. */

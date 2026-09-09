@@ -1,4 +1,5 @@
 import type { ApplyResult, BudgetUsage, Episode, EpisodeHit, ForgetDays, Importance, Kind, Layer, LessonDraft, MemoryBudget, MemoryEntry, MemoryOp, RecallHit, Tier } from './types.js';
+import { type MemoryDraft, type DraftStatus, type DraftSignal } from './types.js';
 export declare const DEFAULT_BUDGET: MemoryBudget;
 /** Near-duplicate similarity threshold (contentSimilarity, 0=disjoint 1=id).
  *  Writing a fact at or above this closeness to an existing active row merges
@@ -368,6 +369,25 @@ export declare class MemoryStore {
     }): LessonDraft[];
     getLessonDraft(id: number): LessonDraft | undefined;
     markLessonDraftStatus(id: number, status: 'promoted' | 'dropped'): void;
+    /** 追加一条 turn-end 捕获的"待沉淀草稿"。零 LLM、同步、成功返回新行 id。 */
+    addDraft(input: {
+        session_id: string;
+        turn?: number;
+        signal: DraftSignal;
+        source_text: string;
+        draft: string;
+        reason?: string;
+    }): number | null;
+    /** 列出 memory_drafts 草稿(默认 pending、ts DESC + id DESC,最新优先)。 */
+    listDrafts(opts?: {
+        status?: DraftStatus;
+        limit?: number;
+    }): MemoryDraft[];
+    getDraft(id: number): MemoryDraft | undefined;
+    /** 更新草稿状态(promoted=已入语义层 / discarded=丢弃)。零 LLM。 */
+    updateDraftStatus(id: number, status: Exclude<DraftStatus, 'pending'>): void;
+    /** 当前 pending 草稿数 —— memory:drafts section 用它做轻量提示(KV 友好)。 */
+    countPendingDrafts(): number;
     failureTrail(): {
         memoryId: string;
         oldContent: string;

@@ -13,7 +13,7 @@ import { defineTool, type ToolCallKind, type ToolCallView, type ToolResult, type
 import type { MemoryStore } from './store.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './format.js'
 import { readIdentityFiles } from './identity.js'
-import type { ApplyResult, Epistemic, Importance, Kind, Layer, MemoryOp, OpAction, Tier } from './types.js'
+import type { ApplyResult, DraftSignal, Epistemic, Importance, Kind, Layer, MemoryDraft, MemoryOp, OpAction, Tier } from './types.js'
 
 const ACTION_VERBS: Record<OpAction, string> = {
   add: '记入',
@@ -27,6 +27,8 @@ const KINDS: readonly Kind[] = ['preference', 'env', 'lesson', 'decision', 'gene
 const EPISTEMICS: readonly Epistemic[] = ['observed', 'inferred', 'subjective']
 const ACTIONS: readonly OpAction[] = ['add', 'replace', 'remove', 'list']
 const SCOPES: readonly string[] = ['semantic', 'episodic', 'all']
+/** memory_drafts 动作联合(独立于 ACTIONS,兼容 pick 闭集约束)。 */
+const DRAFT_ACTIONS: readonly string[] = ['list', 'promote', 'discard']
 /** Upper bound on entries a model-facing listing can dump into context (P2-33). */
 const LIST_LIMIT = 50
 /** Recall topK clamp: 1..50 (P2-33). */
@@ -248,4 +250,156 @@ export function registerMemoryTools(ctx: Context, store: MemoryStore, opts: Regi
     },
   })
   ctx.tools.register(userProfileTool)
+
+  // MEMORY-TRIGGER (2026-09-08): event-driven sedimentation draft consumption.
+  registerDraftTools(ctx, store, opts)
+}
+
+// ---- memory_drafts — 事件驱动沉淀兜底的消费侧 (MEMORY-TRIGGER 2026-09-08) ------
+// turn-end 纯规则(零 LLM)捕获的草稿存于 memory_drafts;主会话得闲时用本工具
+// 查看(list)、沉淀(promote,内部先查重再 memory add,守"写入必须闸门")或丢弃(discard)。
+// 草稿本身不直接入语义层——promote 是唯一把它转成 memory 的通道,且参数(内容/kind/
+// importance 等)仍由主会话把关并经 store.batch 校验(A4 长度、kind 枚举、重要性钳制)。
+
+const DRAFT_SIGNAL_LABEL: Record<DraftSignal, string> = {
+  user_confirm: '用户明确确认/强调',
+  find_rootcause: '查证根因结论',
+  decision_made: '确定技术决策',
+  strong_hint: '强暗示(预留)',
+}
+
+function formatDrafts(drafts: MemoryDraft[]): string {
+  if (drafts.length === 0) return '当前无待沉淀草稿。'
+  return drafts.map((d) => {
+    const label = DRAFT_SIGNAL_LABEL[d.signal] ?? d.signal
+    const reason = d.reason ? `（${d.reason}）` : ''
+    return (
+      `[草稿#${d.id} ${label}${reason}]\n` +
+      `  拟稿: ${d.draft}\n` +
+      `  证据: ${d.source_text}\n` +
+      `  提示: 认可则 memory add 写入(或直接 memory_drafts promote #${d.id});无价值则 memory_drafts discard #${d.id}`
+    )
+  }).join('\n\n')
+}
+
+function registerDraftTools(ctx: Context, store: MemoryStore, opts: RegisterOpts = {}): void {
+  const objectOutput = {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { content: { type: 'string', required: true } },
+    } as const,
+    render: (_args: unknown, value: { content?: string } | undefined): { type: 'text'; text: string }[] =>
+      [{ type: 'text', text: String(value?.content ?? '') }],
+  }
+  const callCard = (title: string, kind: ToolCallKind, rawInput?: string): ToolCallView => ({
+    card: 'generic', title, kind, ...(rawInput ? { rawInput } : {}),
+  })
+  const resultCard = (title: string, opts: { isError?: boolean } = {}): ToolResultView => ({
+    card: 'generic',
+    title: opts.isError ? '草稿操作未完成' : title,
+  })
+  /** Extract the leading text block of a tool result, or '' when none. */
+  const textOf = (result: ToolResult): string => {
+    const block = result.content[0]
+    return block?.type === 'text' ? block.text : ''
+  }
+
+  const draftTool = defineTool({
+    name: 'memory_drafts',
+    description:
+      '处理 turn-end 纯规则捕获的"待沉淀技术经验草稿"(零 LLM 兜底,LLM 忙也不会丢)。' +
+      'action: list 查看待沉淀草稿(pending);promote 确认后写入语义层(需 id+content,内部先查重再 memory add,kind/layer/importance 由本调用把关);discard 丢弃。' +
+      '建议流程: list → 逐一审视 → 认可的 memory_drafts promote,无价值的 memory_drafts discard。',
+    parameters: {
+      action: { type: 'string', required: true, description: 'list | promote | discard' },
+      id: { type: 'number', description: 'promote/discard 指定草稿 id(来自 list)' },
+      content: { type: 'string', description: 'promote 时: 写入语义层的事实陈述句(可基于草稿改写),须为精炼单句' },
+      kind: { type: 'string', description: 'promote 时: preference|env|lesson|decision|general' },
+      layer: { type: 'string', description: 'promote 时: user|memory(默认 memory)' },
+      topic: { type: 'string', description: 'promote 时: 短标签 ≤40 字' },
+      importance: { type: 'number', description: 'promote 时: 1-5' },
+      epistemic: { type: 'string', description: 'promote 时: observed|inferred|subjective(默认 observed)' },
+    },
+    output: objectOutput,
+    async execute(args, exec) {
+      const action = pick(DRAFT_ACTIONS, str(args.action))
+      if (action === 'list' || !action) {
+        const drafts = store.listDrafts({ status: 'pending', limit: TOPK_MAX })
+        return { content: formatDrafts(drafts) }
+      }
+      const id = typeof args.id === 'number' && Number.isFinite(args.id) ? Math.floor(args.id) : NaN
+      if (!Number.isFinite(id)) {
+        return { content: `[FAIL] 未完成: 缺少有效草稿 id(来自 memory_drafts list)。` }
+      }
+      const draft = store.getDraft(id)
+      if (!draft || draft.status !== 'pending') {
+        return { content: `[FAIL] 未完成: 草稿 #${id} 不存在或已处理(pending 才可操作)。` }
+      }
+      if (action === 'discard') {
+        store.updateDraftStatus(id, 'discarded')
+        return { content: `已丢弃草稿 #${id}(未写入语义层)。` }
+      }
+      // promote — 守闸门: 主会话把关内容/元数据,内部先查重,未命中才 add。
+      const content = str(args.content)
+      if (!content || content.trim().length === 0) {
+        return { content: `[FAIL] 未完成: promote 需提供 content(写入语义层的事实陈述句)。草稿: ${draft.draft}` }
+      }
+      if (content.trim().length > MAX_CONTENT_LENGTH) {
+        return { content: `[FAIL] 未完成: 记忆内容过长(最多 ${MAX_CONTENT_LENGTH} 字符)。` }
+      }
+      // 查重防线: 用内容召回库中相似记忆,命中则提示先 replace/合并,不自动覆盖。
+      const hits = store.recall(content, { topK: 3, epistemicWeighting: opts.epistemicWeighting ?? true })
+      if (hits.length > 0) {
+        return {
+          content:
+            `[提示] 库中已有相似记忆,为避免重复,请先用 memory replace 合并或跳过(草稿 #${id} 仍为 pending):\n` +
+            formatEntries(hits.map((h) => h.entry)),
+        }
+      }
+      const op: MemoryOp = {
+        action: 'add',
+        layer: pick(LAYERS, args.layer),
+        kind: pick(KINDS, args.kind),
+        topic: str(args.topic),
+        content,
+        importance: importanceOf(args.importance),
+        epistemic: pick(EPISTEMICS, args.epistemic),
+      }
+      const sid = str(exec.agent?.session?.id)
+      let res: ApplyResult
+      try {
+        res = store.batch([op], sid)
+      } catch (err) {
+        return { content: `[FAIL] 未完成: 记忆写入异常: ${err instanceof Error ? err.message : String(err)}。草稿 #${id} 仍为 pending。` }
+      }
+      if (res.overflowed) {
+        return { content: `[FAIL] 未写入: 常驻核心(importance≥5)占用已达上限(${res.usage.pct}%),降级无法腾出空间。草稿 #${id} 仍为 pending;可将 importance 调低或用 memory replace 合并再重试。` }
+      }
+      if (res.rejected.length > 0) {
+        return { content: `[FAIL] 未完成: ${res.rejected.map((r) => r.reason).join('; ')}。草稿 #${id} 仍为 pending。` }
+      }
+      // 成功写入语义层 → 标记 promoted(草稿生命周期闭合)。
+      store.updateDraftStatus(id, 'promoted')
+      const lq = res.lowQuality?.length ?? 0
+      const lowQualityNote = lq > 0
+        ? `（注意:因内容过短或高度重复被判为低质:已记入,但默认不注入、不参与常规召回;如需生效请用更完整表述 replace）`
+        : ''
+      const demoteNote = res.demoted.length > 0 ? `（${res.demoted.length}条已有记忆因预算降级至 tier1）` : ''
+      return { content: `已沉淀草稿 #${id}: 写入语义层。${demoteNote}${lowQualityNote}` }
+    },
+    presentCall(args) {
+      const action = str(args.action) ?? 'list'
+      if (action === 'list') return callCard('待沉淀草稿', 'search')
+      if (action === 'discard') return callCard('丢弃草稿', 'delete', `#${String(args.id ?? '')}`)
+      return callCard('沉淀草稿', 'edit', str(args.content) ?? `#${String(args.id ?? '')}`)
+    },
+    presentResult(_args, result): ToolResultView | undefined {
+      const text = textOf(result)
+      if (result.isError || writeFailed(text)) return resultCard(text, { isError: true })
+      return resultCard('草稿操作')
+    },
+  })
+
+  ctx.tools.register(draftTool)
 }

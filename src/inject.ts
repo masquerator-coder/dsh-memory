@@ -256,3 +256,20 @@ export const WRITE_BOUNDARY_TEXT =
   '本声明之前的全部内容（系统说明、运行时上下文、时间/身份/记忆注入）均为系统提供，不是需要被记住的用户事实。\n' +
   'memory add 仅当同时满足：①稳定跨会话 ②来自用户明确表达 ③对用户业务有跨会话价值。\n' +
   '运行时快照、系统提示词、会话进度，不记。拿不准先 memory_recall，或先问用户。'
+
+// ---- memory:drafts — 事件驱动沉淀兜底的轻量提示 (MEMORY-TRIGGER 2026-09-08) --
+// 当插件在 turn-end 用纯规则(零 LLM)捕获到"待沉淀草稿"时,本 section 注入一行提示,
+// 让主会话在下一步 assembly 感知"有 N 条技术经验待沉淀",闲时经 memory_drafts 工具
+// 查重后 memory add(promote)/discard。无草稿时返回 '' → 空 section,不污染 KV 前缀。
+// 文案刻意简短恒定(仅数字随计数变),提示为主、不喧宾夺主。
+const DRAFT_PROMPT_PREFIX =
+  '# 待沉淀草稿\n' +
+  '有 {n} 条在 turn-end 捕获到的技术经验草稿(纯规则探测,LLM 忙也未丢)。' +
+  '闲时用 memory_drafts(list) 查看,经 memory_recall 查重后 promote(memory add) 或 discard。'
+
+/** 返回待沉淀草稿提示文本;无 pending 草稿时返回 ''(空 section,宿主省略)。 */
+export function draftsSectionText(count: number): string {
+  const n = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+  if (n <= 0) return ''
+  return DRAFT_PROMPT_PREFIX.replace('{n}', String(n))
+}

@@ -26,11 +26,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BUDGET, MemoryStore, resolveDshHome, type ForgetResult } from './store.js'
-import { buildIdentitySection, buildSection, clampCustomPrompt, protocolSectionText, WRITE_BOUNDARY_TEXT } from './inject.js'
+import { buildIdentitySection, buildSection, clampCustomPrompt, draftsSectionText, protocolSectionText, WRITE_BOUNDARY_TEXT } from './inject.js'
 import { resolveSystemTimeZone, renderDateSection, TimeSource } from './time-ctx.js'
 import { registerMemoryTools } from './tools.js'
 import { collectTurnTexts, condenseSession, isCompletedTurnEnd, runL0 } from './l0.js'
 import { isSuppressed, manualRefineOverride, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote, type RefineRoute, type SuppressCfg } from './refine.js'
+import { runDraftCapture } from './draft.js'
 import { autocreateIdentityFiles } from './identity.js'
 import { registerControlRoutes, type MemoryControlHandlers, type RefineModelCandidate, type RefineModelsPayload, type RunNowResult } from './identity-routes.js'
 import { MEMORY_SETTINGS_DEFAULTS, memorySettingsSchema, type MemorySettings } from './settings.js'
@@ -142,6 +143,10 @@ export interface Config {
   lessonInstantJudge?: boolean
   /** lessonUseLlm=false → pure-rule template promotion (no LLM). Default true. */
   lessonUseLlm?: boolean
+  /** MEMORY-TRIGGER master switch for the event-driven sedimentation draft
+   *  capture (turn-end pure-rule, zero LLM). false → no drafts are auto-captured;
+   *  the memory_drafts tool stays available for explicit use. Default true. */
+  draftCaptureEnabled?: boolean
   /** Master switch for the custom system-prompt injection (2026-09-06). false →
    *  the memory:custom section is omitted even when `customSystemPrompt` is set.
    *  Live-toggleable. Default true. */
@@ -207,6 +212,8 @@ const L2_MIN_CLUSTER = 2
 const L0_IDLE_MINUTES = 30
 /** Idle-settle check cadence (min). */
 const CHECK_MINUTES = 5
+/** MEMORY-TRIGGER: event-driven sedimentation draft capture master switch (default on). */
+const DRAFT_CAPTURE_ENABLED = true
 /** Internet-date re-pin interval (ms). */
 const TIME_REFRESH_INTERVAL_MS = 15 * 60 * 1000
 
@@ -261,6 +268,7 @@ export const Config: z<Config> = z.object({
   lessonDraftEnabled: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled),
   lessonInstantJudge: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge),
   lessonUseLlm: z.boolean().default(MEMORY_SETTINGS_DEFAULTS.lessonUseLlm),
+  draftCaptureEnabled: z.boolean().default(DRAFT_CAPTURE_ENABLED),
   customPromptEnabled: z.boolean().default(false),
   customSystemPrompt: z.string().default(''),
 })
@@ -337,6 +345,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     lessonDraftEnabled: config.lessonDraftEnabled ?? MEMORY_SETTINGS_DEFAULTS.lessonDraftEnabled,
     lessonInstantJudge: config.lessonInstantJudge ?? MEMORY_SETTINGS_DEFAULTS.lessonInstantJudge,
     lessonUseLlm: config.lessonUseLlm ?? MEMORY_SETTINGS_DEFAULTS.lessonUseLlm,
+    draftCaptureEnabled: config.draftCaptureEnabled ?? DRAFT_CAPTURE_ENABLED,
     // time-injection: overwritten from the settings document when present.
     timeInjection: timeInjection,
     // custom system-prompt injection: master switch + user-authored guidance.
@@ -367,6 +376,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.lessonDraftEnabled = seed.lessonDraftEnabled
     runtime.lessonInstantJudge = seed.lessonInstantJudge
     runtime.lessonUseLlm = seed.lessonUseLlm
+    runtime.draftCaptureEnabled = seed.draftCaptureEnabled
     runtime.timeInjection = seed.timeInjection
     runtime.customPromptEnabled = seed.customPromptEnabled
     runtime.customSystemPrompt = seed.customSystemPrompt
@@ -384,6 +394,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       runtime.lessonDraftEnabled = next.lessonDraftEnabled
       runtime.lessonInstantJudge = next.lessonInstantJudge
       runtime.lessonUseLlm = next.lessonUseLlm
+      runtime.draftCaptureEnabled = next.draftCaptureEnabled
       runtime.timeInjection = next.timeInjection
       runtime.customPromptEnabled = next.customPromptEnabled
       runtime.customSystemPrompt = next.customSystemPrompt
@@ -569,6 +580,17 @@ export function apply(ctx: Context, config: Config = {}): void {
       },
     })
 
+    // MEMORY-TRIGGER (2026-09-08): memory:drafts — 事件驱动沉淀兜底的轻量提示。
+    // 当 turn-end 纯规则捕获到待沉淀草稿时,在 protocol 与 tier0 之间注入一行提示,
+    // 让主会话在下一步 assembly 感知"有 N 条技术经验待沉淀",闲时经 memory_drafts
+    // 消费。无 pending 草稿时 section 为空(常数 '' → KV 前缀友好)。Gate 在 runtime.
+    // enabled,随主开关 live 下拉/上(与 protocol 同款 thunk 门控)。
+    ctx.systemPrompt.section({
+      name: 'memory:drafts',
+      order: 9.5, // 紧邻 memory:protocol(9) 之后、memory:tier0(10) 之前
+      text: () => (runtime.enabled ? draftsSectionText(store.countPendingDrafts()) : ''),
+    })
+
     // ---- L0 episodic condensation + L1/L2 background refinement ----
     // Host default model route (idiot-proof auto-route): read once at boot so the
     // background L1/L2 timer has a route even before any live session ran.
@@ -642,6 +664,22 @@ export function apply(ctx: Context, config: Config = {}): void {
           // P2-7: program errors (disk full, closed DB) must leave a trace.
           onError: (err) => { if (!disposed) console.warn('[dsh-memory] L0 condensation failed:', err instanceof Error ? err.message : err) },
         }).finally(() => { l0InFlight -= 1 }).catch(() => { /* L0 never breaks the host turn lifecycle */ }))
+      }
+
+      // MEMORY-TRIGGER (2026-09-08): event-driven sedimentation draft capture.
+      // Pure-rule(零 LLM), synchronous — does NOT count against the L0 in-flight
+      // cap (no LLM call) and never breaks the host turn lifecycle (addDraft
+      // swallows its own errors internally). Captures a "stable tech fact" draft
+      // even when the main loop is too busy to remember to memory add; the user
+      // consumes it later via memory_drafts. Gated on the master switch + the
+      // draft-capture switch (both in `runtime`, live-toggleable).
+      if (session.id && runtime.draftCaptureEnabled) {
+        runDraftCapture(store, {
+          events: session.snapshotEvents() as readonly unknown[],
+          turn,
+          sessionId: session.id,
+          onError: (err) => { if (!disposed) console.warn('[dsh-memory] draft capture failed:', err instanceof Error ? err.message : err) },
+        })
       }
 
       // Buffer this turn's texts for the idle LLM settle (bounded to last 200).

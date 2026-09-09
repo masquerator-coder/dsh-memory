@@ -31,6 +31,7 @@
  *   G25  review fixes 2026-09-02 (S1 truncation / G4 cross-layer flip)
  *   G38  audit fixes 2026-09-03 (C1 replace metadata / M1 blank query / M3 no-route skip / M4 honest reject / M6 newest draft)
  *   G40  time-injection (internet-anchored date → local tz, local fallback)
+ *   G44  event-driven sedimentation drafts (MEMORY-TRIGGER 2026-09-08)
  *
  * Run: node smoke.mjs
  */
@@ -43,7 +44,8 @@ import { isLowQuality, qualityScore } from './lib/quality.js'
 import { formatEntries, formatEpisodes, recallEmptyLabel, writeFailed, writeVerdictLabel } from './lib/format.js'
 import { collectTurnTexts, collectTurnTools, condenseSession, dedupe, episodeWorthWriting, isCompletedTurnEnd, runL0, summarizeLlm, summarizeRules } from './lib/l0.js'
 import { buildL1Prompt, buildL2Prompt, isSuppressedRaw, manualRefineOverride, parseL1Json, parseL2Json, resolveRefineRoute, runRefineL1, runRefineL2, runRefineLessonPromote } from './lib/refine.js'
-import { buildIdentitySection, buildSection, clampCustomPrompt, CUSTOM_CAP, IDENTITY_CAP, PROTOCOL_TEXT, protocolSectionText, sanitizeIdentity } from './lib/inject.js'
+import { buildIdentitySection, buildSection, clampCustomPrompt, CUSTOM_CAP, IDENTITY_CAP, PROTOCOL_TEXT, protocolSectionText, sanitizeIdentity, draftsSectionText } from './lib/inject.js'
+import { collectTurnRoleTexts, detectDraftSignal, runDraftCapture } from './lib/draft.js'
 import { fetchInternetEpochMs, formatLocalDate, renderDateSection, resolveSystemTimeZone, TimeSource } from './lib/time-ctx.js'
 import { readIdentityFiles, writeIdentityFile } from './lib/identity.js'
 import { buildMarkdownBundle, mdSafe, renderEpisodesMarkdown, renderIdentityMarkdown, renderMemoriesMarkdown } from './lib/md-export.js'
@@ -1601,6 +1603,72 @@ group('G43 audit fixes 2026-09-07 (M1 / M2 / L1)')
   assert('L1 doubles single quotes', sqlPathLiteral("a'b") === "a''b")
   assert('L1 forward-slashes backslashes (Windows)', sqlPathLiteral('C:\\dir\\file.db') === 'C:/dir/file.db')
   assert('L1 escapes quote + backslash together', sqlPathLiteral("C:\\x\\o'b") === "C:/x/o''b")
+}
+
+// ---------------------------------------------------------------------------
+group('G44 event-driven sedimentation drafts (MEMORY-TRIGGER 2026-09-08)')
+{
+  // pure detectDraftSignal: user_confirm (用户明确确认/强调)
+  const cu = detectDraftSignal({ userText: '记住：这个接口要在初始化前调用，否则会报错', agentText: '已确认，会在初始化前调用。', toolsUsed: [] })
+  assert('detect user_confirm signal', cu && cu.signal === 'user_confirm' && cu.draft.includes('初始化前'))
+  // 无用户信号 → 不捕
+  const none = detectDraftSignal({ userText: '那这个方案看起来还行', agentText: '好的，我继续往下看。', toolsUsed: ['read'] })
+  assert('weak/no signal → null (no capture)', none === null)
+  // find_rootcause: 查证工具 + 根因结论动词(强证据)
+  const fr = detectDraftSignal({ userText: '这问题出在哪？', agentText: '根因是构造函数里调用了未初始化的单例，导致空引用。', toolsUsed: ['read', 'grep'] })
+  assert('detect find_rootcause (rootcause tool + verb)', fr && fr.signal === 'find_rootcause' && fr.draft.includes('根因'))
+  // 有根因动词但无查证工具 → 不捕(保守,避免误报)
+  const noTool = detectDraftSignal({ userText: '这是为啥？', agentText: '原因是缓存没刷新导致的结果。', toolsUsed: [] })
+  assert('rootcause verb without evidence tool → null', noTool === null)
+  // decision_made: agent 决策动词 + 用户有实质输入
+  const dm = detectDraftSignal({ userText: '就用这个方案吧。', agentText: '决定采用基于依赖注入的方式重构该模块。', toolsUsed: [] })
+  assert('detect decision_made', dm && dm.signal === 'decision_made' && dm.draft.includes('依赖注入'))
+
+  // collectTurnRoleTexts: 区分 user/agent
+  const roleEvents = [
+    { type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '用户回合内容' }] } },
+    { type: 'agent/message', data: { turn: 1, content: [{ type: 'text', text: 'agent回合内容' }] } },
+    { type: 'user/message', data: { turn: 2, content: [{ type: 'text', text: '不该进turn1' }] } },
+  ]
+  const roles = collectTurnRoleTexts(roleEvents, 1)
+  assert('collectTurnRoleTexts splits user from agent, scoped to turn',
+    roles.user.length === 1 && roles.agent.length === 1 && roles.user[0].includes('用户') && roles.agent[0].includes('agent') && !roles.user.join('').includes('不该进'))
+
+  // draftsSectionText 提示注入: 0 → 空; >0 → 一行提示
+  assert('draftsSectionText(0) is empty (KV-friendly)', draftsSectionText(0) === '')
+  assert('draftsSectionText(n>0) injects prompt', draftsSectionText(2).includes('待沉淀草稿') && draftsSectionText(2).includes('2 条'))
+
+  // store 方法端到端: 状态机 pending → promoted/discarded
+  const t = mkdtempSync(join(tmpdir(), 'dsh-mem-g26-'))
+  const s = new MemoryStore(t)
+  assert('addDraft returns a positive id', typeof s.addDraft({ session_id: 's1', turn: 1, signal: 'user_confirm', source_text: '源文本', draft: '候选陈述', reason: '用户确认' }) === 'number')
+  const id2 = s.addDraft({ session_id: 's1', turn: 2, signal: 'decision_made', source_text: '源2', draft: '决策文' })
+  assert('countPendingDrafts counts pending only', s.countPendingDrafts() === 2)
+  const drafts = s.listDrafts({ status: 'pending' })
+  assert('listDrafts newest-first + fields present', drafts.length === 2 && drafts[0].id === id2 && drafts[0].signal === 'decision_made')
+  assert('getDraft resolves a row', s.getDraft(id2) && s.getDraft(id2).session_id === 's1')
+  s.updateDraftStatus(id2, 'promoted')
+  assert('updateDraftStatus promoted → pending count drops', s.countPendingDrafts() === 1)
+  assert('promoted draft not in pending list', s.listDrafts({ status: 'pending' }).find(d => d.id === id2) === undefined)
+  s.updateDraftStatus(drafts[1].id, 'discarded')
+  assert('updateDraftStatus discarded → all drained', s.countPendingDrafts() === 0)
+  s.close(); rmSync(t, { recursive: true, force: true })
+
+  // runDraftCapture 端到端: 从事件写出一条草稿,零 LLM,不 throw
+  const t2 = mkdtempSync(join(tmpdir(), 'dsh-mem-g26b-'))
+  const s2 = new MemoryStore(t2)
+  const capEvents = [
+    { type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '记住：构建产物要先编译再打包' }] } },
+    { type: 'agent/message', data: { turn: 1, content: [{ type: 'text', text: '好的，已记住这个顺序。' }] } },
+  ]
+  let capErr = null
+  const draftId = runDraftCapture(s2, { events: capEvents, turn: 1, sessionId: 'cap-sess', onError: (e) => { capErr = e } })
+  assert('runDraftCapture captured a draft (zero LLM)', draftId !== null && capErr === null)
+  assert('captured draft persisted with user_confirm signal', s2.listDrafts({ status: 'pending' }).some(d => d.signal === 'user_confirm'))
+  // 弱信号事件 → 不捕,不 throw
+  const calmId = runDraftCapture(s2, { events: [{ type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: '普通闲聊没有信号' }] } }], turn: 1, sessionId: 'cap-sess-2' })
+  assert('runDraftCapture skips weak signal (null, no throw)', calmId === null)
+  s2.close(); rmSync(t2, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

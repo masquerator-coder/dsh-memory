@@ -139,3 +139,20 @@ export interface ForgetDays {
     decision: number;
     general: number;
 }
+/** 触发信号标签——决定 detectDraftSignal 命中哪类稳定技术事实。 */
+export type DraftSignal = 'user_confirm' | 'find_rootcause' | 'decision_made' | 'strong_hint';
+/** memory_drafts 表状态机：pending(待裁决) → promoted(已入语义层) / discarded(丢弃)。 */
+export type DraftStatus = 'pending' | 'promoted' | 'discarded';
+/** 一行 memory_drafts 记录(事件层兜底捕获的候选草稿)。 */
+export interface MemoryDraft {
+    id: number;
+    session_id: string;
+    turn?: number;
+    ts: number;
+    signal: DraftSignal;
+    source_text: string;
+    draft: string;
+    reason?: string;
+    status: DraftStatus;
+    created: number;
+}

@@ -85,3 +85,5 @@ export declare const PROTOCOL_TEXT: string;
  *  R3-total live-toggle tears the section down/up without a restart. */
 export declare function protocolSectionText(enabled: boolean): string;
 export declare const WRITE_BOUNDARY_TEXT: string;
+/** 返回待沉淀草稿提示文本;无 pending 草稿时返回 ''(空 section,宿主省略)。 */
+export declare function draftsSectionText(count: number): string;

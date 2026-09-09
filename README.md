@@ -98,6 +98,16 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 - 语义层：FTS5 + CJK 子串 + `epistemic × heat` 加权
 - 情景层：FTS5 + 时间近因
 
+**`memory_drafts`**（2026-09-08，事件驱动沉淀兜底）——处理 turn-end 纯规则（零 LLM）捕获的"待沉淀技术经验草稿"：
+
+```
+{ action: list|promote|discard, id?, content?, kind?, layer?, topic?, importance?, epistemic? }
+```
+
+- 背景：记忆写入触发依赖主会话（LLM）临场想起 `memory add`，LLM 忙（构建/调试/查证）时会忽略阶段收尾而丢失稳定技术事实。插件在**每次完成的回合**用纯规则探测"用户明确确认/查证根因/确定技术决策"等强信号，命中即自动留存为 `memory_drafts` 草稿（零 LLM、零旁路，不占模型）；`memory:drafts` system-prompt 节在有待沉淀草稿时提示主会话。
+- `list` 查看待沉淀草稿；`promote` 对认可的草稿**先查重**（`memory_recall`）再 `memory add`（写入语义层，kind/layer/importance 由本调用把关）并标记 `promoted`；`discard` 丢弃草稿。
+- 草稿本身不直接入语义层——promote 是唯一转成 memory 的通道，守"写入必须闸门"。开关：设置面板「事件驱动沉淀兜底」（`draftCaptureEnabled`，默认开）。
+
 ### 2.2 设置面板（dsh 设置页「记忆」项）
 
 设置面板注册在官方 `settings.section` slot，左侧导航自带**神经元图标**（插件自声明，无需侵入 harness shell）。可实时切换（经 `scope.watch` live 生效，免重启，写入 dsh 设置文档持久化）：
@@ -108,6 +118,7 @@ frequency_boost = 1 + ln(1 + window_freq) # 近 windowDays 天召回次数的对
 | 系统提示注入当前日期 | `timeInjection` | 关 → 系统提示不注入真实世界日期节 |
 | 自定义系统提示词 | `customPromptEnabled` / `customSystemPrompt` | 开关置于该段之前（见 §2.4b）：开 → `customSystemPrompt` 用户自编指令**逐字注入**系统提示词、每个会话生效；关 → 整段不注入（即使有内容）；留空亦不注入 |
 | 主动遗忘 | `forgetEnabled` | 关 → 暂停降级/归档/硬删，**不清理已有记忆** |
+| 事件驱动沉淀兜底 | `draftCaptureEnabled` | 关 → 回合结束不再纯规则捕获待沉淀草稿（`memory_drafts` 工具仍可显式用） |
 | 忙闲时段抑制扫描 | `peakHourSuppress` | 关 → 任何时段都跑后台 LLM 凝练（费 API 钱） |
 | 凝练整理时间间隔（小时） | `refineIntervalMs` | 自定义 L1/L2 抽取与去重的周期扫描间隔（默认 1h，0.1h 起）；改小更及时更费 API、改大更省。新会话后 10 秒内仍会即时凝练一次（不受此间隔影响） |
 | 凝练模型（R10） | `refineModelMode` / `refineModelProvider` / `refineModel` | 记忆整理（L1 抽取/L2 合并/教训升格/会话收口）所用 LLM 的路由策略。**自动** = 跟随会话所用模型 → dsh 默认模型（含 cordis 显式 l1/l2/l0 路由）；**手动** = 固定用一个模型——下拉从 dsh 已配置模型（`GET /memory/models`，与 dsh 模型选择器同源的 LLM registry）里选，或选「自定义…」手填 provider/model。手动值填完整则**最高优先**于其余路由来源；未填完整自动回落，绝不硬降级 |
@@ -346,6 +357,7 @@ npm run smoke   # 等价于 node smoke.mjs
 
 ## 八、状态与兼容性
 
+- **事件驱动沉淀兜底（2026-09-08，MEMORY-TRIGGER）**：插件补上"写入前触发"这一记忆盲区——turn-end 用**纯规则（零 LLM、零旁路）**从当前回合的 user/agent 文本 + 工具集探测稳定技术事实强信号（用户明确确认/查证根因/确定技术决策），命中即自动留存为 `memory_drafts` 草稿（新表），即使主会话 LLM 忙到忘了 `memory add` 也不丢。`memory:drafts` system-prompt 节（仅有待草稿时非空、KV 友好）提示主会话；新工具 `memory_drafts`（list / promote / discard）让主会话闲时查重（`memory_recall`）后**沉淀（promote→memory add，守写入闸门）或丢弃**。草稿不直接入语义层。新开关 `draftCaptureEnabled`（settings 面板「事件驱动沉淀兜底」，默认开，live-toggle）。不改 `memories`/`episodes` 存储检索热度遗忘语义（与设计文档正交）；不每轮 spawn LLM 旁路、无常驻进程。新增 `smoke.mjs` 断言组 G44（23 断言）全绿。设计定稿见 Obsidian `dsh-memory/MEMORY-TRIGGER-DESIGN.md`。
 - **核心闭环完成**：三层存储、全局直写、跨会话召回、双信号热度、主动遗忘（三级阶梯 + 双遗忘面 + 审计 + 免疫 + 真删快照）、教训沉淀管道、整库备份导出/导入——`smoke.mjs` 全部断言组（219 项，G1–G35）全绿、稳定连跑，`tsc` 零错误。
 - **真机联调通过（2026-08-31）**：「记忆」设置项出现、面板控件渲染正常；`curl /memory/identity` 路由通；设置页关「记忆总开关」→ 新会话 agent 不再记得（live 生效铁证）。
 - **后台凝练 L1/L2**：周期性运行（默认 1h，面板可自定义间隔），情景→事实抽取 + 语义簇合并/去重，受忙闲时段抑制；新会话落库 10 秒内即时触发一次；亦可面板「立即整理记忆」手动触发。LLM 降级时不退化为纯规则硬抽（标记 degraded）。

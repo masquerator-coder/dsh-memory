@@ -36,7 +36,7 @@ import type {
   RecallHit,
   Tier,
 } from './types.js'
-import { isInjectableKind } from './types.js'
+import { isInjectableKind, type MemoryDraft, type DraftStatus, type DraftSignal } from './types.js'
 import { DAY_MS, heatOf, resolveForgetDays, shouldArchive, shouldDelete, shouldDemote } from './heat.js'
 import { contentSimilarity, isNearDupCandidate, isLowQuality, qualityScore } from './quality.js'
 import { DDL, rebuildFts } from './schema.js'
@@ -1526,6 +1526,92 @@ export class MemoryStore {
 
   markLessonDraftStatus(id: number, status: 'promoted' | 'dropped'): void {
     this.stmt('UPDATE lesson_drafts SET status = ? WHERE id = ?').run(status, id)
+  }
+
+  // ---- Event-driven sedimentation drafts (MEMORY-TRIGGER 2026-09-08) --------
+  // 零 LLM: 捕获/状态机全部是同步纯库操作,不占模型、不占旁路。写入语义层(memory
+  // add)仍由主会话经 memory_drafts 工具裁决,这里只管草稿的落库与状态迁移。
+
+  /** 追加一条 turn-end 捕获的"待沉淀草稿"。零 LLM、同步、成功返回新行 id。 */
+  addDraft(input: {
+    session_id: string
+    turn?: number
+    signal: DraftSignal
+    source_text: string
+    draft: string
+    reason?: string
+  }): number | null {
+    const now = Date.now()
+    try {
+      const r = this.stmt(
+        'INSERT INTO memory_drafts(session_id, turn, ts, signal, source_text, draft, reason, status, created) VALUES (?,?,?,?,?,?,?,?,?)',
+      ).run(
+        input.session_id,
+        input.turn ?? null,
+        now,
+        input.signal,
+        input.source_text,
+        input.draft,
+        input.reason ?? null,
+        'pending',
+        now,
+      )
+      return Number(r.lastInsertRowid)
+    } catch {
+      // 捕获兜底绝不断主会话: 草稿写失败静默丢弃(与 upsertLessonDraft 同策略).
+      return null
+    }
+  }
+
+  /** 列出 memory_drafts 草稿(默认 pending、ts DESC + id DESC,最新优先)。 */
+  listDrafts(opts: { status?: DraftStatus; limit?: number } = {}): MemoryDraft[] {
+    let sql = 'SELECT * FROM memory_drafts'
+    const params: Array<string | number | null> = []
+    if (opts.status) { sql += ' WHERE status = ?'; params.push(opts.status) }
+    sql += ' ORDER BY ts DESC, id DESC'
+    const lim = Number.isFinite(opts.limit) ? Math.max(1, Math.floor(opts.limit as number)) : 0
+    if (lim > 0) sql += ` LIMIT ${lim}`
+    const rows = this.stmt(sql).all(...params) as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: Number(r.id),
+      session_id: String(r.session_id),
+      turn: r.turn == null ? undefined : Number(r.turn),
+      ts: Number(r.ts),
+      signal: String(r.signal) as DraftSignal,
+      source_text: String(r.source_text ?? ''),
+      draft: String(r.draft ?? ''),
+      reason: r.reason == null ? undefined : String(r.reason),
+      status: String(r.status) as DraftStatus,
+      created: Number(r.created),
+    }))
+  }
+
+  getDraft(id: number): MemoryDraft | undefined {
+    const r = this.stmt('SELECT * FROM memory_drafts WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    if (!r) return undefined
+    return {
+      id: Number(r.id),
+      session_id: String(r.session_id),
+      turn: r.turn == null ? undefined : Number(r.turn),
+      ts: Number(r.ts),
+      signal: String(r.signal) as DraftSignal,
+      source_text: String(r.source_text ?? ''),
+      draft: String(r.draft ?? ''),
+      reason: r.reason == null ? undefined : String(r.reason),
+      status: String(r.status) as DraftStatus,
+      created: Number(r.created),
+    }
+  }
+
+  /** 更新草稿状态(promoted=已入语义层 / discarded=丢弃)。零 LLM。 */
+  updateDraftStatus(id: number, status: Exclude<DraftStatus, 'pending'>): void {
+    this.stmt('UPDATE memory_drafts SET status = ? WHERE id = ?').run(status, id)
+  }
+
+  /** 当前 pending 草稿数 —— memory:drafts section 用它做轻量提示(KV 友好)。 */
+  countPendingDrafts(): number {
+    const r = this.stmt("SELECT COUNT(*) AS c FROM memory_drafts WHERE status = 'pending'").get() as { c: number }
+    return Number(r?.c ?? 0)
   }
 
   failureTrail(): { memoryId: string; oldContent: string; newContent: string; correctedAt: number }[] {

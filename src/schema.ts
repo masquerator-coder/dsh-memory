@@ -128,6 +128,25 @@ CREATE TABLE IF NOT EXISTS lesson_drafts (
   drafted_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lesson_drafts_status ON lesson_drafts(status, drafted_at);
+
+-- MEMORY-TRIGGER (2026-09-08): 事件驱动沉淀兜底——turn-end 用纯规则(零 LLM)
+-- 探测到的"待沉淀候选草稿"表。与 episodes(会话摘要)/memories(语义事实) 语义正交：
+-- 这句"该不该记的技术经验"在 LLM 忙而被忽略时也被自动留存,由主会话经
+-- memory_drafts 工具在闲时裁决(查重后 memory add=promoted / 丢弃=discarded)。
+-- 捕获走纯规则零 LLM,不违背设计文档"不每轮 spawn LLM 旁路"；写入语义层仍有闸门。
+CREATE TABLE IF NOT EXISTS memory_drafts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,               -- 捕获所在会话
+  turn        INTEGER,                     -- 触发所在 turn（溯源）
+  ts          INTEGER NOT NULL,            -- 捕获时间(ms)
+  signal      TEXT NOT NULL,               -- 触发信号: user_confirm|find_rootcause|decision_made|strong_hint
+  source_text TEXT NOT NULL,               -- 触发证据原文片段(该 turn user/agent 文本)
+  draft       TEXT NOT NULL,               -- 拟稿候选陈述句(待主会话确认真/改写)
+  reason      TEXT,                        -- 触发依据短说明
+  status      TEXT NOT NULL DEFAULT 'pending',  -- pending|promoted|discarded
+  created     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_drafts_status ON memory_drafts(status, ts);
 `
 
 /**

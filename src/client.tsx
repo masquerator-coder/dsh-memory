@@ -55,6 +55,8 @@ interface MemorySettingsValue {
   customSystemPrompt?: string
   /** custom system-prompt injection master switch. false → omit the section. */
   customPromptEnabled?: boolean
+  /** MEMORY-TRIGGER: event-driven sedimentation draft capture master switch. */
+  draftCaptureEnabled?: boolean
   /** R10: refine-model selection ('auto' | 'manual'). */
   refineModelMode?: string
   refineModelProvider?: string
@@ -565,6 +567,13 @@ function MemorySettingsPanel(props: PanelProps): JSX.Element {
         checked={value.forgetEnabled ?? true}
         disabled={!ready}
         onChange={(next) => set('forgetEnabled', next)}
+      />
+      <Toggle
+        label="事件驱动沉淀兜底"
+        hint="回合结束时用纯规则（零 LLM）探测稳定技术事实并留存为待沉淀草稿，避免 LLM 忙时被忽略；闲时经 memory_drafts 工具沉淀或丢弃"
+        checked={value.draftCaptureEnabled ?? true}
+        disabled={!ready}
+        onChange={(next) => set('draftCaptureEnabled', next)}
       />
       <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0' }}>
         <span style={{ flex: 1 }}>
