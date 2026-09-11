@@ -30,6 +30,12 @@ export interface RecallQuery {
   readonly maxTokens?: number
   readonly now?: number
   readonly excludeIds?: readonly string[]
+  /**
+   * When true, only `index_state = ready` facts are considered (the outward
+   * signal of the outbox/Saga eventual-consistency barrier, §7.2). Called by the
+   * service with the resolved policy value.
+   */
+  readonly requireReadyIndex?: boolean
 }
 
 export interface ScoredMemory {
@@ -70,6 +76,8 @@ export async function recall(
     status: ['active'],
     privacy: policy.privacy.retrievalFilter,
     now,
+    // Outbox barrier: read only facts the derived backends have confirmed.
+    indexState: q.requireReadyIndex === true ? ['ready'] : undefined,
   }
 
   const terms = queryTerms(q.query)

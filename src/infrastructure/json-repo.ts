@@ -61,6 +61,7 @@ function applyFilter(fact: AtomicFact, filter: FactFilter): boolean {
   if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
   if (filter.pii === true && fact.pii !== true) return false
   if (filter.types !== undefined && !filter.types.includes(fact.type)) return false
+  if (filter.indexState !== undefined && !filter.indexState.includes(fact.index_state)) return false
   if (filter.now !== undefined && isExpired(fact, filter.now)) return false
   return true
 }

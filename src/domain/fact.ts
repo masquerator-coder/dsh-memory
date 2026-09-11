@@ -22,6 +22,9 @@ export type FactStatus =
   | 'pending_indexing'
   | 'index_failed'
 
+/** Derived-index consistency state of a fact (§7.2). */
+export type IndexState = 'ready' | 'pending_indexing' | 'index_failed'
+
 /** Privacy tier — decides default retrieval filter and redaction. */
 export type PrivacyLevel = 'public' | 'private' | 'confidential' | 'secret'
 
@@ -113,7 +116,7 @@ export interface AtomicFact {
   readonly ttl?: string | null
   readonly entities: readonly string[]
   readonly tags?: readonly string[]
-  readonly index_state: 'ready' | 'pending_indexing' | 'index_failed'
+  readonly index_state: IndexState
   /** Unix epoch ms when the fact was first stored. */
   readonly created_at: number
   /** Unix epoch ms of the last version bump. */

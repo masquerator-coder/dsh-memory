@@ -8,6 +8,7 @@
 import type { Config } from './config.ts'
 import type {
   ForgettingPolicy,
+  IndexingPolicy,
   MemoryPolicy,
   PrivacyPolicy,
   RetrievalPolicy,
@@ -60,6 +61,18 @@ export function buildPolicy(config: Config): MemoryPolicy {
     piiRedaction: config.privacy?.piiRedaction ?? true,
   }
 
+  const indexing: IndexingPolicy = {
+    enabled: config.indexing?.enabled ?? false,
+    pollIntervalMs: config.indexing?.pollIntervalMs ?? 250,
+    backoff: {
+      maxRetries: config.indexing?.maxRetries ?? 5,
+      baseMs: config.indexing?.backoffBaseMs ?? 50,
+      factor: config.indexing?.backoffFactor ?? 2,
+      capMs: config.indexing?.backoffCapMs ?? 5_000,
+    },
+    requireReadyIndex: config.indexing?.requireReadyIndex ?? true,
+  }
+
   return {
     profile: config.profile ?? 'personal',
     retrieval,
@@ -85,5 +98,6 @@ export function buildPolicy(config: Config): MemoryPolicy {
       incrementalIntervalMs: config.consolidation?.incrementalIntervalMs ?? 15 * 60_000,
       batchSize: config.consolidation?.batchSize ?? 500,
     },
+    indexing,
   }
 }

@@ -6,6 +6,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (P3 — Outbox / Saga 多后端最终一致性)
+
+- **Outbox log** (`src/domain/outbox.ts`, `src/infrastructure/outbox-journal.ts`):
+  an append-only, replay-safe journal of index/unindex changes keyed by
+  `(op, factId)` (idempotent — duplicate appends coalesce). Exponential backoff
+  (`backoffDelayMs`) governs retry timings. The `OutboxJournal` is in-process for
+  the plugin's single-process local positioning; the `OutboxStore` port is the
+  seam a durable SQLite/PostgreSQL log can implement later.
+- **Pluggable derived backends** (`src/infrastructure/index-backends.ts`): three
+  in-memory implementations of `DerivedIndexBackend` (vector / graph / object),
+  each with an idempotent `upsert`/`remove` and a fault-injection seam
+  (`injectFault`, `setHealthy`). Real ANN / Neo4j / object stores implement the
+  same port.
+- **IndexWorker** (`src/application/index-worker.ts`): the background Saga
+  participant. Reads due outbox entries, propagates `index`/`unindex` to every
+  registered backend, flips the fact `index_state` `pending_indexing → ready`,
+  retries failures with exponential backoff, and graduates permanently-failing
+  entries to the DLQ (`index_failed`) so recall can skip them. Skips unhealthy
+  backends without burning retries and surfaces degradation via `health()`.
+- **Tombstone & cascade delete** wired through `MemoryService`: `remember` /
+  `link` / `slowPath` / `applyUserMdEdits` publish `index` (and `unindex` for a
+  superseded fact) to the outbox; `forget` / `forgetAll` / `consolidate` publish
+  `unindex` tombstones so derived copies are removed (§7.2, §7.3, §12.7).
+- **Recall consistency barrier**: when indexing is enabled and backends are
+  registered, `recall` reads only `index_state = ready` facts (§7.2) via a new
+  `requireReadyIndex` option — a pending fact is hidden until the worker confirms
+  it. With zero backends the plugin behaves byte-for-byte like P0 (all facts
+  immediately `ready`), keeping every prior test green.
+- **Config & policy** (`config.ts`, `domain/policies.ts`, `build-policy.ts`):
+  `indexing.{enabled, pollIntervalMs, requireReadyIndex, maxRetries, backoff*}`.
+  Off by default; `index.ts` builds/start the outbox + worker and registers a
+  disposer when enabled.
+- **Observability**: `health()` now reports `indexing{enabled,backends,degraded}`
+  and `outbox{pending,dead}`; `metrics()` reports `outboxPending` / `outboxDead`
+  and per-backend counts.
+
+### Tests
+
+- New `tests/outbox.test.ts` (journal idempotency, backoff/due, DLQ counts),
+  `tests/index-backends.test.ts`, `tests/index-worker.test.ts` (happy path,
+  tombstone cascade, retry-then-success, DLQ on retry exhaustion, unhealthy-skip,
+  zero-backend trivially-consistent), and `tests/indexing-service.test.ts`
+  (end-to-end service write path + recall barrier + health/metrics, plus the
+  default no-outbox regression guard).
+- Suite is now **104 unit tests** (was 84 after P2).
+
 ### Added (P2)
 
 - **Entity-card aggregation & summary** (`src/domain/card.ts`,

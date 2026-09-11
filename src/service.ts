@@ -13,7 +13,7 @@ import type { AtomicFact, MemoryEvent } from './domain/fact.ts'
 import type { EntityResolver } from './domain/entity.ts'
 import type { MemoryPolicy } from './domain/policies.ts'
 import { isExpired } from './domain/policies.ts'
-import type { MemoryRepository } from './application/ports.ts'
+import type { MemoryRepository, OutboxStore } from './application/ports.ts'
 import type { RawAssertion } from './domain/factory.ts'
 import type { EntityCard, CardOptions } from './domain/card.ts'
 import { buildEntityCard } from './application/card.ts'
@@ -29,6 +29,7 @@ import { consolidateScope } from './application/consolidate.ts'
 import { scanPii } from './application/privacy.ts'
 import { ScopeQueue } from './infrastructure/queue.ts'
 import { withTimeout } from './util/timeout.ts'
+import type { IndexWorker } from './application/index-worker.ts'
 
 /** Optional LLM extraction callback supplied by the adapter (main LLM never extracts). */
 export type ExtractFunction = (text: string) => Promise<RawAssertion[]>
@@ -63,6 +64,13 @@ export interface Health {
   readonly store: { active: number; total: number } | undefined
   readonly llmExtraction: boolean
   readonly llmAvailable: boolean
+  readonly indexing: {
+    readonly enabled: boolean
+    readonly backends: number
+    readonly degraded: boolean
+    readonly detail?: string
+  }
+  readonly outbox: { pending: number; dead: number } | undefined
 }
 
 export interface MemoryServiceOptions {
@@ -75,6 +83,10 @@ export interface MemoryServiceOptions {
   readonly llmExtractionEnabled: boolean
   /** Master switch for session fast-channel capture (from config). */
   readonly captureEnabled: boolean
+  /** Outbox journal + IndexWorker (P3 §7.2). When set, writes publish to the
+   *  outbox and the worker keeps the pluggable derived backends consistent. */
+  readonly outbox?: OutboxStore
+  readonly worker?: IndexWorker
   readonly now?: () => number
   readonly onEvents?: (events: MemoryEvent[]) => void
 }
@@ -89,6 +101,8 @@ export class MemoryService {
   private readonly captureEnabled: boolean
   private readonly now: () => number
   private readonly onEvents?: (events: MemoryEvent[]) => void
+  private readonly outbox?: OutboxStore
+  private readonly worker?: IndexWorker
   /** Scope ids that have seen writes — drives the background consolidate sweep. */
   private readonly scopes = new Set<string>()
 
@@ -102,10 +116,22 @@ export class MemoryService {
     this.captureEnabled = options.captureEnabled
     this.now = options.now ?? Date.now
     this.onEvents = options.onEvents
+    this.outbox = options.outbox
+    this.worker = options.worker
   }
 
   policy(): MemoryPolicy {
     return this.policyRef()
+  }
+
+  /**
+   * Whether the deployment uses the outbox/Saga write path: indexing enabled
+   * AND at least one pluggable derived backend is registered. With zero backends
+   * the behavior is byte-for-byte that of P0 (all facts immediately `ready`).
+   */
+  get useOutbox(): boolean {
+    const pol = this.policyRef()
+    return pol.indexing.enabled && (this.worker?.backendCount ?? 0) > 0
   }
 
   /** Record a scope that has had activity (for the sweep). */
@@ -127,6 +153,8 @@ export class MemoryService {
       const report = await consolidateScope(this.repo, scope, stamp)
       expired += report.expired
       merged += report.merged
+      this.emit(report.events)
+      for (const f of report.inactivated) await this.publishUnindex(f.factId, f.scope)
     }
     return { expired, merged }
   }
@@ -137,11 +165,13 @@ export class MemoryService {
 
   /**
    * Synchronous-budget, degradation-safe recall (design §5.2). Returns cached
-   * scope facts when the store is slow, never throwing.
+   * scope facts when the store is slow, never throwing. When the outbox write
+   * path is active, only `index_state = ready` facts are read (the
+   * eventual-consistency barrier, §7.2).
    */
   async recall(query: RecallQuery): Promise<ScoredMemory[]> {
     const policy = this.policy()
-    const run = recall(policy, this.repo, query)
+    const run = recall(policy, this.repo, { ...query, requireReadyIndex: this.useOutbox && policy.indexing.requireReadyIndex })
     return withTimeout(run, policy.retrieval.timeoutMs, async () => {
       // Degradation: return any active scope facts (cheap list) rather than
       // nothing, without re-running the full pipeline.
@@ -216,9 +246,12 @@ export class MemoryService {
         await this.repo.put({ ...victim, status: 'superseded', updated_at: now })
         await this.repo.put({ ...next, version: victim.version + 1, supersedes: victim.id, created_at: victim.created_at })
         this.emit([{ kind: 'fact_superseded', factId: victim.id, byFactId: next.id, scope }])
+        await this.publishIndexedFact(next)
+        await this.publishUnindex(victim.id, scope)
         superseded += 1
       } else {
-        await rememberOne(this.deps(), assertion)
+        const outcome = await rememberOne(this.deps(), assertion)
+        await this.publishOutcome(outcome)
         added += 1
       }
     }
@@ -294,6 +327,7 @@ export class MemoryService {
     const outcome = await rememberOne(this.deps(), assertion)
     this.emit(outcome.events)
     this.recordScope(input.scope)
+    await this.publishOutcome(outcome)
     return outcome
   }
 
@@ -304,16 +338,21 @@ export class MemoryService {
     if (mode === 'delete') {
       await this.repo.delete(factId)
       this.emit([{ kind: 'fact_archived', factId, scope: fact.scope }])
+      await this.publishUnindex(factId, fact.scope)
       return
     }
     await this.repo.put({ ...fact, status: 'archived', updated_at: this.now() })
     this.emit([{ kind: 'fact_archived', factId, scope: fact.scope }])
+    await this.publishUnindex(factId, fact.scope)
   }
 
   /** Cascade-delete every fact in a scope (design §12.7 forgetting rights). */
   async forgetAll(scope: string): Promise<ForgetAllReport> {
     const facts = await this.repo.listScope(scope)
-    for (const fact of facts) await this.repo.delete(fact.id)
+    for (const fact of facts) {
+      await this.repo.delete(fact.id)
+      await this.publishUnindex(fact.id, scope)
+    }
     const events: MemoryEvent[] = facts.map(f => ({ kind: 'fact_archived', factId: f.id, scope }))
     this.emit(events)
     return { scope, deleted: facts.length, events }
@@ -338,12 +377,16 @@ export class MemoryService {
     }
     const outcome = await rememberOne(this.deps(), assertion)
     this.emit(outcome.events)
+    await this.publishOutcome(outcome)
     return outcome
   }
 
   /** Run a consolidation pass over one scope. */
   async consolidate(scope: string): Promise<{ expired: number; merged: number }> {
-    return consolidateScope(this.repo, scope, this.now())
+    const report = await consolidateScope(this.repo, scope, this.now())
+    this.emit(report.events)
+    for (const f of report.inactivated) await this.publishUnindex(f.factId, f.scope)
+    return { expired: report.expired, merged: report.merged }
   }
 
   /**
@@ -397,6 +440,7 @@ export class MemoryService {
     for (const assertion of assertions) {
       const outcome = await rememberOne(this.deps(), { ...assertion, source: assertion.source })
       this.emit(outcome.events)
+      await this.publishOutcome(outcome)
     }
     this.recordScope(input.scope)
   }
@@ -410,19 +454,91 @@ export class MemoryService {
       store = undefined
     }
     const policy = this.policy()
+    const indexingEnabled = this.useOutbox
+    const degraded = this.worker?.degraded()
+    let outbox: Health['outbox']
+    try {
+      outbox = this.outbox !== undefined
+        ? await this.outbox.stats()
+        : { pending: 0, dead: 0 }
+    } catch {
+      outbox = undefined
+    }
+    const backends = this.worker?.backendCount ?? 0
+    let ok = store !== undefined
+    if (indexingEnabled) ok = ok && (degraded?.ok !== false)
     return {
-      ok: store !== undefined,
+      ok,
       queue: this.queue.stats(),
       store,
       llmExtraction: this.llmExtractionEnabled,
       llmAvailable: this.extract !== undefined,
+      indexing: {
+        enabled: indexingEnabled,
+        backends,
+        degraded: degraded?.ok === false,
+        detail: degraded?.ok === false ? degraded.detail : undefined,
+      },
+      outbox,
     }
   }
 
   /** Observability metrics (design §11). */
-  async metrics(): Promise<{ stored: number; active: number }> {
+  async metrics(): Promise<{ stored: number; active: number; outboxPending: number; outboxDead: number; indexedBackends: Record<string, number> }> {
     const stats = await this.repo.stats()
-    return { stored: stats.total, active: stats.active }
+    const outboxStats = this.outbox !== undefined ? await this.outbox.stats() : { pending: 0, dead: 0 }
+    const indexedBackends: Record<string, number> = {}
+    for (const backend of this.worker?.backendsSnapshot ?? []) {
+      indexedBackends[backend.name] = await backend.count()
+    }
+    return {
+      stored: stats.total,
+      active: stats.active,
+      outboxPending: outboxStats.pending,
+      outboxDead: outboxStats.dead,
+      indexedBackends,
+    }
+  }
+
+  /**
+   * Run the index worker until the outbox drains (up to `tickLimit` per sweep).
+   * Used by tests and by the background loop's manual trigger; safe to no-op when
+   * outbox/Saga is not configured.
+   */
+  async drainIndexing(tickLimit = 100): Promise<{ swept: number; remaining: number }> {
+    if (!this.useOutbox || this.worker === undefined || this.outbox === undefined) return { swept: 0, remaining: 0 }
+    const report = await this.worker.tick(this.now(), tickLimit)
+    const stats = await this.outbox.stats()
+    return { swept: report.attempted, remaining: stats.pending }
+  }
+
+  /**
+   * Publish a write outcome to the outbox when the Saga write path is active.
+   * The stored active fact is flagged `pending_indexing` (so recall skips it until
+   * the worker confirms) and an `index` entry is queued; a superseded fact gets an
+   * `unindex` entry so its derived copies are removed (§7.2, §7.3).
+   */
+  private async publishOutcome(outcome: StoreOutcome): Promise<void> {
+    if (!this.useOutbox || this.outbox === undefined) return
+    await this.publishIndexedFact(outcome.stored)
+    if (outcome.superseded !== undefined) {
+      await this.outbox.append('unindex', outcome.superseded, outcome.stored.scope)
+    }
+  }
+
+  /** Queue an `index` entry and flag an active fact `pending_indexing`. */
+  private async publishIndexedFact(fact: AtomicFact): Promise<void> {
+    if (!this.useOutbox || this.outbox === undefined) return
+    if (fact.status === 'active') {
+      await this.repo.put({ ...fact, index_state: 'pending_indexing' })
+      await this.outbox.append('index', fact.id, fact.scope)
+    }
+  }
+
+  /** Queue a tombstone/unindex entry when the Saga write path is active. */
+  private async publishUnindex(factId: string, scope: string): Promise<void> {
+    if (!this.useOutbox || this.outbox === undefined) return
+    await this.outbox.append('unindex', factId, scope)
   }
 
   private deps(): { repo: MemoryRepository; resolver: EntityResolver; forgetting: MemoryPolicy['forgetting']; defaultPrivacy: AtomicFact['privacy'] } {

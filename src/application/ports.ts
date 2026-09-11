@@ -5,7 +5,8 @@
  *
  * @module dsh-memory/application/ports
  */
-import type { AtomicFact, FactUpdate, PrivacyLevel, FactType } from '../domain/fact.ts'
+import type { AtomicFact, FactUpdate, PrivacyLevel, FactType, IndexState } from '../domain/fact.ts'
+import type { OutboxEntry, OutboxOp } from '../domain/outbox.ts'
 
 /** Filter applied to recall candidates before ranking. */
 export interface FactFilter {
@@ -17,6 +18,13 @@ export interface FactFilter {
   readonly types?: readonly FactType[]
   /** Only facts not expired as of this epoch ms. */
   readonly now?: number
+  /**
+   * Only facts whose index_state is in this set. Recall requests it as
+   * `['ready']` when the deployment has configured pluggable backends and
+   * therefore honors the eventual-consistency barrier (design §7.2). When no
+   * backend is configured, the service omits this and all facts pass.
+   */
+  readonly indexState?: readonly IndexState[]
 }
 
 export interface RecallCandidate {
@@ -63,4 +71,61 @@ export interface MemoryRepository {
   stats(): Promise<StoreStats>
   /** Persist in-flight buffers/state (no-op when already flushed on each put). */
   flush?(): Promise<void>
+}
+
+/**
+ * Durable, replay-safe outbox the write path appends to (§7.2). Implementations
+ * may persist it beside the KV main records. All mutations are serialized; reads
+ * may observe a consistent snapshot. Idempotency is guaranteed by keying on
+ * `(op, factId)` — appending the same logical change twice is coalesced.
+ */
+export interface OutboxStore {
+  /** Record an index/unindex change for a fact (coalesces `(op, factId)`). */
+  append(op: OutboxOp, factId: string, scope: string): Promise<void>
+  /** Entries that are pending and whose backoff horizon has passed. */
+  pendingDue(now: number, limit: number): Promise<OutboxEntry[]>
+  /** Read one entry (undefined when absent). */
+  get(entryId: string): Promise<OutboxEntry | undefined>
+  /** Mark an entry successfully applied. */
+  markDone(entryId: string): Promise<OutboxEntry | undefined>
+  /** Record a retryable failure and bump the attempt/backoff. */
+  markFailed(entryId: string, error: string, nextAttemptAt: number): Promise<OutboxEntry | undefined>
+  /** Move a permanently-failing entry to the dead-letter log. */
+  markDead(entryId: string): Promise<OutboxEntry | undefined>
+  /** Remove an entry entirely (garbage-collect after done / dead). */
+  remove(entryId: string): Promise<void>
+  /** Counts for health / observability. */
+  stats(): Promise<OutboxStats>
+  /** Drop every entry (tests / scope-wipe). */
+  clear(): Promise<void>
+}
+
+export interface OutboxStats {
+  readonly pending: number
+  readonly done: number
+  readonly failed: number
+  readonly dead: number
+  readonly total: number
+}
+
+/**
+ * A pluggable derived index (vector / graph / object stand-in) kept consistent
+ * by the IndexWorker. Real providers (HNSW vector DB, Neo4j/Kùzu graph store,
+ * object store) implement the same contract; the shipped code ships in-memory
+ * implementations so the outbox/Saga machinery is exercised end-to-end without
+ * an external dependency (P3 "backends real-ized" later by swapping these).
+ */
+export interface DerivedIndexBackend {
+  /** Stable identity, e.g. `vector` / `graph` / `object`. */
+  readonly name: string
+  /** Index a fact (updates by factId; idempotent). */
+  upsert(fact: AtomicFact): Promise<void>
+  /** Remove a fact by id (idempotent; no-op when absent). */
+  remove(factId: string): Promise<void>
+  /** Optional full rebuild hook (schema migration / model change). */
+  rebuild?(facts: AtomicFact[]): Promise<void>
+  /** Whether the backend is reachable / healthy for the worker. */
+  health(): { ok: boolean; detail?: string }
+  /** Current entry count (observability). */
+  count(): Promise<number>
 }

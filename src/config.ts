@@ -55,6 +55,15 @@ export interface Config {
     incrementalIntervalMs?: number
     batchSize?: number
   }
+  indexing?: {
+    enabled?: boolean
+    pollIntervalMs?: number
+    requireReadyIndex?: boolean
+    maxRetries?: number
+    backoffBaseMs?: number
+    backoffFactor?: number
+    backoffCapMs?: number
+  }
 }
 
 const relationWhitelist = ['works_with', 'prefers_diet', 'uses_tool', 'uses_technology', 'located_in', 'deployed_on', 'works_at', 'uses_database', 'uses_orm', 'has_theme', 'is_a', 'speaks']
@@ -114,5 +123,14 @@ export const Config: z<Config> = z.object({
     enabled: z.boolean().default(true),
     incrementalIntervalMs: z.number().default(15 * 60_000),
     batchSize: z.number().default(500),
+  }),
+  indexing: z.object({
+    enabled: z.boolean().default(false),
+    pollIntervalMs: z.number().default(250),
+    requireReadyIndex: z.boolean().default(true),
+    maxRetries: z.number().default(5),
+    backoffBaseMs: z.number().default(50),
+    backoffFactor: z.number().default(2),
+    backoffCapMs: z.number().default(5_000),
   }),
 })

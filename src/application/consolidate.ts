@@ -16,6 +16,8 @@ export interface ConsolidateReport {
   readonly expired: number
   readonly merged: number
   readonly events: MemoryEvent[]
+  /** Facts this pass moved out of `active` — callers should cascade-unindex. */
+  readonly inactivated: readonly { readonly factId: string; readonly scope: string }[]
 }
 
 /**
@@ -29,6 +31,7 @@ export async function consolidateScope(
   budget = 500,
 ): Promise<ConsolidateReport> {
   const events: MemoryEvent[] = []
+  const inactivated: { factId: string; scope: string }[] = []
   let expired = 0
   let merged = 0
   const facts = await repo.listScope(scope)
@@ -41,6 +44,7 @@ export async function consolidateScope(
     if (isExpired(fact, now)) {
       await repo.put({ ...fact, status: 'expired', updated_at: now })
       expired += 1
+      inactivated.push({ factId: fact.id, scope: fact.scope })
       events.push({ kind: 'fact_expired', factId: fact.id, scope: fact.scope })
       continue
     }
@@ -51,10 +55,11 @@ export async function consolidateScope(
       && latest.version > fact.version) {
       await repo.put({ ...fact, status: 'superseded', updated_at: now })
       merged += 1
+      inactivated.push({ factId: fact.id, scope: fact.scope })
       events.push({ kind: 'fact_superseded', factId: fact.id, byFactId: latest.id, scope: fact.scope })
     }
   }
-  return { expired, merged, events }
+  return { expired, merged, events, inactivated }
 }
 
 /** Type-only re-export so callers can annotate sweeps. */

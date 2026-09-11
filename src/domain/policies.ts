@@ -71,6 +71,25 @@ export interface ConsolidationPolicy {
   readonly enabled: boolean
 }
 
+/**
+ * Outbox / Saga indexing policy (design §7.2) — how the IndexWorker keeps the
+ * derived backends consistent and whether recall honors the index barrier.
+ */
+export interface IndexingPolicy {
+  /** Master switch: emit outbox entries and run the worker. */
+  readonly enabled: boolean
+  /** Worker pull interval, ms. */
+  readonly pollIntervalMs: number
+  /** Exponential-backoff config for retrying outbox entries. */
+  readonly backoff: { readonly maxRetries: number; readonly baseMs: number; readonly factor: number; readonly capMs: number }
+  /**
+   * When true, recall only reads facts whose `index_state` is `ready`. Effective
+   * only when at least one derived backend is registered; with none it is forced
+   * off so a backend-free deployment behaves exactly as before (all facts `ready`).
+   */
+  readonly requireReadyIndex: boolean
+}
+
 /** The flat resolved policy object for one deployment. */
 export interface MemoryPolicy {
   readonly profile: string
@@ -79,6 +98,7 @@ export interface MemoryPolicy {
   readonly forgetting: ForgettingPolicy
   readonly privacy: PrivacyPolicy
   readonly consolidation: ConsolidationPolicy
+  readonly indexing: IndexingPolicy
 }
 
 /** Expiry computation — a fact is expired once its expires_at has passed. */

@@ -5,6 +5,8 @@ import { Context } from "@deepseek-ai/cordis";
 type FactType = 'semantic' | 'episodic' | 'procedural' | 'working';
 /** Lifecycle status of a fact. */
 type FactStatus = 'active' | 'superseded' | 'archived' | 'expired' | 'pending_review' | 'pending_indexing' | 'index_failed';
+/** Derived-index consistency state of a fact (§7.2). */
+type IndexState = 'ready' | 'pending_indexing' | 'index_failed';
 /** Privacy tier — decides default retrieval filter and redaction. */
 type PrivacyLevel = 'public' | 'private' | 'confidential' | 'secret';
 /** Where a fact came from; drives source credibility. */
@@ -93,7 +95,7 @@ interface AtomicFact {
   readonly ttl?: string | null;
   readonly entities: readonly string[];
   readonly tags?: readonly string[];
-  readonly index_state: 'ready' | 'pending_indexing' | 'index_failed';
+  readonly index_state: IndexState;
   /** Unix epoch ms when the fact was first stored. */
   readonly created_at: number;
   /** Unix epoch ms of the last version bump. */
@@ -183,6 +185,15 @@ interface Config {
     enabled?: boolean;
     incrementalIntervalMs?: number;
     batchSize?: number;
+  };
+  indexing?: {
+    enabled?: boolean;
+    pollIntervalMs?: number;
+    requireReadyIndex?: boolean;
+    maxRetries?: number;
+    backoffBaseMs?: number;
+    backoffFactor?: number;
+    backoffCapMs?: number;
   };
 }
 declare const Config: z<Config>;
@@ -329,6 +340,29 @@ interface ConsolidationPolicy {
   readonly batchSize: number;
   readonly enabled: boolean;
 }
+/**
+ * Outbox / Saga indexing policy (design §7.2) — how the IndexWorker keeps the
+ * derived backends consistent and whether recall honors the index barrier.
+ */
+interface IndexingPolicy {
+  /** Master switch: emit outbox entries and run the worker. */
+  readonly enabled: boolean;
+  /** Worker pull interval, ms. */
+  readonly pollIntervalMs: number;
+  /** Exponential-backoff config for retrying outbox entries. */
+  readonly backoff: {
+    readonly maxRetries: number;
+    readonly baseMs: number;
+    readonly factor: number;
+    readonly capMs: number;
+  };
+  /**
+   * When true, recall only reads facts whose `index_state` is `ready`. Effective
+   * only when at least one derived backend is registered; with none it is forced
+   * off so a backend-free deployment behaves exactly as before (all facts `ready`).
+   */
+  readonly requireReadyIndex: boolean;
+}
 /** The flat resolved policy object for one deployment. */
 interface MemoryPolicy {
   readonly profile: string;
@@ -337,6 +371,54 @@ interface MemoryPolicy {
   readonly forgetting: ForgettingPolicy;
   readonly privacy: PrivacyPolicy;
   readonly consolidation: ConsolidationPolicy;
+  readonly indexing: IndexingPolicy;
+}
+//#endregion
+//#region src/domain/outbox.d.ts
+/**
+ * Outbox event model — the durable, replay-safe log that guarantees eventual
+ * consistency across the plugin's backing stores (design §7.2).
+ *
+ * Write-path contract: every fact mutation that must be propagated to a derived
+ * backend (vector / graph / object) appends one OutboxEntry in the same logical
+ * write as the KV main record. A background IndexWorker
+ * (`application/index-worker`) applies entries to each registered backend, then
+ * marks the fact's `index_state` `ready`. Retries use exponential backoff; a
+ * permanently-failing entry graduates to the dead-letter log (DLQ) and the fact
+ * is flagged `index_failed` so recall can skip it (§7.2).
+ *
+ * Idempotency: an entry is keyed by `(op, factId)`, and the backends upsert /
+ * remove by fact id, so re-applying an already-handled entry is a no-op —
+ * replay is safe without a distributed coordinator (§12.2).
+ *
+ * @module dsh-memory/domain/outbox
+ */
+/** What to do to the derived backends for one fact. */
+type OutboxOp = 'index' | 'unindex';
+type OutboxState = 'pending' | 'done' | 'failed' | 'dead';
+interface OutboxEntry {
+  readonly id: string;
+  readonly op: OutboxOp;
+  readonly factId: string;
+  readonly scope: string;
+  readonly attempts: number;
+  readonly state: OutboxState;
+  /** Epoch ms after which the worker may retry (exponential backoff). */
+  readonly nextAttemptAt: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly lastError?: string;
+}
+/** Exponential-backoff configuration for retrying outbox entries. */
+interface BackoffPolicy {
+  /** How many attempts before an entry graduates to the DLQ. */
+  readonly maxRetries: number;
+  /** Base delay for the first retry, ms. */
+  readonly baseMs: number;
+  /** Multiplier per retry (1.X). */
+  readonly factor: number;
+  /** Hard ceiling on any single delay, ms. */
+  readonly capMs: number;
 }
 //#endregion
 //#region src/application/ports.d.ts
@@ -350,6 +432,13 @@ interface FactFilter {
   readonly types?: readonly FactType[];
   /** Only facts not expired as of this epoch ms. */
   readonly now?: number;
+  /**
+   * Only facts whose index_state is in this set. Recall requests it as
+   * `['ready']` when the deployment has configured pluggable backends and
+   * therefore honors the eventual-consistency barrier (design §7.2). When no
+   * backend is configured, the service omits this and all facts pass.
+   */
+  readonly indexState?: readonly IndexState[];
 }
 interface RecallCandidate {
   readonly fact: AtomicFact;
@@ -393,6 +482,63 @@ interface MemoryRepository {
   stats(): Promise<StoreStats>;
   /** Persist in-flight buffers/state (no-op when already flushed on each put). */
   flush?(): Promise<void>;
+}
+/**
+ * Durable, replay-safe outbox the write path appends to (§7.2). Implementations
+ * may persist it beside the KV main records. All mutations are serialized; reads
+ * may observe a consistent snapshot. Idempotency is guaranteed by keying on
+ * `(op, factId)` — appending the same logical change twice is coalesced.
+ */
+interface OutboxStore {
+  /** Record an index/unindex change for a fact (coalesces `(op, factId)`). */
+  append(op: OutboxOp, factId: string, scope: string): Promise<void>;
+  /** Entries that are pending and whose backoff horizon has passed. */
+  pendingDue(now: number, limit: number): Promise<OutboxEntry[]>;
+  /** Read one entry (undefined when absent). */
+  get(entryId: string): Promise<OutboxEntry | undefined>;
+  /** Mark an entry successfully applied. */
+  markDone(entryId: string): Promise<OutboxEntry | undefined>;
+  /** Record a retryable failure and bump the attempt/backoff. */
+  markFailed(entryId: string, error: string, nextAttemptAt: number): Promise<OutboxEntry | undefined>;
+  /** Move a permanently-failing entry to the dead-letter log. */
+  markDead(entryId: string): Promise<OutboxEntry | undefined>;
+  /** Remove an entry entirely (garbage-collect after done / dead). */
+  remove(entryId: string): Promise<void>;
+  /** Counts for health / observability. */
+  stats(): Promise<OutboxStats>;
+  /** Drop every entry (tests / scope-wipe). */
+  clear(): Promise<void>;
+}
+interface OutboxStats {
+  readonly pending: number;
+  readonly done: number;
+  readonly failed: number;
+  readonly dead: number;
+  readonly total: number;
+}
+/**
+ * A pluggable derived index (vector / graph / object stand-in) kept consistent
+ * by the IndexWorker. Real providers (HNSW vector DB, Neo4j/Kùzu graph store,
+ * object store) implement the same contract; the shipped code ships in-memory
+ * implementations so the outbox/Saga machinery is exercised end-to-end without
+ * an external dependency (P3 "backends real-ized" later by swapping these).
+ */
+interface DerivedIndexBackend {
+  /** Stable identity, e.g. `vector` / `graph` / `object`. */
+  readonly name: string;
+  /** Index a fact (updates by factId; idempotent). */
+  upsert(fact: AtomicFact): Promise<void>;
+  /** Remove a fact by id (idempotent; no-op when absent). */
+  remove(factId: string): Promise<void>;
+  /** Optional full rebuild hook (schema migration / model change). */
+  rebuild?(facts: AtomicFact[]): Promise<void>;
+  /** Whether the backend is reachable / healthy for the worker. */
+  health(): {
+    ok: boolean;
+    detail?: string;
+  };
+  /** Current entry count (observability). */
+  count(): Promise<number>;
 }
 //#endregion
 //#region src/domain/factory.d.ts
@@ -496,6 +642,12 @@ interface RecallQuery {
   readonly maxTokens?: number;
   readonly now?: number;
   readonly excludeIds?: readonly string[];
+  /**
+   * When true, only `index_state = ready` facts are considered (the outward
+   * signal of the outbox/Saga eventual-consistency barrier, §7.2). Called by the
+   * service with the resolved policy value.
+   */
+  readonly requireReadyIndex?: boolean;
 }
 interface ScoredMemory {
   readonly fact: AtomicFact;
@@ -535,6 +687,56 @@ declare class ScopeQueue {
   stats(): QueueStats;
   private pump;
   private work;
+}
+//#endregion
+//#region src/application/index-worker.d.ts
+interface IndexWorkerOptions {
+  readonly repo: MemoryRepository;
+  readonly outbox: OutboxStore;
+  readonly backends: DerivedIndexBackend[];
+  readonly backoff?: Partial<BackoffPolicy>;
+  readonly now?: () => number;
+  /** Fired after an entry is applied (success or DLQ) — observability seam. */
+  readonly onApplied?: (factId: string, entryId: string, ok: boolean) => void;
+}
+interface IndexReport {
+  attempted: number;
+  indexed: number;
+  unindexed: number;
+  failed: number;
+  dead: number;
+  skippedUnhealthy: number;
+}
+declare class IndexWorker {
+  private readonly repo;
+  private readonly outbox;
+  private readonly backends;
+  private readonly backoff;
+  private readonly now;
+  private readonly onApplied?;
+  private timer;
+  private running;
+  constructor(options: IndexWorkerOptions);
+  /** Independent-process style: pull-driven single pass over due entries. */
+  tick(now?: number, limit?: number): Promise<IndexReport>;
+  /** Start a periodic pull loop. Returns a stop function. */
+  start(intervalMs: number): () => void;
+  stop(): void;
+  dispose(): void;
+  /** How many derived backends the worker keeps in sync. */
+  get backendCount(): number;
+  /** Shallow copy of the registered backends (observability / metrics). */
+  get backendsSnapshot(): readonly DerivedIndexBackend[];
+  /** Whether any target backend is reporting unhealthy (for health checks). */
+  degraded(): {
+    ok: boolean;
+    detail?: string;
+  };
+  private applyEntry;
+  /** One retryable failure: retry with backoff, or graduate to the DLQ + flag failure. */
+  private failEntry;
+  private markReady;
+  private settleDone;
 }
 //#endregion
 //#region src/service.d.ts
@@ -588,6 +790,16 @@ interface Health {
   } | undefined;
   readonly llmExtraction: boolean;
   readonly llmAvailable: boolean;
+  readonly indexing: {
+    readonly enabled: boolean;
+    readonly backends: number;
+    readonly degraded: boolean;
+    readonly detail?: string;
+  };
+  readonly outbox: {
+    pending: number;
+    dead: number;
+  } | undefined;
 }
 interface MemoryServiceOptions {
   readonly repo: MemoryRepository;
@@ -599,6 +811,10 @@ interface MemoryServiceOptions {
   readonly llmExtractionEnabled: boolean;
   /** Master switch for session fast-channel capture (from config). */
   readonly captureEnabled: boolean;
+  /** Outbox journal + IndexWorker (P3 §7.2). When set, writes publish to the
+   *  outbox and the worker keeps the pluggable derived backends consistent. */
+  readonly outbox?: OutboxStore;
+  readonly worker?: IndexWorker;
   readonly now?: () => number;
   readonly onEvents?: (events: MemoryEvent[]) => void;
 }
@@ -612,10 +828,18 @@ declare class MemoryService {
   private readonly captureEnabled;
   private readonly now;
   private readonly onEvents?;
+  private readonly outbox?;
+  private readonly worker?;
   /** Scope ids that have seen writes — drives the background consolidate sweep. */
   private readonly scopes;
   constructor(options: MemoryServiceOptions);
   policy(): MemoryPolicy;
+  /**
+   * Whether the deployment uses the outbox/Saga write path: indexing enabled
+   * AND at least one pluggable derived backend is registered. With zero backends
+   * the behavior is byte-for-byte that of P0 (all facts immediately `ready`).
+   */
+  get useOutbox(): boolean;
   /** Record a scope that has had activity (for the sweep). */
   recordScope(scope: string): void;
   /** All scopes observed so far. */
@@ -628,7 +852,9 @@ declare class MemoryService {
   private emit;
   /**
    * Synchronous-budget, degradation-safe recall (design §5.2). Returns cached
-   * scope facts when the store is slow, never throwing.
+   * scope facts when the store is slow, never throwing. When the outbox write
+   * path is active, only `index_state = ready` facts are read (the
+   * eventual-consistency barrier, §7.2).
    */
   recall(query: RecallQuery): Promise<ScoredMemory[]>;
   /**
@@ -687,7 +913,30 @@ declare class MemoryService {
   metrics(): Promise<{
     stored: number;
     active: number;
+    outboxPending: number;
+    outboxDead: number;
+    indexedBackends: Record<string, number>;
   }>;
+  /**
+   * Run the index worker until the outbox drains (up to `tickLimit` per sweep).
+   * Used by tests and by the background loop's manual trigger; safe to no-op when
+   * outbox/Saga is not configured.
+   */
+  drainIndexing(tickLimit?: number): Promise<{
+    swept: number;
+    remaining: number;
+  }>;
+  /**
+   * Publish a write outcome to the outbox when the Saga write path is active.
+   * The stored active fact is flagged `pending_indexing` (so recall skips it until
+   * the worker confirms) and an `index` entry is queued; a superseded fact gets an
+   * `unindex` entry so its derived copies are removed (§7.2, §7.3).
+   */
+  private publishOutcome;
+  /** Queue an `index` entry and flag an active fact `pending_indexing`. */
+  private publishIndexedFact;
+  /** Queue a tombstone/unindex entry when the Saga write path is active. */
+  private publishUnindex;
   private deps;
 }
 //#endregion
