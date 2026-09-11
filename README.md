@@ -5,7 +5,7 @@ plugin. It lets an agent remember user preferences, project knowledge, and
 decisions **across sessions**, with privacy-first defaults and a predictable,
 budgeted retrieval path that never blocks the main conversation.
 
-This is a **P0 core** implementation of the design in
+This is a **P0–P2** implementation of the design in
 [`DeepSeek Harness 记忆系统插件 · 完整设计说明.md`](./DeepSeek%20Harness%20记忆系统插件%20·%20完整设计说明.md).
 
 ---
@@ -22,6 +22,18 @@ This is a **P0 core** implementation of the design in
 - **Explicit tools** the model can call:
   - `memory_recall` / `memory_remember` / `memory_forget` /
     `memory_forget_all` / `memory_link` / `read_user_profile`
+  - `memory_remember` optionally takes a `procedure` (structured steps) for
+    procedural memory; `read_user_profile` returns the aggregated **entity
+    card** (core summary + per-topic groups).
+- **Entity-card aggregation** — `read_user_profile` / `getCard` aggregate an
+  entity's facts into a grouped card with a deterministic, budgeted summary
+  (design §3.13).
+- **`user.md` round-trip** — a `user.md` view (design §8) is rendered to disk
+  from the entity card and watched for external edits, which are written back
+  to atomic facts as `user_edit` (credibility 1.0, always wins conflicts).
+- **Procedural memory** — procedural facts carry structured `steps` /
+  `preconditions` / `tool_chain` / `success_rate` (design §3.12), with a
+  migration helper for P0-era "steps-as-content" facts.
 - **Fast-channel capture** — a `session/event` listener with deterministic,
   zero-LLM rules (`记住…`, `我的偏好是…`) that hands signals to the background
   queue (design §6.4 **mode B**).
@@ -48,7 +60,7 @@ This is a **P0 core** implementation of the design in
   `provider` **and** `model` are configured in `extraction` plus
   `llmExtractionEnabled: true`.
 
-## Known Limitations (P0)
+## Known Limitations (P0/P1/P2)
 
 - **Storage** is a dependency-free JSON document (KV + lexical BM25 stand-in for
   a vector store + entity adjacency). No external vector DB, no SQLite, no graph
@@ -61,11 +73,15 @@ This is a **P0 core** implementation of the design in
 - **Recency decay is per-memory-type.** Fusion ranking decays recency
   exponentially with the forgetting-policy lambda of the fact's type (semantic
   decays slowly, episodic faster) rather than a fixed placeholder.
-- **Consolidation** covers expiry + same-key dedup only; entity-card
-  aggregation, summarization, schema migration, and full graph fan-out ranking
-  are deferred (design P1–P3).
-- **`user.md`** rendering/round-trip is not implemented in P0 (design §8 is
-  P2/P3). The `read_user_profile` tool returns an aggregated raw view.
+- **Consolidation** covers expiry + same-key dedup only; schema migration and
+  full graph fan-out ranking remain deferred (design P3).
+- **Summarization** is deterministic first-class-line selection, not an LLM
+  call. LLM/embedding-based summarization of entity cards is a later seam on
+  top of the grouping.
+- **`user.md` reconciliation** matches edited lines to facts per predicate by
+  exact content; heavily restructured free-hand edits may not map cleanly to a
+  single fact and are written back as new/archived facts. Concurrent user edits
+  win over background aggregation (design §8.4).
 - **Per-scope ordering** is guaranteed by a scope-scoped worker queue, but there
   is no cross-process lock: P0 targets a single local DSH process.
 
@@ -86,6 +102,7 @@ mirror the design's Profile (§10). Selected defaults:
 | key | default |
 | --- | --- |
 | `dataFile` | `''` (**in-memory**; set a path to persist) |
+| `userMdFile` | `''` (persist + watch the `user.md` view; empty disables) |
 | `profile` | `personal` |
 | `injectContext` | `true` |
 | `captureEnabled` | `true` |
@@ -107,6 +124,11 @@ dsh plugin add "https://github.com/masquerator-coder/dsh-memory.git"
 The plugin's `package.json` declares `dsh.bundle.patch: ./cordis.patch.yml`, so
 the loader auto-inserts the `memory` row. To persist fact storage, patch
 `dataFile` to an absolute path in your profile's `cordis.patch.yml`.
+
+To persist the `user.md` view and sync user edits back to facts, set `userMdFile`
+to an absolute path (e.g. next to `dataFile`). The file is rendered on data
+changes and watched for external edits (editing it in Obsidian writes the
+changes back to atomic facts as `user_edit`).
 
 To enable LLM extraction, add `extraction.provider`, `extraction.model`, and
 `llmExtractionEnabled: true` to the `memory` row.

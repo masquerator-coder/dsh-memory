@@ -15,6 +15,14 @@ import type { MemoryPolicy } from './domain/policies.ts'
 import { isExpired } from './domain/policies.ts'
 import type { MemoryRepository } from './application/ports.ts'
 import type { RawAssertion } from './domain/factory.ts'
+import type { EntityCard, CardOptions } from './domain/card.ts'
+import { buildEntityCard } from './application/card.ts'
+import { normalizeProcedure } from './domain/procedural.ts'
+import { buildFact } from './domain/factory.ts'
+import { parseUserMd } from './application/usermd-parse.ts'
+import { renderUserMd } from './application/usermd-render.ts'
+import { diffUserMdEdits } from './application/usermd-sync.ts'
+import type { UserMdLine } from './domain/usermd.ts'
 import { rememberOne, type StoreOutcome } from './application/remember.ts'
 import { recall, type RecallQuery, type ScoredMemory } from './application/recall.ts'
 import { consolidateScope } from './application/consolidate.ts'
@@ -37,6 +45,8 @@ export interface RememberInput {
   privacy?: AtomicFact['privacy']
   pii?: boolean
   source?: { uri?: string }
+  /** Procedural payload (P2-3): structured steps for `type: 'procedural'`. */
+  procedure?: { steps?: unknown[]; preconditions?: string[]; success_rate?: number }
 }
 
 export type ForgettingMode = 'archive' | 'delete'
@@ -143,10 +153,120 @@ export class MemoryService {
     })
   }
 
+  /**
+   * Build the aggregated entity card for one canonical entity (design §3.13).
+   * Runs within the retrieval budget; on timeout it degrades to an empty card
+   * rather than blocking the caller.
+   */
+  async getCard(entityId: string, options: CardOptions = {}): Promise<EntityCard> {
+    const policy = this.policy()
+    const run = buildEntityCard(this.repo, entityId, options)
+    return withTimeout(run, policy.retrieval.timeoutMs, async () => ({
+      entityId,
+      entityName: entityId,
+      entityType: 'entity',
+      updatedAt: 0,
+      count: 0,
+      summary: [],
+      groups: [],
+    }))
+  }
+
+  /**
+   * Resolve the primary "user" entity id of a scope (most-frequency heuristic)
+   * and render its card to the user.md Markdown view (design §8.5). Returns an
+   * empty-document string when the scope has no user-typed facts.
+   */
+  async renderUserMd(scope: string): Promise<string> {
+    const entityId = await this.primaryUserEntityId(scope)
+    if (entityId === undefined) return renderUserMd({ entityId: 'user', entityName: '用户', entityType: 'user', updatedAt: 0, count: 0, summary: [], groups: [] })
+    const card = await this.getCard(entityId)
+    return renderUserMd(card)
+  }
+
+  /**
+   * Apply an edited user.md document back to the underlying atomic facts
+   * (design §8.4): parse → diff → add / supersede / archive. All writes are
+   * `source=user_edit` (credibility 1.0) so they always win conflicts.
+   * Returns a summary of what was written.
+   */
+  async applyUserMdEdits(scope: string, markdown: string): Promise<{ added: number; superseded: number; archived: number }> {
+    const parsed = parseUserMd(markdown)
+    // Baseline: the intersection of comment entries with current active facts.
+    const facts = (await this.repo.listScope(scope)).filter(f => f.status === 'active')
+    const actions = diffUserMdEdits(parsed.lines, { facts })
+
+    const now = this.now()
+    const policy = this.policy()
+    let added = 0
+    let superseded = 0
+    let archived = 0
+
+    for (const action of actions) {
+      if (action.kind === 'archive') {
+        await this.forget(action.factId, 'archive')
+        archived += 1
+        continue
+      }
+      // add / supersede both create a user_edit fact.
+      const victim = action.kind === 'supersede' ? await this.repo.get(action.factId) : undefined
+      const assertion = this.userEditAssertion(scope, action.line, now)
+      if (victim !== undefined && victim.status === 'active') {
+        const next = buildFact(assertion, { resolver: this.resolver, forgetting: policy.forgetting, defaultPrivacy: policy.privacy.default, now })
+        await this.repo.put({ ...victim, status: 'superseded', updated_at: now })
+        await this.repo.put({ ...next, version: victim.version + 1, supersedes: victim.id, created_at: victim.created_at })
+        this.emit([{ kind: 'fact_superseded', factId: victim.id, byFactId: next.id, scope }])
+        superseded += 1
+      } else {
+        await rememberOne(this.deps(), assertion)
+        added += 1
+      }
+    }
+
+    this.recordScope(scope)
+    return { added, superseded, archived }
+  }
+
+  private userEditAssertion(scope: string, line: UserMdLine, now: number): RawAssertion {
+    return {
+      subject: { type: 'user', name: '用户' },
+      predicate: line.predicate,
+      object: { type: 'concept', name: line.content.slice(0, 60) },
+      content: line.content,
+      type: 'semantic',
+      confidence: 0.95,
+      privacy: this.policy().privacy.default,
+      pii: false,
+      scope,
+      source: { type: 'user_edit', uri: 'user.md', credibility: 1 },
+    }
+  }
+
+  private async primaryUserEntityId(scope: string): Promise<string | undefined> {
+    const facts = await this.repo.listScope(scope)
+    let best: string | undefined
+    let bestCount = 0
+    const counts = new Map<string, number>()
+    for (const fact of facts) {
+      if (fact.status !== 'active' || fact.pii) continue
+      if (fact.subject.type !== 'user') continue
+      const n = (counts.get(fact.subject.id) ?? 0) + 1
+      counts.set(fact.subject.id, n)
+      if (n > bestCount) {
+        bestCount = n
+        best = fact.subject.id
+      }
+    }
+    return best
+  }
+
   /** Explicitly remember a fact from raw content (tool path). */
   async remember(input: RememberInput): Promise<StoreOutcome> {
     const policy = this.policy()
     const source = { type: 'tool_result' as const, uri: input.source?.uri, credibility: 0.9 }
+    const procedure = input.procedure !== undefined
+      ? normalizeProcedure(input.procedure as Parameters<typeof normalizeProcedure>[0])
+      : undefined
     const assertion: RawAssertion = {
       subject: {
         type: input.subject?.type ?? 'user',
@@ -166,6 +286,10 @@ export class MemoryService {
       pii: input.pii ?? false,
       scope: input.scope,
       source,
+      steps: procedure?.steps,
+      preconditions: procedure?.preconditions,
+      tool_chain: procedure?.tool_chain,
+      success_rate: procedure?.success_rate,
     }
     const outcome = await rememberOne(this.deps(), assertion)
     this.emit(outcome.events)

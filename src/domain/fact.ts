@@ -95,6 +95,14 @@ export interface AtomicFact {
   /** Isolation boundary, e.g. a conversation/session id. */
   readonly scope: string
   readonly source: FactSource
+  /** Procedural memories (P2): ordered execution steps (§3.12). */
+  readonly steps?: readonly ProceduralStep[]
+  /** Preconditions that must hold before the procedure runs. */
+  readonly preconditions?: readonly string[]
+  /** Projection of `steps[*].tool` for cheap retrieval, when steps are set. */
+  readonly tool_chain?: readonly string[]
+  /** Historical success rate 0..1, when known. */
+  readonly success_rate?: number
   readonly confidence: number
   readonly version: number
   readonly supersedes?: string

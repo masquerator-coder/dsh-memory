@@ -30,6 +30,19 @@ interface FactSource {
   /** Source credibility 0..1; `user_edit` is always 1.0. */
   readonly credibility: number;
 }
+/** Procedural fact steps (P1 program memory shape; P0 stores steps as content). */
+interface ProceduralStep {
+  readonly id: string;
+  readonly tool: string;
+  readonly depends_on?: readonly string[];
+  readonly parallel_group?: string | null;
+  readonly on_failure?: 'abort' | 'rollback' | 'continue';
+  readonly retry?: {
+    readonly max?: number;
+    readonly backoff?: 'fixed' | 'exponential';
+  };
+  readonly rollback?: string | null;
+}
 /** Qualifiers that constrain a fact to avoid over-generalization. */
 interface FactQualifiers {
   /** RFC3339 or date string the assertion became valid. */
@@ -62,6 +75,14 @@ interface AtomicFact {
   /** Isolation boundary, e.g. a conversation/session id. */
   readonly scope: string;
   readonly source: FactSource;
+  /** Procedural memories (P2): ordered execution steps (§3.12). */
+  readonly steps?: readonly ProceduralStep[];
+  /** Preconditions that must hold before the procedure runs. */
+  readonly preconditions?: readonly string[];
+  /** Projection of `steps[*].tool` for cheap retrieval, when steps are set. */
+  readonly tool_chain?: readonly string[];
+  /** Historical success rate 0..1, when known. */
+  readonly success_rate?: number;
   readonly confidence: number;
   readonly version: number;
   readonly supersedes?: string;
@@ -107,6 +128,8 @@ type MemoryEvent = {
 interface Config {
   /** Where facts persist (JSON document). Empty string → in-memory only. */
   dataFile?: string;
+  /** Path to the rendered `user.md` view (design §8). Empty → not persisted. */
+  userMdFile?: string;
   profile?: string;
   /** Whether to inject recalled facts as system context each step. */
   injectContext?: boolean;
@@ -389,12 +412,69 @@ interface RawAssertion {
   content: string;
   type: FactType;
   confidence: number;
+  /** Procedural payload (P2-3): structured steps / preconditions / tool_chain. */
+  steps?: readonly ProceduralStep[];
+  preconditions?: readonly string[];
+  tool_chain?: readonly string[];
+  success_rate?: number;
   qualifiers?: FactQualifiers;
   privacy?: PrivacyLevel;
   pii?: boolean;
   tags?: readonly string[];
   scope: string;
   source: FactSource;
+}
+//#endregion
+//#region src/domain/card.d.ts
+/** A single grouped fact within a card, aligned to the user.md line model. */
+interface CardFact {
+  readonly id: string;
+  /** Canonical predicate (the group key). */
+  readonly predicate: string;
+  /** Human-readable predicate label (from the registry synonym entry). */
+  readonly label: string;
+  /** The fact's natural-language content, as rendered in the view. */
+  readonly content: string;
+  readonly confidence: number;
+  readonly privacy: AtomicFact['privacy'];
+  readonly pii: boolean;
+  readonly type: AtomicFact['type'];
+  readonly updated_at: number;
+  /** Procedural payload (P2-3), present only for procedural facts. */
+  readonly steps?: readonly ProceduralStep[];
+  readonly tool_chain?: readonly string[];
+}
+/** One predicate group of an entity card. */
+interface CardGroup {
+  readonly predicate: string;
+  readonly title: string;
+  /** Facts in this group, ordered by confidence then recency (desc). */
+  readonly facts: CardFact[];
+}
+/** Options accepted by the card aggregation engine. */
+interface CardOptions {
+  /** Only facts at or above this privacy tier (subset-preserving). */
+  readonly privacy?: readonly AtomicFact['privacy'][];
+  /** Cap on the number of summary lines. */
+  readonly summaryMax?: number;
+  /** Cap on the summary's estimated token footprint (design §8.5: ≤200). */
+  readonly summaryTokens?: number;
+  /** Exclude facts flagged as PII from the rendered card (default true). */
+  readonly redactPii?: boolean;
+}
+/**
+ * A fully-aggregated entity card. `summary` is the deterministic headline set
+ * (fits `summaryTokens`), `groups` is the full per-predicate breakdown.
+ */
+interface EntityCard {
+  readonly entityId: string;
+  readonly entityName: string;
+  readonly entityType: string;
+  /** Epoch ms of the newest fact contributing to the card. */
+  readonly updatedAt: number;
+  readonly count: number;
+  readonly summary: string[];
+  readonly groups: CardGroup[];
 }
 //#endregion
 //#region src/application/remember.d.ts
@@ -482,6 +562,12 @@ interface RememberInput {
   source?: {
     uri?: string;
   };
+  /** Procedural payload (P2-3): structured steps for `type: 'procedural'`. */
+  procedure?: {
+    steps?: unknown[];
+    preconditions?: string[];
+    success_rate?: number;
+  };
 }
 type ForgettingMode = 'archive' | 'delete';
 interface ForgetAllReport {
@@ -545,6 +631,31 @@ declare class MemoryService {
    * scope facts when the store is slow, never throwing.
    */
   recall(query: RecallQuery): Promise<ScoredMemory[]>;
+  /**
+   * Build the aggregated entity card for one canonical entity (design §3.13).
+   * Runs within the retrieval budget; on timeout it degrades to an empty card
+   * rather than blocking the caller.
+   */
+  getCard(entityId: string, options?: CardOptions): Promise<EntityCard>;
+  /**
+   * Resolve the primary "user" entity id of a scope (most-frequency heuristic)
+   * and render its card to the user.md Markdown view (design §8.5). Returns an
+   * empty-document string when the scope has no user-typed facts.
+   */
+  renderUserMd(scope: string): Promise<string>;
+  /**
+   * Apply an edited user.md document back to the underlying atomic facts
+   * (design §8.4): parse → diff → add / supersede / archive. All writes are
+   * `source=user_edit` (credibility 1.0) so they always win conflicts.
+   * Returns a summary of what was written.
+   */
+  applyUserMdEdits(scope: string, markdown: string): Promise<{
+    added: number;
+    superseded: number;
+    archived: number;
+  }>;
+  private userEditAssertion;
+  private primaryUserEntityId;
   /** Explicitly remember a fact from raw content (tool path). */
   remember(input: RememberInput): Promise<StoreOutcome>;
   /** Forget one fact: archive (soft) or delete (hard tombstone). */

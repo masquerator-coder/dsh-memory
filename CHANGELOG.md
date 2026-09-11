@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (P2)
+
+- **Entity-card aggregation & summary** (`src/domain/card.ts`,
+  `src/application/card.ts`): the read path now aggregates an entity's active,
+  retrieval-visible facts into a structured `EntityCard` — grouped by canonical
+  predicate, ordered by confidence then recency, with a deterministic summary
+  capped to a token budget. `MemoryService.getCard()` exposes it with timeout
+  degradation, and `read_user_profile` now returns this aggregated card
+  (summary + per-topic groups) instead of a raw fact list.
+- **`user.md` two-way sync** (design §8; `src/domain/usermd.ts`,
+  `src/application/usermd-render.ts` / `usermd-parse.ts` / `usermd-sync.ts`,
+  `src/infrastructure/usermd-file.ts`): renders the user profile card to a
+  human-readable `user.md` (the `# User Profile` / `## 核心摘要` / `## 详细偏好`
+  structure with `### <predicate>` groups), and writes user edits back to
+  atomic facts — changed lines supersede, new lines are added, removed lines
+  are archived, all with `source=user_edit` (credibility 1.0) so user edits
+  always win conflicts. A `userMdFile` config option persists the view and
+  watches for external edits (e.g. editing in Obsidian). `MemoryService`
+  exposes `renderUserMd()` / `applyUserMdEdits()`.
+- **Procedural memory serialization** (design §3.12; `src/domain/procedural.ts`):
+  `AtomicFact` now carries structured `steps` / `preconditions` / `tool_chain` /
+  `success_rate`, `memory_remember` accepts a `procedure` argument, and
+  `normalizeProcedure()` / `stepsFromContent()` validate and migrate P0-era
+  "steps-as-content" into typed steps (tool / depends_on / on_failure /
+  rollback). Procedural payload is not part of the semantic identity.
+
 ### Changed (P1 hardening)
 
 - **Per-memory-type recency decay in fusion ranking** (`src/application/recall.ts`):

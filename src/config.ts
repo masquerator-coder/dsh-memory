@@ -11,6 +11,8 @@ import type { PrivacyLevel, FactType } from './domain/fact.ts'
 export interface Config {
   /** Where facts persist (JSON document). Empty string → in-memory only. */
   dataFile?: string
+  /** Path to the rendered `user.md` view (design §8). Empty → not persisted. */
+  userMdFile?: string
   profile?: string
   /** Whether to inject recalled facts as system context each step. */
   injectContext?: boolean
@@ -59,6 +61,7 @@ const relationWhitelist = ['works_with', 'prefers_diet', 'uses_tool', 'uses_tech
 
 export const Config: z<Config> = z.object({
   dataFile: z.string().default(''),
+  userMdFile: z.string().default(''),
   profile: z.string().default('personal'),
   injectContext: z.boolean().default(true),
   captureEnabled: z.boolean().default(true),

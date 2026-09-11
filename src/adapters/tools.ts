@@ -64,6 +64,12 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
     parameters: {
       content: { type: 'string', required: true, description: '要记住的原始内容' },
       scope: { type: 'string', description: '可选：记忆范围（默认当前会话）' },
+      type: { type: 'string', enum: ['semantic', 'episodic', 'procedural', 'working'], description: '可选：记忆类型' },
+      procedure: {
+        type: 'object',
+        additionalProperties: true,
+        description: '可选：程序记忆的结构化步骤（tool/depends_on/rollback）；仅 type=procedural 时使用',
+      },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
@@ -83,6 +89,8 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
         scope,
         pii: pii.detected,
         privacy: pii.detected ? 'confidential' : undefined,
+        type: args.type,
+        procedure: args.procedure,
       })
       return { id: outcome.stored.id, superseded: outcome.superseded ?? null, retained: outcome.retained ?? null }
     },
@@ -150,24 +158,58 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_user_profile',
-    description: '读取当前用户的画像摘要（聚合的原子事实视图）。',
-    parameters: {},
+    description: '读取当前用户的画像卡片（聚合的原子事实视图：核心摘要 + 按主题分组的详细偏好）。',
+    parameters: {
+      topic: { type: 'string', description: '可选：只看某一主题（谓词分组）' },
+    },
     output: {
       schema: { type: 'object', additionalProperties: true },
       render(_args, value) {
-        const v = value as { summary?: string }
-        return [{ type: 'text', text: v.summary ?? '（暂无画像）' }]
+        const v = value as { summary?: string[]; groups?: { title: string; lines: string[] }[] }
+        const head = (v.summary ?? []).map(l => `- ${l}`).join('\n')
+        const body = (v.groups ?? [])
+          .map(g => `${g.title}\n${g.lines.map(l => `- ${l}`).join('\n')}`)
+          .join('\n\n')
+        return [{ type: 'text', text: head || '（暂无画像）' + (body ? `\n\n${body}` : '') }]
       },
     },
-    async execute(_args, exec) {
+    async execute(args, exec) {
       const svc = memory(tc)
       const scope = scopeOf(exec, fallbackScope)
-      const facts = await svc.repo.listScope(scope)
-      const active = facts.filter(f => f.status === 'active')
-      const summary = active.slice(0, 30).map(f => `- ${f.content}`).join('\n')
-      return { count: active.length, summary }
+      const entityId = await primaryUserEntity(svc, scope)
+      const card = entityId === undefined
+        ? { entityId: 'user', entityName: '用户', entityType: 'user', updatedAt: 0, count: 0, summary: [], groups: [] }
+        : await svc.getCard(entityId)
+      const topic = args.topic
+      const groups = (topic === undefined ? card.groups : card.groups.filter(g => g.title === topic))
+        .map(g => ({ title: g.title, lines: g.facts.map(f => f.content) }))
+      return { entityId: card.entityId, count: card.count, summary: card.summary, groups }
     },
   })))
 
   return disposers
+}
+
+/**
+ * Deterministically pick the "current user" entity for a scope: the most
+ * frequently asserted `user`-typed subject. Falls back to `undefined` when the
+ * scope has no user-typed facts (an empty profile).
+ */
+async function primaryUserEntity(svc: MemoryService, scope: string): Promise<string | undefined> {
+  const facts = await svc.repo.listScope(scope)
+  let best: string | undefined
+  let bestCount = 0
+  const counts = new Map<string, number>()
+  for (const fact of facts) {
+    if (fact.status !== 'active') continue
+    if (fact.pii) continue
+    if (fact.subject.type !== 'user') continue
+    const n = (counts.get(fact.subject.id) ?? 0) + 1
+    counts.set(fact.subject.id, n)
+    if (n > bestCount) {
+      bestCount = n
+      best = fact.subject.id
+    }
+  }
+  return best
 }

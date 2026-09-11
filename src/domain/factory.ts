@@ -17,6 +17,7 @@ import type {
   FactSource,
   FactType,
   PrivacyLevel,
+  ProceduralStep,
 } from './fact.ts'
 import type { ForgettingPolicy } from './policies.ts'
 import { parseTtlMs } from './policies.ts'
@@ -29,6 +30,11 @@ export interface RawAssertion {
   content: string
   type: FactType
   confidence: number
+  /** Procedural payload (P2-3): structured steps / preconditions / tool_chain. */
+  steps?: readonly ProceduralStep[]
+  preconditions?: readonly string[]
+  tool_chain?: readonly string[]
+  success_rate?: number
   qualifiers?: FactQualifiers
   privacy?: PrivacyLevel
   pii?: boolean
@@ -88,6 +94,10 @@ export function buildFact(input: RawAssertion, options: BuildOptions): AtomicFac
     type: input.type,
     scope: input.scope,
     source: input.source,
+    steps: input.steps,
+    preconditions: input.preconditions,
+    tool_chain: input.tool_chain ?? input.steps?.map(s => s.tool),
+    success_rate: input.success_rate,
     confidence: input.confidence,
     version: 1,
     status: 'active',
