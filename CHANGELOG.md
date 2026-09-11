@@ -6,6 +6,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (P3 — 向量/图存储真实化 + 研究 Agent Profile + 观测)
+
+- **Vector/graph storage realized on the read path** (`src/infrastructure/index-backends.ts`,
+  `src/application/recall.ts`, `src/service.ts`): `DerivedIndexBackend` now carries a
+  read contract (`search` / `graphNeighbors` / `graphFactIds` + `capabilities`), and
+  `recall` accepts an optional `IndexRead`. When a searchable vector backend is
+  present it drives the semantic-recall stage (a genuine sparse TF-IDF cosine
+  vector-space index over char n-gram features, not presence-only BM25); when a
+  graph backend is present it drives graph expansion with whitelist-aware entity
+  hops. No read source → the KV lexical/adjacency fallback is used unchanged.
+  `composeIndexRead()` binds a composite read to the registered backends and the
+  service passes it through automatically when indexing is enabled. Real ANN /
+  Neo4j / object stores implement the same port.
+- **Research Agent Profile** (`src/build-policy.ts`, `src/domain/policies.ts`,
+  `src/config.ts`): personal / research share the same engines; differences are
+  converged into a typed `profileKind` resolved from `config.profile`. Research
+  (`profile: research`) enables all-version retrieval (`versions: 'all'`, recall
+  reads `active` + `superseded` and keeps every version instead of collapsing a
+  semantic key), a larger pruned graph fan-out, weaker recency decay + longer TTL
+  (keeps history), and a privacy filter that may surface `confidential` evidence.
+  Personal keeps byte-for-byte P0 defaults.
+- **Observability: metrics + tracing** (`src/application/observability.ts`,
+  `src/service.ts`): an in-process `Metrics` registry (typed counters + latency
+  histograms) and a bounded `TraceBuffer` of execution spans (§11, §12.4). Now
+  tracked: writes (`remember`/`forget`/`forget_all`/`link`), recall (count +
+  latency + degradation timeout), extraction attempts/success/fail, forgetting
+  (`expired`/`merged`), and index worker ticks/applied/dead. `MemoryService.metrics()`
+  returns the full counter snapshot and `traces()` exposes recent end-to-end spans.
+  Recall-timeout degradation is fault-injected and asserted in tests (§12.8).
+
+### Tests
+
+- `tests/index-read.test.ts` (composeIndexRead, vector cosine ranking, graph
+  whitelist neighbors, recall routed to derived backends + KV fallback),
+  `tests/profile.test.ts` (research vs personal policy differences, all-version
+  retrieval vs active-only), `tests/observability.test.ts` (metric counters /
+  recall latency / trace spans / timeout degradation fault injection).
+- Suite is now **117 unit tests** (was 104 after the Outbox/Saga round).
+
 ### Added (P3 — Outbox / Saga 多后端最终一致性)
 
 - **Outbox log** (`src/domain/outbox.ts`, `src/infrastructure/outbox-journal.ts`):

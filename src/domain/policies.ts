@@ -7,12 +7,18 @@
  */
 import type { FactType, PrivacyLevel } from './fact.ts'
 
+/** Which fact versions a recall may read (profile difference §10.2). */
+export type VersionRetention = 'active' | 'all'
+
 /** Retrieval budget — the hard cost floors a recall may work within. */
 export interface RetrievalPolicy {
   readonly topK: number
   readonly maxTokens: number
   /** Hard ceiling on synchronous recall, ms (degrade after this). */
   readonly timeoutMs: number
+  /** Which versions to consider: personal reads only `active`; research may
+   *  read all versions (including `superseded`) for evolution/contradiction. */
+  readonly versions: VersionRetention
   readonly graph: {
     readonly maxDepth: number
     readonly maxSeedEntities: number
@@ -93,6 +99,8 @@ export interface IndexingPolicy {
 /** The flat resolved policy object for one deployment. */
 export interface MemoryPolicy {
   readonly profile: string
+  /** Typed profile kind (personal / research) — the differences converge here. */
+  readonly profileKind: 'personal' | 'research'
   readonly retrieval: RetrievalPolicy
   readonly extraction: ExtractionPolicy
   readonly forgetting: ForgettingPolicy
@@ -100,6 +108,9 @@ export interface MemoryPolicy {
   readonly consolidation: ConsolidationPolicy
   readonly indexing: IndexingPolicy
 }
+
+/** Profile kinds supported by the policy builder. */
+export type AgentProfileKind = MemoryPolicy['profileKind']
 
 /** Expiry computation — a fact is expired once its expires_at has passed. */
 export function isExpired(fact: { readonly expires_at?: number | null }, now: number): boolean {

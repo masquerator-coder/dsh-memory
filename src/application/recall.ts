@@ -12,9 +12,8 @@
  */
 import type { AtomicFact, FactType } from '../domain/fact.ts'
 import type { MemoryPolicy } from '../domain/policies.ts'
-import { recencyScore } from '../domain/policies.ts'
-import type { MemoryRepository } from './ports.ts'
-import type { FactFilter } from './ports.ts'
+import { isExpired, recencyScore } from '../domain/policies.ts'
+import type { MemoryRepository, IndexRead, FactFilter, RecallCandidate } from './ports.ts'
 
 /**
  * Fallback decay lambda when no memory type is supplied (kept conservative,
@@ -36,6 +35,40 @@ export interface RecallQuery {
    * service with the resolved policy value.
    */
   readonly requireReadyIndex?: boolean
+  /**
+   * Optional derived-index read source (P3 vector/graph realization). When a
+   * searchable vector backend is available it drives the semantic recall stage;
+   * when a graph backend is available it drives graph expansion. Absent (or with
+   * no capability), recall falls back to the KV repo's lexical BM25 / adjacency.
+   */
+  readonly read?: IndexRead
+}
+
+/** Local filter guard mirroring the store's applyFilter for resolved facts. */
+function factPasses(fact: AtomicFact, filter: FactFilter): boolean {
+  if (filter.scope !== undefined && fact.scope !== filter.scope) return false
+  if (filter.status !== undefined && !filter.status.includes(fact.status)) return false
+  if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
+  if (filter.pii === true && fact.pii !== true) return false
+  if (filter.types !== undefined && !filter.types.includes(fact.type)) return false
+  if (filter.indexState !== undefined && !filter.indexState.includes(fact.index_state)) return false
+  if (filter.now !== undefined && isExpired(fact, filter.now)) return false
+  return true
+}
+
+/** Resolve ids from the derived index into filtered, repo-backed candidates. */
+async function resolveHits(
+  repo: MemoryRepository,
+  hits: readonly { factId: string; relevance: number }[],
+  filter: FactFilter,
+): Promise<RecallCandidate[]> {
+  const out: RecallCandidate[] = []
+  for (const hit of hits) {
+    const fact = await repo.get(hit.factId)
+    if (fact === undefined || !factPasses(fact, filter)) continue
+    out.push({ fact, relevance: hit.relevance, viaGraph: false })
+  }
+  return out
 }
 
 export interface ScoredMemory {
@@ -71,9 +104,11 @@ export async function recall(
   const now = q.now ?? Date.now()
   const topK = q.topK ?? policy.retrieval.topK
   const maxTokens = q.maxTokens ?? policy.retrieval.maxTokens
+  // Profile difference §10.2: research reads all versions (incl. superseded).
+  const statuses = policy.retrieval.versions === 'all' ? ['active', 'superseded'] : ['active']
   const filter: FactFilter = {
     scope: q.scope,
-    status: ['active'],
+    status: statuses,
     privacy: policy.privacy.retrievalFilter,
     now,
     // Outbox barrier: read only facts the derived backends have confirmed.
@@ -81,7 +116,15 @@ export async function recall(
   }
 
   const terms = queryTerms(q.query)
-  const candidates = await repo.query(filter, terms, [])
+  const read = q.read
+  // Stage 1 — semantic recall: backend vector search (default `none` scopes).
+  let candidates: RecallCandidate[]
+  if (read !== undefined && read.capabilities.search) {
+    const hits = await read.search(q.query, terms, Math.max(topK, policy.retrieval.graph.maxSeedEntities * 3))
+    candidates = await resolveHits(repo, hits, filter)
+  } else {
+    candidates = await repo.query(filter, terms, [])
+  }
 
   // Seed entities for graph expansion: subject/object of the top candidates.
   const ranked = fusionSort(policy, candidates, now)
@@ -93,9 +136,8 @@ export async function recall(
     if (fact.object?.id !== undefined) seedEntities.add(fact.object.id)
   }
 
-  // Read the relation whitelist once.
+  const graphRead = read !== undefined && read.capabilities.graph
   const whitelist = policy.retrieval.graph.relationWhitelist
-  const expanded = new Set<string>()
   const visited = new Set<string>(seedEntities)
   let frontier = [...seedEntities].slice(0, policy.retrieval.graph.maxSeedEntities)
   for (let depth = 0; depth < policy.retrieval.graph.maxDepth && frontier.length > 0; depth += 1) {
@@ -103,7 +145,9 @@ export async function recall(
     let fan = 0
     for (const entity of frontier) {
       if (fan >= policy.retrieval.graph.maxCandidates) break
-      const neighbors = await repo.neighbors(entity, whitelist)
+      const neighbors = graphRead
+        ? await read!.graphNeighbors(entity, whitelist)
+        : await repo.neighbors(entity, whitelist)
       for (const n of neighbors) {
         if (visited.has(n)) continue
         visited.add(n)
@@ -117,16 +161,29 @@ export async function recall(
   // Collect facts touching the expanded entity set as graph extensions.
   const graphCandidates: typeof candidates = []
   for (const entity of visited) {
-    const facts = await repo.byEntity(entity, filter)
-    for (const fact of facts) {
-      const already = candidates.some(c => c.fact.id === fact.id)
-      if (!already) graphCandidates.push({ fact, relevance: 0, viaGraph: true })
+    if (graphRead) {
+      const ids = await read!.graphFactIds(entity, policy.retrieval.graph.maxFanoutPerEntity)
+      const resolved = await resolveHits(repo, ids.map(fid => ({ factId: fid, relevance: 0 })), filter)
+      for (const c of resolved) {
+        if (candidates.some(x => x.fact.id === c.fact.id)) continue
+        graphCandidates.push({ fact: c.fact, relevance: 0, viaGraph: true })
+      }
+    } else {
+      const facts = await repo.byEntity(entity, filter)
+      for (const fact of facts) {
+        const already = candidates.some(c => c.fact.id === fact.id)
+        if (!already) graphCandidates.push({ fact, relevance: 0, viaGraph: true })
+      }
     }
     if (graphCandidates.length > policy.retrieval.graph.maxCandidates) break
   }
 
   const all = [...candidates, ...graphCandidates]
-  const deduped = dedupBySemanticKey(all)
+  // Profile difference: research keeps every version for evolution analysis
+  // (dedup by id only); personal collapses same semantic key to the best hit.
+  const deduped = policy.retrieval.versions === 'all'
+    ? dedupById(all)
+    : dedupBySemanticKey(all)
 
   // Sort by fused score (graph facts get their small w5 graph increment).
   const fused = fusionSort(policy, deduped.map(c => ({ fact: c.fact, relevance: c.relevance, viaGraph: c.viaGraph })), now)
@@ -199,7 +256,7 @@ function fusionSort(policy: MemoryPolicy, candidates: Candidate[], now: number):
     .sort((a, b) => b.score - a.score)
 }
 
-/** Merge facts sharing a semantic_key, keeping the highest relevance. */
+/** Merge candidates, keeping the highest relevance per semantic key. */
 function dedupBySemanticKey(candidates: Candidate[]): Candidate[] {
   const byKey = new Map<string, Candidate>()
   for (const c of candidates) {
@@ -207,4 +264,13 @@ function dedupBySemanticKey(candidates: Candidate[]): Candidate[] {
     if (prev === undefined || c.relevance > prev.relevance) byKey.set(c.fact.semantic_key, c)
   }
   return [...byKey.values()]
+}
+
+/** Version-aware dedup (research): keep every distinct version (dedup by id). */
+function dedupById(candidates: Candidate[]): Candidate[] {
+  const byId = new Map<string, Candidate>()
+  for (const c of candidates) {
+    if (!byId.has(c.fact.id)) byId.set(c.fact.id, c)
+  }
+  return [...byId.values()]
 }

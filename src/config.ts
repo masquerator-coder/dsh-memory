@@ -24,6 +24,7 @@ export interface Config {
     topK?: number
     maxTokens?: number
     timeoutMs?: number
+    versions?: 'active' | 'all'
     graph?: {
       maxDepth?: number
       maxSeedEntities?: number
@@ -79,6 +80,7 @@ export const Config: z<Config> = z.object({
     topK: z.number().default(20),
     maxTokens: z.number().default(800),
     timeoutMs: z.number().default(80),
+    versions: z.union(['active', 'all'] as const).default('active'),
     graph: z.object({
       maxDepth: z.number().default(2),
       maxSeedEntities: z.number().default(5),

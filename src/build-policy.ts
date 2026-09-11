@@ -7,6 +7,7 @@
  */
 import type { Config } from './config.ts'
 import type {
+  AgentProfileKind,
   ForgettingPolicy,
   IndexingPolicy,
   MemoryPolicy,
@@ -14,16 +15,27 @@ import type {
   RetrievalPolicy,
 } from './domain/policies.ts'
 
+/** Map a configured profile string onto a typed profile kind (§10.2). */
+export function resolveProfileKind(profile: string | undefined): AgentProfileKind {
+  return profile === 'research' || profile === 'research-agent' ? 'research' : 'personal'
+}
+
 export function buildPolicy(config: Config): MemoryPolicy {
+  const kind = resolveProfileKind(config.profile)
+  const research = kind === 'research'
+
   const retrieval: RetrievalPolicy = {
     topK: config.retrieval?.topK ?? 20,
     maxTokens: config.retrieval?.maxTokens ?? 800,
     timeoutMs: config.retrieval?.timeoutMs ?? 80,
+    // personal: only active; research: all versions (evolution/contradiction).
+    versions: config.retrieval?.versions ?? (research ? 'all' : 'active'),
     graph: {
-      maxDepth: config.retrieval?.graph?.maxDepth ?? 2,
+      // research allows a larger, pruned fan-out (§10.2 "可较大,带剪枝").
+      maxDepth: config.retrieval?.graph?.maxDepth ?? (research ? 3 : 2),
       maxSeedEntities: config.retrieval?.graph?.maxSeedEntities ?? 5,
-      maxFanoutPerEntity: config.retrieval?.graph?.maxFanoutPerEntity ?? 30,
-      maxCandidates: config.retrieval?.graph?.maxCandidates ?? 200,
+      maxFanoutPerEntity: config.retrieval?.graph?.maxFanoutPerEntity ?? (research ? 60 : 30),
+      maxCandidates: config.retrieval?.graph?.maxCandidates ?? (research ? 400 : 200),
       relationWhitelist: config.retrieval?.graph?.relationWhitelist ?? [],
     },
     ranking: {
@@ -35,28 +47,37 @@ export function buildPolicy(config: Config): MemoryPolicy {
     },
   }
 
-  const forgetting: ForgettingPolicy = {
-    semantic: {
-      ttl: config.forgetting?.semantic?.ttl ?? '365d',
-      lambda: config.forgetting?.semantic?.lambda ?? 0.001,
-    },
-    episodic: {
-      ttl: config.forgetting?.episodic?.ttl ?? '90d',
-      lambda: config.forgetting?.episodic?.lambda ?? 0.02,
-    },
-    procedural: {
-      ttl: config.forgetting?.procedural?.ttl ?? '365d',
-      lambda: config.forgetting?.procedural?.lambda ?? 0.005,
-    },
-    working: {
-      ttl: config.forgetting?.working?.ttl ?? null,
-      lambda: config.forgetting?.working?.lambda ?? 0,
-    },
-  }
+  // research keeps history: weaker decay + longer TTL (§10.2 "保留历史").
+  const forgetting: ForgettingPolicy = research
+    ? {
+        semantic: { ttl: config.forgetting?.semantic?.ttl ?? '730d', lambda: config.forgetting?.semantic?.lambda ?? 0.0001 },
+        episodic: { ttl: config.forgetting?.episodic?.ttl ?? '365d', lambda: config.forgetting?.episodic?.lambda ?? 0.005 },
+        procedural: { ttl: config.forgetting?.procedural?.ttl ?? '730d', lambda: config.forgetting?.procedural?.lambda ?? 0.001 },
+        working: { ttl: config.forgetting?.working?.ttl ?? null, lambda: config.forgetting?.working?.lambda ?? 0 },
+      }
+    : {
+        semantic: {
+          ttl: config.forgetting?.semantic?.ttl ?? '365d',
+          lambda: config.forgetting?.semantic?.lambda ?? 0.001,
+        },
+        episodic: {
+          ttl: config.forgetting?.episodic?.ttl ?? '90d',
+          lambda: config.forgetting?.episodic?.lambda ?? 0.02,
+        },
+        procedural: {
+          ttl: config.forgetting?.procedural?.ttl ?? '365d',
+          lambda: config.forgetting?.procedural?.lambda ?? 0.005,
+        },
+        working: {
+          ttl: config.forgetting?.working?.ttl ?? null,
+          lambda: config.forgetting?.working?.lambda ?? 0,
+        },
+      }
 
   const privacy: PrivacyPolicy = {
-    default: config.privacy?.default ?? 'private',
-    retrievalFilter: config.privacy?.retrievalFilter ?? ['public', 'private'],
+    default: config.privacy?.default ?? (research ? 'confidential' : 'private'),
+    // research may surface confidential evidence (§10.2 "可配置").
+    retrievalFilter: config.privacy?.retrievalFilter ?? (research ? ['public', 'private', 'confidential'] : ['public', 'private']),
     secretRequiresExplicitAuth: config.privacy?.secretRequiresExplicitAuth ?? true,
     piiRedaction: config.privacy?.piiRedaction ?? true,
   }
@@ -74,7 +95,8 @@ export function buildPolicy(config: Config): MemoryPolicy {
   }
 
   return {
-    profile: config.profile ?? 'personal',
+    profile: config.profile ?? (research ? 'research' : 'personal'),
+    profileKind: kind,
     retrieval,
     extraction: {
       provider: config.extraction?.provider ?? '',

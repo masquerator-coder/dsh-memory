@@ -143,6 +143,7 @@ interface Config {
     topK?: number;
     maxTokens?: number;
     timeoutMs?: number;
+    versions?: 'active' | 'all';
     graph?: {
       maxDepth?: number;
       maxSeedEntities?: number;
@@ -269,12 +270,17 @@ declare class EntityResolver {
 }
 //#endregion
 //#region src/domain/policies.d.ts
+/** Which fact versions a recall may read (profile difference §10.2). */
+type VersionRetention = 'active' | 'all';
 /** Retrieval budget — the hard cost floors a recall may work within. */
 interface RetrievalPolicy {
   readonly topK: number;
   readonly maxTokens: number;
   /** Hard ceiling on synchronous recall, ms (degrade after this). */
   readonly timeoutMs: number;
+  /** Which versions to consider: personal reads only `active`; research may
+   *  read all versions (including `superseded`) for evolution/contradiction. */
+  readonly versions: VersionRetention;
   readonly graph: {
     readonly maxDepth: number;
     readonly maxSeedEntities: number;
@@ -366,6 +372,8 @@ interface IndexingPolicy {
 /** The flat resolved policy object for one deployment. */
 interface MemoryPolicy {
   readonly profile: string;
+  /** Typed profile kind (personal / research) — the differences converge here. */
+  readonly profileKind: 'personal' | 'research';
   readonly retrieval: RetrievalPolicy;
   readonly extraction: ExtractionPolicy;
   readonly forgetting: ForgettingPolicy;
@@ -526,8 +534,16 @@ interface OutboxStats {
 interface DerivedIndexBackend {
   /** Stable identity, e.g. `vector` / `graph` / `object`. */
   readonly name: string;
+  /** Which read capabilities this backend offers (vector search / graph hops). */
+  readonly capabilities: IndexCapabilities;
   /** Index a fact (updates by factId; idempotent). */
   upsert(fact: AtomicFact): Promise<void>;
+  /** Read-side: semantic/vector recall over indexed facts. */
+  search(queryText: string, queryTerms: readonly string[], topK: number): Promise<SearchHit[]>;
+  /** Read-side: adjacent canonical entity ids (graph expansion, §7.4). */
+  graphNeighbors(entityId: string, relationWhitelist: readonly string[]): Promise<readonly string[]>;
+  /** Read-side: fact ids whose subject/object is a canonical entity. */
+  graphFactIds(entityId: string, topK: number): Promise<readonly string[]>;
   /** Remove a fact by id (idempotent; no-op when absent). */
   remove(factId: string): Promise<void>;
   /** Optional full rebuild hook (schema migration / model change). */
@@ -539,6 +555,32 @@ interface DerivedIndexBackend {
   };
   /** Current entry count (observability). */
   count(): Promise<number>;
+}
+/** Which read operations a derived backend can serve on the recall path. */
+interface IndexCapabilities {
+  /** Backend can answer `search` (a real vector store, not just KV fallback). */
+  readonly search: boolean;
+  /** Backend can answer `graphNeighbors` / `graphFactIds` (a real graph store). */
+  readonly graph: boolean;
+}
+/** One vector-recall hit from a derived backend. */
+interface SearchHit {
+  readonly factId: string;
+  /** Reuse in [0,1]. */
+  readonly relevance: number;
+}
+/**
+ * Read-only recall source bound to the derived backends. When a deployment has
+ * registered a searchable vector backend and/or graph backend, the service passes
+ * this to {@link recall} so the read path genuinely queries the plugin's vector
+ * recall and graph expansion stores instead of only the KV's lexical index
+ * (P3 "vector/graph storage realized").
+ */
+interface IndexRead {
+  readonly capabilities: IndexCapabilities;
+  search(queryText: string, queryTerms: readonly string[], topK: number): Promise<SearchHit[]>;
+  graphNeighbors(entityId: string, relationWhitelist: readonly string[]): Promise<readonly string[]>;
+  graphFactIds(entityId: string, topK: number): Promise<readonly string[]>;
 }
 //#endregion
 //#region src/domain/factory.d.ts
@@ -648,6 +690,13 @@ interface RecallQuery {
    * service with the resolved policy value.
    */
   readonly requireReadyIndex?: boolean;
+  /**
+   * Optional derived-index read source (P3 vector/graph realization). When a
+   * searchable vector backend is available it drives the semantic recall stage;
+   * when a graph backend is available it drives graph expansion. Absent (or with
+   * no capability), recall falls back to the KV repo's lexical BM25 / adjacency.
+   */
+  readonly read?: IndexRead;
 }
 interface ScoredMemory {
   readonly fact: AtomicFact;
@@ -739,6 +788,54 @@ declare class IndexWorker {
   private settleDone;
 }
 //#endregion
+//#region src/application/observability.d.ts
+/** In-process metrics registry: integer counters + latency histograms. */
+declare class Metrics {
+  private readonly counters;
+  private readonly latencies;
+  incr(name: string, n?: number): void;
+  /** Record a latency sample (ms) for a metric. */
+  record(name: string, ms: number): void;
+  counter(name: string): number;
+  /** Average latency for a metric, or undefined when no samples. */
+  avgMs(name: string): number | undefined;
+  /** Immutable snapshot for reporting / serialization. */
+  snapshot(): Record<string, number>;
+  reset(): void;
+}
+/** One traced span (a unit of execution along the memory pipeline). */
+interface TraceSpan {
+  readonly id: string;
+  readonly name: string;
+  readonly scope?: string;
+  readonly factId?: string;
+  readonly startAt: number;
+  readonly endAt?: number;
+  readonly ms?: number;
+  readonly ok?: boolean;
+  readonly detail?: string;
+}
+/** Handle returned by {@link TraceBuffer.start}; call {@link finish} to close. */
+interface SpanHandle {
+  readonly id: string;
+  finish(ok: boolean, detail?: string): void;
+}
+/** Bounded ring of recent execution spans (§12.4 end-to-end trail). */
+declare class TraceBuffer {
+  private readonly capacity;
+  private readonly now;
+  private readonly spans;
+  private seq;
+  constructor(capacity?: number, now?: () => number);
+  start(name: string, meta?: {
+    scope?: string;
+    factId?: string;
+  }): SpanHandle;
+  /** Most recent spans, newest first, up to `n`. */
+  recent(n?: number): readonly TraceSpan[];
+  get length(): number;
+}
+//#endregion
 //#region src/service.d.ts
 /** Optional LLM extraction callback supplied by the adapter (main LLM never extracts). */
 type ExtractFunction = (text: string) => Promise<RawAssertion[]>;
@@ -815,6 +912,9 @@ interface MemoryServiceOptions {
    *  outbox and the worker keeps the pluggable derived backends consistent. */
   readonly outbox?: OutboxStore;
   readonly worker?: IndexWorker;
+  /** Observability sinks (design §11). Default to new in-process instances. */
+  readonly metrics?: Metrics;
+  readonly trace?: TraceBuffer;
   readonly now?: () => number;
   readonly onEvents?: (events: MemoryEvent[]) => void;
 }
@@ -830,6 +930,8 @@ declare class MemoryService {
   private readonly onEvents?;
   private readonly outbox?;
   private readonly worker?;
+  private readonly metric;
+  private readonly trace;
   /** Scope ids that have seen writes — drives the background consolidate sweep. */
   private readonly scopes;
   constructor(options: MemoryServiceOptions);
@@ -840,6 +942,10 @@ declare class MemoryService {
    * the behavior is byte-for-byte that of P0 (all facts immediately `ready`).
    */
   get useOutbox(): boolean;
+  /** Read source bound to the registered derived backends (P3: recall really
+   *  queries vector/graph storage when present). Memoized per policy snapshot. */
+  private _indexRead;
+  get indexRead(): IndexRead | undefined;
   /** Record a scope that has had activity (for the sweep). */
   recordScope(scope: string): void;
   /** All scopes observed so far. */
@@ -909,14 +1015,17 @@ declare class MemoryService {
   private slowPath;
   /** Health check (design §12.4). */
   health(): Promise<Health>;
-  /** Observability metrics (design §11). */
+  /** Observability metrics (design §11): store + outbox + backends + counters. */
   metrics(): Promise<{
     stored: number;
     active: number;
     outboxPending: number;
     outboxDead: number;
     indexedBackends: Record<string, number>;
+    counters: Record<string, number>;
   }>;
+  /** Most recent trace spans (design §12.4 end-to-end trail), newest first. */
+  traces(n?: number): readonly TraceSpan[];
   /**
    * Run the index worker until the outbox drains (up to `tickLimit` per sweep).
    * Used by tests and by the background loop's manual trigger; safe to no-op when

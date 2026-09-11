@@ -13,7 +13,7 @@ import type { AtomicFact, MemoryEvent } from './domain/fact.ts'
 import type { EntityResolver } from './domain/entity.ts'
 import type { MemoryPolicy } from './domain/policies.ts'
 import { isExpired } from './domain/policies.ts'
-import type { MemoryRepository, OutboxStore } from './application/ports.ts'
+import type { MemoryRepository, OutboxStore, IndexRead } from './application/ports.ts'
 import type { RawAssertion } from './domain/factory.ts'
 import type { EntityCard, CardOptions } from './domain/card.ts'
 import { buildEntityCard } from './application/card.ts'
@@ -28,8 +28,10 @@ import { recall, type RecallQuery, type ScoredMemory } from './application/recal
 import { consolidateScope } from './application/consolidate.ts'
 import { scanPii } from './application/privacy.ts'
 import { ScopeQueue } from './infrastructure/queue.ts'
+import { composeIndexRead } from './infrastructure/index-backends.ts'
 import { withTimeout } from './util/timeout.ts'
 import type { IndexWorker } from './application/index-worker.ts'
+import { Metrics, TraceBuffer, MetricKeys, type TraceSpan } from './application/observability.ts'
 
 /** Optional LLM extraction callback supplied by the adapter (main LLM never extracts). */
 export type ExtractFunction = (text: string) => Promise<RawAssertion[]>
@@ -87,6 +89,9 @@ export interface MemoryServiceOptions {
    *  outbox and the worker keeps the pluggable derived backends consistent. */
   readonly outbox?: OutboxStore
   readonly worker?: IndexWorker
+  /** Observability sinks (design §11). Default to new in-process instances. */
+  readonly metrics?: Metrics
+  readonly trace?: TraceBuffer
   readonly now?: () => number
   readonly onEvents?: (events: MemoryEvent[]) => void
 }
@@ -103,6 +108,8 @@ export class MemoryService {
   private readonly onEvents?: (events: MemoryEvent[]) => void
   private readonly outbox?: OutboxStore
   private readonly worker?: IndexWorker
+  private readonly metric: Metrics
+  private readonly trace: TraceBuffer
   /** Scope ids that have seen writes — drives the background consolidate sweep. */
   private readonly scopes = new Set<string>()
 
@@ -118,6 +125,8 @@ export class MemoryService {
     this.onEvents = options.onEvents
     this.outbox = options.outbox
     this.worker = options.worker
+    this.metric = options.metrics ?? new Metrics()
+    this.trace = options.trace ?? new TraceBuffer(200, this.now)
   }
 
   policy(): MemoryPolicy {
@@ -132,6 +141,18 @@ export class MemoryService {
   get useOutbox(): boolean {
     const pol = this.policyRef()
     return pol.indexing.enabled && (this.worker?.backendCount ?? 0) > 0
+  }
+
+  /** Read source bound to the registered derived backends (P3: recall really
+   *  queries vector/graph storage when present). Memoized per policy snapshot. */
+  private _indexRead: IndexRead | undefined
+  get indexRead(): IndexRead | undefined {
+    const count = this.worker?.backendCount ?? 0
+    if (count === 0) return undefined
+    if (this._indexRead === undefined) {
+      this._indexRead = composeIndexRead(this.worker!.backendsSnapshot)
+    }
+    return this._indexRead
   }
 
   /** Record a scope that has had activity (for the sweep). */
@@ -156,6 +177,8 @@ export class MemoryService {
       this.emit(report.events)
       for (const f of report.inactivated) await this.publishUnindex(f.factId, f.scope)
     }
+    this.metric.incr(MetricKeys.expired, expired)
+    this.metric.incr(MetricKeys.merged, merged)
     return { expired, merged }
   }
 
@@ -171,16 +194,38 @@ export class MemoryService {
    */
   async recall(query: RecallQuery): Promise<ScoredMemory[]> {
     const policy = this.policy()
-    const run = recall(policy, this.repo, { ...query, requireReadyIndex: this.useOutbox && policy.indexing.requireReadyIndex })
-    return withTimeout(run, policy.retrieval.timeoutMs, async () => {
-      // Degradation: return any active scope facts (cheap list) rather than
-      // nothing, without re-running the full pipeline.
-      const fallback = await this.repo.listScope(query.scope)
-      return fallback
-        .filter(f => f.status === 'active' && !isExpired(f, this.now()))
-        .map(f => ({ fact: f, score: 0, relevance: 0 }))
-        .slice(0, query.topK ?? policy.retrieval.topK)
-    })
+    const start = performance.now()
+    const span = this.trace.start('recall', { scope: query.scope })
+    try {
+      const run = recall(policy, this.repo, {
+        ...query,
+        requireReadyIndex: this.useOutbox && policy.indexing.requireReadyIndex,
+        read: this.indexRead,
+      })
+      const result = await withTimeout(run, policy.retrieval.timeoutMs, async () => {
+        // Degradation: return any active scope facts (cheap list) rather than
+        // nothing, without re-running the full pipeline. Version-aware for research.
+        const statuses = policy.retrieval.versions === 'all' ? ['active', 'superseded'] : ['active']
+        const fallback = await this.repo.listScope(query.scope)
+        return fallback
+          .filter(f => statuses.includes(f.status) && !isExpired(f, this.now()))
+          .map(f => ({ fact: f, score: 0, relevance: 0 }))
+          .slice(0, query.topK ?? policy.retrieval.topK)
+      })
+      const elapsed = performance.now() - start
+      this.metric.incr(MetricKeys.recall)
+      this.metric.record('memory.recall', elapsed)
+      if (policy.retrieval.timeoutMs > 0 && elapsed >= policy.retrieval.timeoutMs) {
+        this.metric.incr(MetricKeys.recallTimeout)
+      }
+      span.finish(true)
+      return result
+    } catch (error) {
+      this.metric.incr(MetricKeys.recall)
+      this.metric.incr(MetricKeys.recallTimeout)
+      span.finish(false, String(error instanceof Error ? error.message : error))
+      throw error
+    }
   }
 
   /**
@@ -328,6 +373,8 @@ export class MemoryService {
     this.emit(outcome.events)
     this.recordScope(input.scope)
     await this.publishOutcome(outcome)
+    this.metric.incr(MetricKeys.remember)
+    this.trace.start('remember', { scope: input.scope, factId: outcome.stored.id }).finish(true)
     return outcome
   }
 
@@ -335,15 +382,18 @@ export class MemoryService {
   async forget(factId: string, mode: ForgettingMode): Promise<void> {
     const fact = await this.repo.get(factId)
     if (fact === undefined) throw new Error(`memory: no fact "${factId}"`)
+    this.trace.start('forget', { factId, scope: fact.scope }).finish(true)
     if (mode === 'delete') {
       await this.repo.delete(factId)
       this.emit([{ kind: 'fact_archived', factId, scope: fact.scope }])
       await this.publishUnindex(factId, fact.scope)
+      this.metric.incr(MetricKeys.forget)
       return
     }
     await this.repo.put({ ...fact, status: 'archived', updated_at: this.now() })
     this.emit([{ kind: 'fact_archived', factId, scope: fact.scope }])
     await this.publishUnindex(factId, fact.scope)
+    this.metric.incr(MetricKeys.forget)
   }
 
   /** Cascade-delete every fact in a scope (design §12.7 forgetting rights). */
@@ -355,6 +405,7 @@ export class MemoryService {
     }
     const events: MemoryEvent[] = facts.map(f => ({ kind: 'fact_archived', factId: f.id, scope }))
     this.emit(events)
+    this.metric.incr(MetricKeys.forgetAll, facts.length)
     return { scope, deleted: facts.length, events }
   }
 
@@ -378,6 +429,7 @@ export class MemoryService {
     const outcome = await rememberOne(this.deps(), assertion)
     this.emit(outcome.events)
     await this.publishOutcome(outcome)
+    this.metric.incr(MetricKeys.link)
     return outcome
   }
 
@@ -385,6 +437,8 @@ export class MemoryService {
   async consolidate(scope: string): Promise<{ expired: number; merged: number }> {
     const report = await consolidateScope(this.repo, scope, this.now())
     this.emit(report.events)
+    this.metric.incr(MetricKeys.expired, report.expired)
+    this.metric.incr(MetricKeys.merged, report.merged)
     for (const f of report.inactivated) await this.publishUnindex(f.factId, f.scope)
     return { expired: report.expired, merged: report.merged }
   }
@@ -410,10 +464,14 @@ export class MemoryService {
 
     let assertions: RawAssertion[] | undefined
     if (this.extract !== undefined && this.llmExtractionEnabled) {
+      this.metric.incr(MetricKeys.extractAttempt)
       try {
         assertions = await this.extract(pii.redacted)
+        if (assertions !== undefined && assertions.length > 0) this.metric.incr(MetricKeys.extractSuccess)
+        else this.metric.incr(MetricKeys.extractFail)
       } catch {
         assertions = undefined
+        this.metric.incr(MetricKeys.extractFail)
       }
     }
 
@@ -483,8 +541,8 @@ export class MemoryService {
     }
   }
 
-  /** Observability metrics (design §11). */
-  async metrics(): Promise<{ stored: number; active: number; outboxPending: number; outboxDead: number; indexedBackends: Record<string, number> }> {
+  /** Observability metrics (design §11): store + outbox + backends + counters. */
+  async metrics(): Promise<{ stored: number; active: number; outboxPending: number; outboxDead: number; indexedBackends: Record<string, number>; counters: Record<string, number> }> {
     const stats = await this.repo.stats()
     const outboxStats = this.outbox !== undefined ? await this.outbox.stats() : { pending: 0, dead: 0 }
     const indexedBackends: Record<string, number> = {}
@@ -497,7 +555,13 @@ export class MemoryService {
       outboxPending: outboxStats.pending,
       outboxDead: outboxStats.dead,
       indexedBackends,
+      counters: this.metric.snapshot(),
     }
+  }
+
+  /** Most recent trace spans (design §12.4 end-to-end trail), newest first. */
+  traces(n = 20): readonly TraceSpan[] {
+    return this.trace.recent(n)
   }
 
   /**
@@ -508,6 +572,9 @@ export class MemoryService {
   async drainIndexing(tickLimit = 100): Promise<{ swept: number; remaining: number }> {
     if (!this.useOutbox || this.worker === undefined || this.outbox === undefined) return { swept: 0, remaining: 0 }
     const report = await this.worker.tick(this.now(), tickLimit)
+    this.metric.incr(MetricKeys.indexTick, report.attempted)
+    this.metric.incr(MetricKeys.indexApplied, report.indexed + report.unindexed)
+    this.metric.incr(MetricKeys.indexDead, report.dead)
     const stats = await this.outbox.stats()
     return { swept: report.attempted, remaining: stats.pending }
   }

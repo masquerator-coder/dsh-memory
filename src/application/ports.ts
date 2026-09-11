@@ -118,8 +118,16 @@ export interface OutboxStats {
 export interface DerivedIndexBackend {
   /** Stable identity, e.g. `vector` / `graph` / `object`. */
   readonly name: string
+  /** Which read capabilities this backend offers (vector search / graph hops). */
+  readonly capabilities: IndexCapabilities
   /** Index a fact (updates by factId; idempotent). */
   upsert(fact: AtomicFact): Promise<void>
+  /** Read-side: semantic/vector recall over indexed facts. */
+  search(queryText: string, queryTerms: readonly string[], topK: number): Promise<SearchHit[]>
+  /** Read-side: adjacent canonical entity ids (graph expansion, §7.4). */
+  graphNeighbors(entityId: string, relationWhitelist: readonly string[]): Promise<readonly string[]>
+  /** Read-side: fact ids whose subject/object is a canonical entity. */
+  graphFactIds(entityId: string, topK: number): Promise<readonly string[]>
   /** Remove a fact by id (idempotent; no-op when absent). */
   remove(factId: string): Promise<void>
   /** Optional full rebuild hook (schema migration / model change). */
@@ -128,4 +136,33 @@ export interface DerivedIndexBackend {
   health(): { ok: boolean; detail?: string }
   /** Current entry count (observability). */
   count(): Promise<number>
+}
+
+/** Which read operations a derived backend can serve on the recall path. */
+export interface IndexCapabilities {
+  /** Backend can answer `search` (a real vector store, not just KV fallback). */
+  readonly search: boolean
+  /** Backend can answer `graphNeighbors` / `graphFactIds` (a real graph store). */
+  readonly graph: boolean
+}
+
+/** One vector-recall hit from a derived backend. */
+export interface SearchHit {
+  readonly factId: string
+  /** Reuse in [0,1]. */
+  readonly relevance: number
+}
+
+/**
+ * Read-only recall source bound to the derived backends. When a deployment has
+ * registered a searchable vector backend and/or graph backend, the service passes
+ * this to {@link recall} so the read path genuinely queries the plugin's vector
+ * recall and graph expansion stores instead of only the KV's lexical index
+ * (P3 "vector/graph storage realized").
+ */
+export interface IndexRead {
+  readonly capabilities: IndexCapabilities
+  search(queryText: string, queryTerms: readonly string[], topK: number): Promise<SearchHit[]>
+  graphNeighbors(entityId: string, relationWhitelist: readonly string[]): Promise<readonly string[]>
+  graphFactIds(entityId: string, topK: number): Promise<readonly string[]>
 }
