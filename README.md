@@ -56,7 +56,11 @@ This is a **P0 core** implementation of the design in
 - **LLM extraction is optional and off by default.** Without it, capture is
   rule-driven (confident triggers) and stores the raw statement at low
   confidence — facts are never silently lost, but richer extraction requires
-  wiring `ctx.get('llm')` + provider/model.
+  wiring `ctx.get('llm')` + provider/model. The LLM path (stream → `BlockAssembler`
+  → strict JSON validation → injection isolation) is unit-tested end-to-end.
+- **Recency decay is per-memory-type.** Fusion ranking decays recency
+  exponentially with the forgetting-policy lambda of the fact's type (semantic
+  decays slowly, episodic faster) rather than a fixed placeholder.
 - **Consolidation** covers expiry + same-key dedup only; entity-card
   aggregation, summarization, schema migration, and full graph fan-out ranking
   are deferred (design P1–P3).

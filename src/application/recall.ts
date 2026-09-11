@@ -10,11 +10,18 @@
  *
  * @module dsh-memory/application/recall
  */
-import type { AtomicFact } from '../domain/fact.ts'
+import type { AtomicFact, FactType } from '../domain/fact.ts'
 import type { MemoryPolicy } from '../domain/policies.ts'
 import { recencyScore } from '../domain/policies.ts'
 import type { MemoryRepository } from './ports.ts'
 import type { FactFilter } from './ports.ts'
+
+/**
+ * Fallback decay lambda when no memory type is supplied (kept conservative,
+ * equivalent to the procedural placeholder from P0 so direct scalar calls
+ * without a typed fact remain stable).
+ */
+const DEFAULT_DECAY_LAMBDA = 0.005
 
 export interface RecallQuery {
   readonly query: string
@@ -132,7 +139,19 @@ export async function recall(
   return result
 }
 
-/** Fusion-ranking normalization (design §3.10 scoring weights). */
+/** Per-memory-type recency decay lambda (design §3.10). Semantic barely decays, episodic faster. */
+export function decayLambda(policy: MemoryPolicy, type: FactType): number {
+  const f = policy.forgetting[type]
+  return f?.lambda ?? DEFAULT_DECAY_LAMBDA
+}
+
+/**
+ * Fusion-ranking normalization (design §3.10 scoring weights).
+ * Recency is exponentially decayed using the per-memory-type lambda from the
+ * forgetting policy, not a fixed placeholder — so episodic facts sink faster
+ * than semantic ones as they age. `ageMs` is the fact's age in ms (now −
+ * updated_at); recency = exp(−lambda · ageDays).
+ */
 export function fusionScore(
   policy: MemoryPolicy,
   relevance: number,
@@ -140,10 +159,11 @@ export function fusionScore(
   credibility: number,
   ageMs: number,
   graphScore: number,
-  now: number,
+  factType?: FactType,
 ): number {
   const { w1, w2, w3, w4, w5 } = policy.retrieval.ranking
-  const recency = recencyScore(0.005, now - ageMs)
+  const lambda = factType !== undefined ? decayLambda(policy, factType) : DEFAULT_DECAY_LAMBDA
+  const recency = recencyScore(lambda, ageMs)
   return w1 * relevance
     + w2 * confidence
     + w3 * credibility
@@ -162,9 +182,9 @@ function fusionSort(policy: MemoryPolicy, candidates: Candidate[], now: number):
         c.relevance,
         c.fact.confidence,
         c.fact.source.credibility,
-        now - c.fact.updated_at,
+        now - c.fact.updated_at, // age in ms
         c.viaGraph ? 0.5 : 0,
-        now,
+        c.fact.type,
       )
       return { ...c, score }
     })

@@ -1,16 +1,19 @@
 /**
- * LLM extractor adapter — the slow-channel extraction call against `ctx.llm`.
- * Optional: only wired when an `llm` service is present AND advanced
- * extraction is enabled in config. The main-session LLM never performs
- * extraction (§6.3); this is an independent call with a strict, immutable
- * prompt and a JSON validator on the output.
+ * LLM extractor adapter — the slow-channel extraction call against an `llm`
+ * service. Optional: only wired when an `llm` service is present AND a
+ * provider/model is configured AND advanced extraction is enabled in config.
+ * The main-session LLM never performs extraction (§6.3); this is an independent
+ * call with a strict, immutable prompt and a JSON validator on the output.
  *
- * In P0, if no provider/model is configured, or the call fails, the caller
- * falls back to rule capture / raw-event storage — never a silent drop.
+ * If no provider/model is configured, or the call fails, the caller falls back
+ * to rule capture / raw-event storage — never a silent drop.
+ *
+ * The `llm` object is injected as a parameter (read once at the call site via
+ * `ctx.get('llm')`) so this adapter is unit-testable without a full Cordis
+ * context.
  *
  * @module dsh-memory/adapters/llm-extractor
  */
-import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import type { RawAssertion } from '../domain/factory.ts'
@@ -21,32 +24,41 @@ import {
   injectionSuspicion,
 } from '../extraction/extractor.ts'
 
-interface LlmLike {
+/** Minimum structural surface of the `llm` service this adapter consumes. */
+export interface LlmLike {
   stream(options: GenerateOptions): AsyncIterable<unknown>
 }
 
 function asTextBlocks(assembler: BlockAssembler): string {
-  const blocks = (assembler as unknown as { blocks(): { type: string; text?: string }[] }).blocks()
+  const blocks = assembler.blocks()
   return blocks.filter(b => b.type === 'text').map(b => b.text ?? '').join('')
 }
 
+/** The slow-channel extraction function signature. */
+export type ExtractFunction = (text: string) => Promise<RawAssertion[]>
+
+export interface LlmExtractorOptions {
+  provider?: string
+  model?: string
+  maxTokens: number
+  scope: string
+}
+
 /**
- * Build an `ExtractFunction` bound to the ambient `ctx.llm`. Returns undefined
- * so the caller can disable the LLM path cleanly.
+ * Build an {@link ExtractFunction} bound to the given `llm` service. Returns
+ * undefined when no `llm` is available or no provider+model is configured, so
+ * the caller can disable the LLM path cleanly (and avoid NO_ADAPTER failures).
+ *
+ * @param llm - the ambient `llm` service, or undefined to stay off.
+ * @param opts - provider/model route plus extraction budget and target scope.
  */
 export function buildLlmExtractor(
-  ctx: Context,
-  opts: { provider?: string; model?: string; maxTokens: number; scope: string },
-): ((text: string) => Promise<RawAssertion[]>) | undefined {
-  const llm = ctx.get('llm') as unknown as LlmLike | undefined
+  llm: LlmLike | undefined,
+  opts: LlmExtractorOptions,
+): ExtractFunction | undefined {
   if (llm === undefined) return undefined
-  const provider = opts.provider
-  const model = opts.model
-  if (!provider || !model) {
-    // Try to inherit the session route is the caller's job; without a route
-    // we stay off to avoid NO_ADAPTER failures.
-    return undefined
-  }
+  const { provider, model } = opts
+  if (!provider || !model) return undefined
 
   return async (text: string): Promise<RawAssertion[]> => {
     const suspicious = injectionSuspicion(text)
@@ -68,8 +80,8 @@ export function buildLlmExtractor(
     for await (const chunk of llm.stream(options)) {
       assembler.push(chunk as never)
     }
-    const finished = (assembler as unknown as { finish: { kind: string } }).finish
-    if (finished !== undefined && finished.kind !== 'stop') {
+    const finished = assembler.finish
+    if (finished.kind !== 'stop') {
       throw new Error(`extraction LLM did not stop (${finished.kind})`)
     }
     const json = asTextBlocks(assembler).trim()

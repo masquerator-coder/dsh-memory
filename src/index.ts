@@ -52,7 +52,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const queue = new ScopeQueue()
 
   // Optional LLM extraction path (off by default; requires provider+model).
-  const extract = buildLlmExtractor(ctx, {
+  // `llm` is optional — read via ctx.get, never injected on the hard path.
+  const llm = ctx.get('llm') as unknown
+  const extract = buildLlmExtractor(llm as Parameters<typeof buildLlmExtractor>[0], {
     provider: config.extraction?.provider ?? '',
     model: config.extraction?.model ?? '',
     maxTokens: config.extraction?.maxTokens ?? 600,

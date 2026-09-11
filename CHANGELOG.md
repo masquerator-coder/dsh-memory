@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (P1 hardening)
+
+- **Per-memory-type recency decay in fusion ranking** (`src/application/recall.ts`):
+  `fusionScore` now uses the forgetting-policy lambda for the fact's type
+  (`decayLambda`) instead of a fixed `0.005` placeholder — episodic facts sink
+  faster than semantic ones as they age. Fixed a latent double-subtraction so the
+  `ageMs` parameter is the true age (now − updated_at) rather than a timestamp.
+  The `now` argument was removed from `fusionScore` (callers pass the age).
+- **LLM extraction made unit-testable** (`src/adapters/llm-extractor.ts`): the
+  adapter now takes the `llm` service as an injected parameter instead of reading
+  `ctx.get('llm')` internally, so the stream → `BlockAssembler` → validation
+  pipeline is testable without a full Cordis context. `index.ts` resolves the
+  `llm` service once at the call site.
+
+### Tests
+
+- `tests/recall.test.ts`: added recency-decay cases (per-type lambda ordering,
+  fresh-beats-old, lambda resolution).
+- `tests/llm-extractor.test.ts`: 8 end-to-end cases — valid extraction, code-fence
+  tolerance, non-`stop` finish rejection, malformed/non-array output rejection, and
+  prompt-injection isolation.
+- Suite is now **64 unit tests** (was 53 at P0, +3 recall +8 extractor).
+
 ## [0.1.0] — 2026-09-08
 
 Initial **P0 core** release per the design document.

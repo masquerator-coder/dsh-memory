@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { recall, fusionScore, estimateTokens } from '../src/application/recall'
+import { recall, fusionScore, estimateTokens, decayLambda } from '../src/application/recall'
 import { JsonFileMemoryRepository } from '../src/infrastructure/json-repo'
 import { EntityResolver } from '../src/domain/entity'
 import { buildFact, type RawAssertion } from '../src/domain/factory'
@@ -78,8 +78,29 @@ describe('recall', () => {
 
 describe('fusionScore', () => {
   it('is monotonic in confidence', () => {
-    const lo = fusionScore(policy, 0.5, 0.5, 0.5, 0, 0, 1000)
-    const hi = fusionScore(policy, 0.5, 0.9, 0.5, 0, 0, 1000)
+    const lo = fusionScore(policy, 0.5, 0.5, 0.5, 0, 0)
+    const hi = fusionScore(policy, 0.5, 0.9, 0.5, 0, 0)
     expect(hi).toBeGreaterThan(lo)
+  })
+
+  it('decays recency per memory type, episodic sinking faster than semantic', () => {
+    // Same age, same everything else — only the type differs.
+    const ageMs = 30 * 86_400_000 // 30 days
+    const semantic = fusionScore(policy, 0.5, 0.5, 0.5, ageMs, 0, 'semantic')
+    const episodic = fusionScore(policy, 0.5, 0.5, 0.5, ageMs, 0, 'episodic')
+    expect(episodic).toBeLessThan(semantic)
+  })
+
+  it('uses the configured lambda for the type via decayLambda', () => {
+    expect(decayLambda(policy, 'semantic')).toBe(0.001)
+    expect(decayLambda(policy, 'episodic')).toBe(0.02)
+    expect(decayLambda(policy, 'procedural')).toBe(0.005)
+    expect(decayLambda(policy, 'working')).toBe(0)
+  })
+
+  it('ranks a fresh fact above an identically-scored old one', () => {
+    const fresh = fusionScore(policy, 0.5, 0.5, 0.5, 0, 0, 'semantic')
+    const old = fusionScore(policy, 0.5, 0.5, 0.5, 365 * 86_400_000, 0, 'semantic')
+    expect(fresh).toBeGreaterThan(old)
   })
 })
