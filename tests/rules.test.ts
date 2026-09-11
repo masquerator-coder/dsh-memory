@@ -25,6 +25,12 @@ describe('matchRules', () => {
     const m = matchRules('我不太喜欢吃香菜', TRIGGERS)
     expect(m!.statement).toBe('喜欢吃香菜')
   })
+
+  it('strips the separator left behind by the trigger', () => {
+    expect(matchRules('记住，项目部署在阿里云 ACK', TRIGGERS)!.statement).toBe('项目部署在阿里云 ACK')
+    expect(matchRules('请记住: 项目用 pnpm 管理', TRIGGERS)!.statement).toBe('项目用 pnpm 管理')
+    expect(matchRules('记住， 我 偏好简短回答', TRIGGERS)!.statement).toBe('偏好简短回答')
+  })
 })
 
 describe('looksFactWorthy', () => {

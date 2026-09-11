@@ -49,7 +49,19 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const policyRef = () => policy
 
   const repo = new JsonFileMemoryRepository(config.dataFile === '' ? undefined : config.dataFile)
+  // Never leave this unattended: an unreadable document must be reported, and a
+  // corrupt one is quarantined by the store so the first write cannot replace
+  // every stored memory with an empty file (design §12.6 durability).
   void repo.open()
+    .then(() => {
+      const issue = repo.openIssue
+      if (issue === undefined) return
+      const where = issue.backupPath !== undefined
+        ? `preserved at ${issue.backupPath}`
+        : 'could not be preserved — writes are disabled to avoid data loss'
+      ctx.logger(`[dsh-memory] ${issue.kind} memory document (${issue.message}); ${where}`)
+    })
+    .catch(error => ctx.logger(`[dsh-memory] failed to open ${config.dataFile}: ${String(error)}`))
 
   const resolver = new EntityResolver()
 

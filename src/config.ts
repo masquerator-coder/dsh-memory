@@ -3,6 +3,15 @@
  * optional by default in schemastery v3; `.default()` supplies a fallback that
  * is also made optional.
  *
+ * **Do not add `.default()` to the profile-dependent keys** (`retrieval.versions`,
+ * `retrieval.graph.{maxDepth,maxFanoutPerEntity,maxCandidates}`,
+ * `forgetting.*.{ttl,lambda}`, `privacy.{default,retrievalFilter}`): Cordis
+ * resolves the config through this schema *before* `apply()`, so a default here
+ * is indistinguishable from a user-supplied value and `buildPolicy()` can no
+ * longer tell "unset" from "explicitly set to the personal value" — which is
+ * exactly how `profile: research` silently degraded to personal. Their defaults
+ * live in `src/build-policy.ts`, per profile. `tests/profile.test.ts` guards this.
+ *
  * @module dsh-memory/config
  */
 import z from '@deepseek-ai/schemastery'
@@ -69,6 +78,9 @@ export interface Config {
 
 const relationWhitelist = ['works_with', 'prefers_diet', 'uses_tool', 'uses_technology', 'located_in', 'deployed_on', 'works_at', 'uses_database', 'uses_orm', 'has_theme', 'is_a', 'speaks']
 
+/** Privacy tiers, validated as a closed set so a typo cannot silently pass. */
+const PRIVACY_LEVELS = ['public', 'private', 'confidential', 'secret'] as const
+
 export const Config: z<Config> = z.object({
   dataFile: z.string().default(''),
   userMdFile: z.string().default(''),
@@ -80,12 +92,13 @@ export const Config: z<Config> = z.object({
     topK: z.number().default(20),
     maxTokens: z.number().default(800),
     timeoutMs: z.number().default(80),
-    versions: z.union(['active', 'all'] as const).default('active'),
+    // Profile-dependent (personal `active` / research `all`) — no default here.
+    versions: z.union(['active', 'all'] as const),
     graph: z.object({
-      maxDepth: z.number().default(2),
+      maxDepth: z.number(),
       maxSeedEntities: z.number().default(5),
-      maxFanoutPerEntity: z.number().default(30),
-      maxCandidates: z.number().default(200),
+      maxFanoutPerEntity: z.number(),
+      maxCandidates: z.number(),
       relationWhitelist: z.array(z.string()).default(relationWhitelist),
     }),
     ranking: z.object({
@@ -110,14 +123,16 @@ export const Config: z<Config> = z.object({
     ruleConfidence: z.number().default(0.5),
   }),
   forgetting: z.object({
-    semantic: z.object({ ttl: z.string().default('365d'), lambda: z.number().default(0.001) }),
-    episodic: z.object({ ttl: z.string().default('90d'), lambda: z.number().default(0.02) }),
-    procedural: z.object({ ttl: z.string().default('365d'), lambda: z.number().default(0.005) }),
-    working: z.object({ ttl: z.string().default(''), lambda: z.number().default(0) }),
+    semantic: z.object({ ttl: z.string(), lambda: z.number() }),
+    episodic: z.object({ ttl: z.string(), lambda: z.number() }),
+    procedural: z.object({ ttl: z.string(), lambda: z.number() }),
+    working: z.object({ ttl: z.string(), lambda: z.number() }),
   }),
   privacy: z.object({
-    default: z.string().default('private') as z<PrivacyLevel>,
-    retrievalFilter: z.array(z.string()).default(['public', 'private']) as z<PrivacyLevel[]>,
+    default: z.union(PRIVACY_LEVELS) as z<PrivacyLevel>,
+    // A closed set: a typo (or an unknown tier) would otherwise silently widen
+    // or narrow what recall may surface (§12.7).
+    retrievalFilter: z.array(z.union(PRIVACY_LEVELS)) as z<PrivacyLevel[]>,
     secretRequiresExplicitAuth: z.boolean().default(true),
     piiRedaction: z.boolean().default(true),
   }),

@@ -16,7 +16,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { AtomicFact } from '../domain/fact.ts'
-import { isExpired } from '../domain/policies.ts'
+import { factAllowed } from '../application/privacy.ts'
 import type {
   FactFilter,
   MemoryRepository,
@@ -56,14 +56,9 @@ function factText(fact: AtomicFact): string {
 }
 
 function applyFilter(fact: AtomicFact, filter: FactFilter): boolean {
-  if (filter.scope !== undefined && fact.scope !== filter.scope) return false
-  if (filter.status !== undefined && !filter.status.includes(fact.status)) return false
-  if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
-  if (filter.pii === true && fact.pii !== true) return false
-  if (filter.types !== undefined && !filter.types.includes(fact.type)) return false
-  if (filter.indexState !== undefined && !filter.indexState.includes(fact.index_state)) return false
-  if (filter.now !== undefined && isExpired(fact, filter.now)) return false
-  return true
+  // One shared gate with the recall engine (application/privacy), so the store
+  // and the engine can never disagree about what a recall may surface.
+  return factAllowed(fact, filter)
 }
 
 /** BM25 term weight for one query term over the collection. */
@@ -148,6 +143,19 @@ type Mutation =
   | { readonly kind: 'put'; readonly fact: AtomicFact }
   | { readonly kind: 'delete'; readonly id: string }
 
+/**
+ * Why the store could not load its document, and what was done about it. Never
+ * silently ignored: an empty in-memory store would overwrite every persisted
+ * memory on the first write.
+ */
+export interface OpenIssue {
+  /** `corrupt` = unparsable content; `unreadable` = could not be read at all. */
+  readonly kind: 'corrupt' | 'unreadable'
+  readonly message: string
+  /** Where the unreadable document was preserved, when it could be moved aside. */
+  readonly backupPath?: string
+}
+
 export class JsonFileMemoryRepository implements MemoryRepository {
   private facts = new Map<string, AtomicFact>()
   private byKey = new Map<string, AtomicFact>()
@@ -155,11 +163,34 @@ export class JsonFileMemoryRepository implements MemoryRepository {
   private adjacency = new Map<string, Set<string>>()
   private bm25 = new Bm25Index()
   private chain: Promise<void> = Promise.resolve()
+  private issue: OpenIssue | undefined
+  /**
+   * Set when the previous document could not be preserved. Writes are refused
+   * rather than overwriting data we failed to load.
+   */
+  private readOnly = false
 
   /** `filePath` may be omitted for a pure in-memory store (tests). */
   constructor(private readonly filePath?: string) {}
 
-  /** Load an existing document (creates an empty one on first run). */
+  /** What went wrong at `open()`, if anything (surfaced by the plugin logger). */
+  get openIssue(): OpenIssue | undefined {
+    return this.issue
+  }
+
+  /** Whether writes are refused because the previous document is unpreserved. */
+  get isReadOnly(): boolean {
+    return this.readOnly
+  }
+
+  /**
+   * Load an existing document (creates an empty one on first run).
+   *
+   * A missing file is a normal first run. A *corrupt* or *unreadable* file is
+   * quarantined instead of being reported as "empty" — see {@link quarantine}.
+   * Never throws for a bad document, so the plugin loader cannot end up with an
+   * unhandled rejection and an empty store pointed at good data.
+   */
   async open(): Promise<void> {
     if (this.filePath === undefined) return
     let doc: DocumentState = { facts: {} }
@@ -169,18 +200,61 @@ export class JsonFileMemoryRepository implements MemoryRepository {
       doc = { facts: parsed.facts ?? {} }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT') throw error
+      if (code !== 'ENOENT') await this.quarantine(error)
     }
     for (const fact of Object.values(doc.facts)) this.addToMemory(fact)
   }
 
+  /**
+   * Preserve a document we could not load, so the next write cannot destroy it.
+   *
+   * Corrupt content is moved aside to `<file>.corrupt-<ts>` (the next write then
+   * starts a fresh file while the original bytes remain on disk). A document we
+   * could not read at all is left untouched and the store goes read-only.
+   */
+  private async quarantine(error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!(error instanceof SyntaxError)) {
+      this.readOnly = true
+      this.issue = { kind: 'unreadable', message }
+      return
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const backupPath = `${this.filePath}.corrupt-${stamp}`
+    try {
+      await rename(this.filePath!, backupPath)
+      this.issue = { kind: 'corrupt', message, backupPath }
+    } catch {
+      // Could not move it aside — refuse writes instead of overwriting it.
+      this.readOnly = true
+      this.issue = { kind: 'corrupt', message }
+    }
+  }
+
+  /**
+   * Serialize one mutation behind the previous one. The chain records that an
+   * operation finished, never that it failed: `run.then(ok, fail)` would make a
+   * single failure (a transient file lock, a full disk) reject *every* later
+   * read and write on this repository with a stale error.
+   */
   private enqueue(mutation: Mutation): Promise<void> {
-    this.chain = this.chain.then(async () => {
+    const run = this.chain.then(async () => {
+      const id = mutation.kind === 'put' ? mutation.fact.id : mutation.id
+      const previous = this.facts.get(id)
       if (mutation.kind === 'put') this.applyPut(mutation.fact)
       else this.applyDelete(mutation.id)
-      await this.persist()
+      try {
+        await this.persist()
+      } catch (error) {
+        // Keep memory and disk in step: a write that did not land must not leave
+        // a phantom fact (or a phantom deletion) behind in the indexes.
+        if (previous === undefined) this.applyDelete(id)
+        else this.applyPut(previous)
+        throw error
+      }
     })
-    return this.chain
+    this.chain = run.then(() => undefined, () => undefined)
+    return run
   }
 
   private addToMemory(fact: AtomicFact): void {
@@ -236,6 +310,11 @@ export class JsonFileMemoryRepository implements MemoryRepository {
 
   private async persist(): Promise<void> {
     if (this.filePath === undefined) return
+    if (this.readOnly) {
+      throw new Error(
+        'memory: refusing to write — the existing memory document could not be read or preserved (see the plugin log)',
+      )
+    }
     const doc: DocumentState = { facts: Object.fromEntries(this.facts) }
     const tmp = `${this.filePath}.tmp`
     await mkdir(dirname(this.filePath), { recursive: true })

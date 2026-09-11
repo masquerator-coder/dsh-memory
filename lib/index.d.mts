@@ -435,7 +435,20 @@ interface FactFilter {
   readonly scope?: string;
   readonly status?: readonly string[];
   readonly privacy?: readonly PrivacyLevel[];
+  /** Selector: only PII-flagged facts. See `excludePii` for the inverse. */
   readonly pii?: boolean;
+  /**
+   * Drop PII-flagged facts. The model-facing read path sets this: PII is
+   * detected and flagged at capture time (§12.7) and must never be
+   * auto-injected into the prompt or a tool result.
+   */
+  readonly excludePii?: boolean;
+  /**
+   * Drop `secret` facts regardless of the tier list — surfacing them requires
+   * explicit authorization (§12.7), which the plugin only models as
+   * `privacy.secretRequiresExplicitAuth: false`.
+   */
+  readonly excludeSecret?: boolean;
   /** Only facts whose type is in this set. */
   readonly types?: readonly FactType[];
   /** Only facts not expired as of this epoch ms. */
@@ -697,6 +710,17 @@ interface RecallQuery {
    * no capability), recall falls back to the KV repo's lexical BM25 / adjacency.
    */
   readonly read?: IndexRead;
+  /**
+   * Drop PII-flagged facts from the result (default `true` — the read path is
+   * model-facing and PII is flagged at capture time, §12.7). Set `false` only
+   * for an explicit, non-model-facing inspection path.
+   */
+  readonly excludePii?: boolean;
+  /**
+   * Drop `secret` facts regardless of the tier list. The service passes the
+   * inverse of `privacy.secretRequiresExplicitAuth`.
+   */
+  readonly excludeSecret?: boolean;
 }
 interface ScoredMemory {
   readonly fact: AtomicFact;
@@ -964,6 +988,13 @@ declare class MemoryService {
    */
   recall(query: RecallQuery): Promise<ScoredMemory[]>;
   /**
+   * Card options bound to the current policy: one privacy gate shared by the
+   * entity card, `read_user_profile`, the rendered `user.md` view, and the
+   * `user.md` write-back baseline. Without this the view would hide facts the
+   * write-back would then archive as "deleted by the user" (§8.4).
+   */
+  private cardOptions;
+  /**
    * Build the aggregated entity card for one canonical entity (design §3.13).
    * Runs within the retrieval budget; on timeout it degrades to an empty card
    * rather than blocking the caller.
@@ -1002,8 +1033,14 @@ declare class MemoryService {
     merged: number;
   }>;
   /**
-   * The session/event entry point: fast-channel capture, then background
-   * extraction + storage (enqueued, never blocking the caller).
+   * The session/event entry point (design §4.2 / §6.4 mode B): the fast channel
+   * is a **deterministic, zero-LLM gate** — a message is captured only when a
+   * configured trigger phrase fires, or when it looks fact-worthy (a
+   * number/date/version/entity signal). Everything else is left alone; the
+   * accepted capture is handed to the background queue, never blocking the
+   * caller.
+   *
+   * @returns whether the message was accepted for capture.
    */
   extractAndRemember(input: {
     text: string;

@@ -22,6 +22,9 @@ export interface RuleMatch {
   readonly subjectMention?: string
 }
 
+/** Leading punctuation/space left behind once the trigger phrase is removed. */
+const EDGE_PUNCT = /^[\s，,。.、:：;；!！?？~～\-]+/u
+
 /** Strip a leading trigger phrase and surrounding filler from a statement. */
 function stripTrigger(text: string, trigger: string): string {
   let rest = text
@@ -29,9 +32,12 @@ function stripTrigger(text: string, trigger: string): string {
   if (idx >= 0) {
     rest = rest.slice(idx + trigger.length)
   }
-  // Drop leading conversational filler.
-  rest = rest.replace(/^(是|就是|我|请|帮我|以后)\s*/g, '')
-  rest = rest.replace(/[\s，。！？!?]*$/g, '')
+  // Drop the separator and conversational filler that follow the trigger
+  // ("记住，项目部署在…" → "项目部署在…", "记住了我是素食" → "素食").
+  rest = rest.replace(EDGE_PUNCT, '')
+  rest = rest.replace(/^(是|就是|我|请|帮我|以后)\s*/gu, '')
+  rest = rest.replace(EDGE_PUNCT, '')
+  rest = rest.replace(/[\s，。！？!?]*$/gu, '')
   return rest.trim()
 }
 
@@ -51,9 +57,11 @@ export function matchRules(text: string, triggers: readonly string[]): RuleMatch
     if (idx >= 0) {
       const statement = stripTrigger(norm, trigger)
       if (statement.length === 0) continue
-      const type: FactType = /偏好|喜欢|不爱|不吃|讨厌|客气|希望/.test(statement) ? 'semantic' : 'semantic'
       return {
-        type,
+        // Trigger-based captures are declarative statements about the user's
+        // preferences/facts; episodic classification needs a time signal the
+        // fast channel does not have.
+        type: 'semantic',
         statement,
         trigger,
         subjectMention: guessSubject(norm, idx),

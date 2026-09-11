@@ -13,6 +13,7 @@
 import type { AtomicFact, FactType } from '../domain/fact.ts'
 import type { MemoryPolicy } from '../domain/policies.ts'
 import { isExpired, recencyScore } from '../domain/policies.ts'
+import { factAllowed, redactForRecall } from './privacy.ts'
 import type { MemoryRepository, IndexRead, FactFilter, RecallCandidate } from './ports.ts'
 
 /**
@@ -42,18 +43,22 @@ export interface RecallQuery {
    * no capability), recall falls back to the KV repo's lexical BM25 / adjacency.
    */
   readonly read?: IndexRead
+  /**
+   * Drop PII-flagged facts from the result (default `true` — the read path is
+   * model-facing and PII is flagged at capture time, §12.7). Set `false` only
+   * for an explicit, non-model-facing inspection path.
+   */
+  readonly excludePii?: boolean
+  /**
+   * Drop `secret` facts regardless of the tier list. The service passes the
+   * inverse of `privacy.secretRequiresExplicitAuth`.
+   */
+  readonly excludeSecret?: boolean
 }
 
-/** Local filter guard mirroring the store's applyFilter for resolved facts. */
+/** Local filter guard — the same gate the store uses (application/privacy). */
 function factPasses(fact: AtomicFact, filter: FactFilter): boolean {
-  if (filter.scope !== undefined && fact.scope !== filter.scope) return false
-  if (filter.status !== undefined && !filter.status.includes(fact.status)) return false
-  if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
-  if (filter.pii === true && fact.pii !== true) return false
-  if (filter.types !== undefined && !filter.types.includes(fact.type)) return false
-  if (filter.indexState !== undefined && !filter.indexState.includes(fact.index_state)) return false
-  if (filter.now !== undefined && isExpired(fact, filter.now)) return false
-  return true
+  return factAllowed(fact, filter)
 }
 
 /** Resolve ids from the derived index into filtered, repo-backed candidates. */
@@ -110,6 +115,9 @@ export async function recall(
     scope: q.scope,
     status: statuses,
     privacy: policy.privacy.retrievalFilter,
+    // §12.7: PII never auto-injects; secret needs explicit authorization.
+    excludePii: q.excludePii ?? true,
+    excludeSecret: q.excludeSecret ?? policy.privacy.secretRequiresExplicitAuth,
     now,
     // Outbox barrier: read only facts the derived backends have confirmed.
     indexState: q.requireReadyIndex === true ? ['ready'] : undefined,
@@ -201,7 +209,10 @@ export async function recall(
     tokens += t
     if (result.length >= topK) break
   }
-  return result
+  // §12.7 "confidential → 脱敏后注入": the tier may be surfaced (research), but
+  // its content is redacted on the way out when piiRedaction is on.
+  if (!policy.privacy.piiRedaction) return result
+  return result.map(m => ({ ...m, fact: redactForRecall(m.fact, policy.privacy) }))
 }
 
 /** Per-memory-type recency decay lambda (design §3.10). Semantic barely decays, episodic faster. */

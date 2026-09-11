@@ -4,10 +4,17 @@
  * `confidential` recall paths. Secrets never enter by default; PII-bearing
  * content is flagged and isolated.
  *
+ * This module owns the **single read-path gate** ({@link factAllowed}) used by
+ * both the store's query filter and the recall engine, so the two can never
+ * drift apart: a fact the tier list admits can still be dropped for being
+ * `secret` (needs explicit authorization) or PII-flagged (never auto-injected).
+ *
  * @module dsh-memory/application/privacy
  */
-import type { PrivacyLevel } from '../domain/fact.ts'
+import type { AtomicFact, PrivacyLevel } from '../domain/fact.ts'
 import type { PrivacyPolicy } from '../domain/policies.ts'
+import { isExpired } from '../domain/policies.ts'
+import type { FactFilter } from './ports.ts'
 
 /** Result of scanning input for sensitive content. */
 export interface PiiScan {
@@ -55,9 +62,36 @@ export function privacyAllowed(level: PrivacyLevel, filter: readonly PrivacyLeve
 }
 
 /**
- * Apply the recall privacy filter to a candidate set. Confidential content is
- * redacted when piiRedaction is on; secret is dropped unless explicit auth is
- * permitted (P0: never auto-injected).
+ * The one read-path gate (§12.7), shared by the store's `applyFilter` and the
+ * recall engine's local guard:
+ *
+ * - `scope` / `status` / `types` / `indexState` / `now` — the plain selectors;
+ * - `privacy` — the tier list the deployment allows to be surfaced;
+ * - `pii: true` — *only* PII facts (a selector, not a filter);
+ * - `excludePii` — drop PII-flagged facts (the model-facing default: PII is
+ *   flagged at capture time and must never be auto-injected);
+ * - `excludeSecret` — drop `secret` facts regardless of the tier list, because
+ *   surfacing them requires explicit authorization the plugin does not model.
+ */
+export function factAllowed(fact: AtomicFact, filter: FactFilter): boolean {
+  if (filter.scope !== undefined && fact.scope !== filter.scope) return false
+  if (filter.status !== undefined && !filter.status.includes(fact.status)) return false
+  if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
+  if (filter.excludeSecret === true && fact.privacy === 'secret') return false
+  if (filter.excludePii === true && fact.pii) return false
+  if (filter.pii === true && fact.pii !== true) return false
+  if (filter.types !== undefined && !filter.types.includes(fact.type)) return false
+  if (filter.indexState !== undefined && !filter.indexState.includes(fact.index_state)) return false
+  if (filter.now !== undefined && isExpired(fact, filter.now)) return false
+  return true
+}
+
+/**
+ * Apply the recall privacy filter to a candidate set (§12.7):
+ * confidential survives; secret is dropped unless explicitly authorized.
+ *
+ * Used on the read paths that bypass the store's own query filter (the recall
+ * degradation fallback), so every path to the model passes one gate.
  */
 export function filterByPrivacy<T extends { privacy: PrivacyLevel; content: string; pii: boolean }>(
   items: readonly T[],
@@ -70,13 +104,16 @@ export function filterByPrivacy<T extends { privacy: PrivacyLevel; content: stri
   })
 }
 
-/** Redact confidential content for non-auth recall paths. */
+/**
+ * Redact a fact for a non-auth recall path (§12.7 "confidential → 脱敏后注入").
+ * PII patterns inside confidential content are masked and the tier is marked so
+ * the model knows not to echo it. Only applies when `piiRedaction` is on.
+ */
 export function redactForRecall<T extends { privacy: PrivacyLevel; content: string }>(
   item: T,
-  _policy: PrivacyPolicy,
+  policy: PrivacyPolicy,
 ): T {
-  if (item.privacy === 'confidential' && _policy.piiRedaction) {
-    return { ...item, content: `[confidential] ${item.content}` }
-  }
-  return item
+  if (item.privacy !== 'confidential' || !policy.piiRedaction) return item
+  const scanned = scanPii(item.content)
+  return { ...item, content: `[confidential] ${scanned.redacted}` }
 }

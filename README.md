@@ -35,15 +35,22 @@ This is a **P0–P2** implementation of the design in
   `preconditions` / `tool_chain` / `success_rate` (design §3.12), with a
   migration helper for P0-era "steps-as-content" facts.
 - **Fast-channel capture** — a `session/event` listener with deterministic,
-  zero-LLM rules (`记住…`, `我的偏好是…`) that hands signals to the background
-  queue (design §6.4 **mode B**).
+  zero-LLM rules that hands signals to the background queue (design §6.4
+  **mode B**): a message is captured only when a configured trigger phrase fires
+  (`记住…`, `我的偏好是…`) or when it carries a fact-worthy signal (numbers,
+  dates, proper nouns, versions — the §6.4 mode B pattern). Everything else is
+  ignored. `extraction.triggers` configures the trigger list.
 - **Dynamic-context injection** — recalled facts are surfaced through DSH's
   `system-prompt/assemble` context channel (the same "Current runtime context"
   snapshot mechanism), so they remain reconstructible from the session log and
   never mutate the frozen `agent/request` config.
 - **Privacy guard** — PII detection + redaction, privacy-tier retrieval filter,
   and an immutable extraction prompt with strict JSON validation / prompt
-  injection defense (design §12.7).
+  injection defense (design §12.7). Enforced on every path to the model:
+  PII-flagged facts are never auto-injected or returned by a tool, `secret`
+  facts require `secretRequiresExplicitAuth: false` **and** a tier list that
+  admits them, and `confidential` content is PII-masked and tier-marked
+  (`[confidential] …`) on the way out.
 - **Background consolidation** — TTL expiry sweep and same-key dedup merge on a
   timer (design §5.3, P0 scope).
 
@@ -79,25 +86,47 @@ This is a **P0–P2** implementation of the design in
   call. LLM/embedding-based summarization of entity cards is a later seam on
   top of the grouping.
 - **`user.md` reconciliation** matches edited lines to facts per predicate by
-  exact content; heavily restructured free-hand edits may not map cleanly to a
-  single fact and are written back as new/archived facts. Concurrent user edits
-  win over background aggregation (design §8.4).
+  exact content, against exactly the facts the rendered view can show (the
+  primary entity, the current privacy tier, non-PII). Facts the view cannot
+  represent are never treated as "deleted by the user". Heavily restructured
+  free-hand edits may still not map cleanly to a single fact and are written
+  back as new/archived facts. Concurrent user edits win over background
+  aggregation (design §8.4).
 - **Per-scope ordering** is guaranteed by a scope-scoped worker queue, but there
   is no cross-process lock: P0 targets a single local DSH process.
+- **Persistence failure semantics.** A write that fails (file lock, full disk)
+  is rolled back in memory and reported; it no longer breaks later operations. A
+  document that cannot be parsed is moved aside to `<file>.corrupt-<ts>` before
+  anything else is written, and a document that cannot be read at all puts the
+  store in read-only mode rather than being overwritten. There is no `fsync`, so
+  a power loss can still leave a truncated file (recovered as above, not lost).
 
 ## Security model
 
 - User content is **untrusted data**. The extraction prompt is immutable and
   user text cannot alter it; output must pass JSON schema validation.
 - `source.user_edit` implies `credibility = 1.0` and always wins conflicts.
-- Privacy tiers (`public/private/confidential/secret`); secrets are never
-  auto-injected; confidential content is redacted on non-auth recall.
+- Privacy tiers (`public/private/confidential/secret`), enforced on every path
+  that can reach the model (recall, the degradation fallback, context injection,
+  the `memory_*` tools and the `user.md` view):
+  - PII-flagged facts are never auto-injected, and PII detected at capture time
+    is stored redacted (`<<phone>>`, `<<id>>`, …) — the raw value does not enter
+    memory;
+  - `confidential` content is PII-masked and marked `[confidential]` on recall;
+  - `secret` facts are dropped unless `secretRequiresExplicitAuth: false` **and**
+    `privacy.retrievalFilter` lists `secret`.
 - `forgetAll(scope)` is the forgetting-rights cascade.
+
+> **Storage is plaintext.** `dataFile` and `userMdFile` hold long-term memory
+> (including `confidential`/`secret` facts) as unencrypted JSON/Markdown with
+> default filesystem permissions, and there is no passphrase or OS-keychain
+> integration. Point them at a location your platform already protects, and do
+> not put them in a synced/public folder. Encryption is not implemented.
 
 ## Configuration
 
 All settings are declared in `src/config.ts` (schemastery `z.object`) and
-mirror the design's Profile (§10). Selected defaults:
+mirror the design's Profile (§10). Selected defaults **for `profile: personal`**:
 
 | key | default |
 | --- | --- |
@@ -112,6 +141,16 @@ mirror the design's Profile (§10). Selected defaults:
 | `forgetting.semantic.ttl` / `.episodic.ttl` | `365d` / `90d` |
 | `privacy.default` / `retrievalFilter` | `private` / `[public,private]` |
 | `consolidation.incrementalIntervalMs` | `900000` (15min) |
+
+The profile-dependent keys — `retrieval.versions`,
+`retrieval.graph.{maxDepth,maxFanoutPerEntity,maxCandidates}`,
+`forgetting.*.{ttl,lambda}`, `privacy.{default,retrievalFilter}` — are resolved
+in `src/build-policy.ts` per profile (§10.2) and deliberately carry **no schema
+default**, so an unset key means "use the profile's value". `profile: research`
+therefore differs from personal (all-version retrieval, larger pruned fan-out,
+weaker decay / longer TTL, `confidential` in the retrieval filter). Set any of
+them explicitly to override both profiles; `privacy.retrievalFilter` is read as
+unset when empty.
 
 ## Install & mount
 

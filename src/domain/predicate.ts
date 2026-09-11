@@ -5,7 +5,11 @@
  *
  * The registry is intentionally conservative: vector-similarity is only ever a
  * suggestion, never an auto-merge. Unknown predicates pass through verbatim
- * (lowercased) so we never lose a fact to an incomplete dictionary.
+ * (lowercased, whitespace folded) so we never lose a fact to an incomplete
+ * dictionary — including non-ASCII predicates, which are the common case for
+ * this plugin's primary (Chinese) input. Two distinct predicates must never
+ * canonicalize onto the same key, or two different assertions would share one
+ * `semantic_key` and silently supersede each other.
  *
  * @module dsh-memory/domain/predicate
  */
@@ -48,6 +52,13 @@ export function normalizePredicateText(input: string): string {
 
 /**
  * Canonicalize a raw predicate into its normalized canonical form.
+ *
+ * Known aliases collapse onto their registered canonical predicate. Unknown
+ * predicates keep every letter/digit of any script (`\p{L}`/`\p{N}`) — only
+ * whitespace runs and separator punctuation are folded to `_` — so distinct
+ * predicates stay distinct (`喜欢瑜伽` ≠ `讨厌瑜伽`) instead of all collapsing
+ * onto `____`, which would give semantically opposite facts one semantic key.
+ *
  * @param predicate - the natural predicate from extraction.
  * @returns the canonical predicate string.
  */
@@ -55,8 +66,12 @@ export function canonicalizePredicate(predicate: string): string {
   const key = normalizePredicateText(predicate)
   const entry = LOOKUP.get(key)
   if (entry !== undefined) return entry.canonical
-  // Unknown predicates pass through lowercased & dash-normalized.
-  return key.replace(/[\s]+/g, '_').replace(/[^a-z0-9_]/g, '_')
+  // Unknown predicates pass through lowercased, with whitespace and separator
+  // punctuation folded — never with the characters themselves discarded.
+  // Deliberately no `_{2,}` collapsing: merging two spellings is worse than
+  // keeping two distinct keys (a duplicate fact is recoverable, an overwrite
+  // is not).
+  return key.replace(/[\s]+/gu, '_').replace(/[^\p{L}\p{N}_]/gu, '_')
 }
 
 /** Metadata for a canonical predicate, defaulting benign values for unknowns. */

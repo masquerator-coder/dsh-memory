@@ -13,7 +13,20 @@ export interface FactFilter {
   readonly scope?: string
   readonly status?: readonly string[]
   readonly privacy?: readonly PrivacyLevel[]
+  /** Selector: only PII-flagged facts. See `excludePii` for the inverse. */
   readonly pii?: boolean
+  /**
+   * Drop PII-flagged facts. The model-facing read path sets this: PII is
+   * detected and flagged at capture time (§12.7) and must never be
+   * auto-injected into the prompt or a tool result.
+   */
+  readonly excludePii?: boolean
+  /**
+   * Drop `secret` facts regardless of the tier list — surfacing them requires
+   * explicit authorization (§12.7), which the plugin only models as
+   * `privacy.secretRequiresExplicitAuth: false`.
+   */
+  readonly excludeSecret?: boolean
   /** Only facts whose type is in this set. */
   readonly types?: readonly FactType[]
   /** Only facts not expired as of this epoch ms. */

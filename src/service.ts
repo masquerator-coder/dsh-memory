@@ -16,7 +16,7 @@ import { isExpired } from './domain/policies.ts'
 import type { MemoryRepository, OutboxStore, IndexRead } from './application/ports.ts'
 import type { RawAssertion } from './domain/factory.ts'
 import type { EntityCard, CardOptions } from './domain/card.ts'
-import { buildEntityCard } from './application/card.ts'
+import { buildEntityCard, cardVisible } from './application/card.ts'
 import { normalizeProcedure } from './domain/procedural.ts'
 import { buildFact } from './domain/factory.ts'
 import { parseUserMd } from './application/usermd-parse.ts'
@@ -26,7 +26,8 @@ import type { UserMdLine } from './domain/usermd.ts'
 import { rememberOne, type StoreOutcome } from './application/remember.ts'
 import { recall, type RecallQuery, type ScoredMemory } from './application/recall.ts'
 import { consolidateScope } from './application/consolidate.ts'
-import { scanPii } from './application/privacy.ts'
+import { scanPii, filterByPrivacy, redactForRecall } from './application/privacy.ts'
+import { matchRules, looksFactWorthy } from './extraction/rules.ts'
 import { ScopeQueue } from './infrastructure/queue.ts'
 import { composeIndexRead } from './infrastructure/index-backends.ts'
 import { withTimeout } from './util/timeout.ts'
@@ -204,20 +205,27 @@ export class MemoryService {
       })
       const result = await withTimeout(run, policy.retrieval.timeoutMs, async () => {
         // Degradation: return any active scope facts (cheap list) rather than
-        // nothing, without re-running the full pipeline. Version-aware for research.
+        // nothing, without re-running the full pipeline. Version-aware for
+        // research. This path bypasses the store query, so it must apply the
+        // privacy gate itself (§12.7): no PII, no unauthorized secret.
         const statuses = policy.retrieval.versions === 'all' ? ['active', 'superseded'] : ['active']
         const fallback = await this.repo.listScope(query.scope)
-        return fallback
-          .filter(f => statuses.includes(f.status) && !isExpired(f, this.now()))
-          .map(f => ({ fact: f, score: 0, relevance: 0 }))
+        const visible = filterByPrivacy(
+          fallback.filter(f => statuses.includes(f.status) && !isExpired(f, this.now()) && !f.pii),
+          policy.privacy,
+          !policy.privacy.secretRequiresExplicitAuth,
+        )
+        return visible
           .slice(0, query.topK ?? policy.retrieval.topK)
-      })
+          .map(f => ({
+            fact: policy.privacy.piiRedaction ? redactForRecall(f, policy.privacy) : f,
+            score: 0,
+            relevance: 0,
+          }))
+      }, () => this.metric.incr(MetricKeys.recallTimeout))
       const elapsed = performance.now() - start
       this.metric.incr(MetricKeys.recall)
       this.metric.record('memory.recall', elapsed)
-      if (policy.retrieval.timeoutMs > 0 && elapsed >= policy.retrieval.timeoutMs) {
-        this.metric.incr(MetricKeys.recallTimeout)
-      }
       span.finish(true)
       return result
     } catch (error) {
@@ -229,13 +237,23 @@ export class MemoryService {
   }
 
   /**
+   * Card options bound to the current policy: one privacy gate shared by the
+   * entity card, `read_user_profile`, the rendered `user.md` view, and the
+   * `user.md` write-back baseline. Without this the view would hide facts the
+   * write-back would then archive as "deleted by the user" (§8.4).
+   */
+  private cardOptions(options: CardOptions = {}): CardOptions {
+    return { privacy: this.policy().privacy.retrievalFilter, ...options }
+  }
+
+  /**
    * Build the aggregated entity card for one canonical entity (design §3.13).
    * Runs within the retrieval budget; on timeout it degrades to an empty card
    * rather than blocking the caller.
    */
   async getCard(entityId: string, options: CardOptions = {}): Promise<EntityCard> {
     const policy = this.policy()
-    const run = buildEntityCard(this.repo, entityId, options)
+    const run = buildEntityCard(this.repo, entityId, this.cardOptions(options))
     return withTimeout(run, policy.retrieval.timeoutMs, async () => ({
       entityId,
       entityName: entityId,
@@ -267,8 +285,16 @@ export class MemoryService {
    */
   async applyUserMdEdits(scope: string, markdown: string): Promise<{ added: number; superseded: number; archived: number }> {
     const parsed = parseUserMd(markdown)
-    // Baseline: the intersection of comment entries with current active facts.
-    const facts = (await this.repo.listScope(scope)).filter(f => f.status === 'active')
+    // Baseline: the facts the rendered view can actually show (same entity, same
+    // privacy tier, non-PII). Diffing against *every* active fact in the scope
+    // made an unchanged re-save archive everything the view cannot represent —
+    // other entities' facts, PII facts, and (under `profile: research`) every
+    // fact at the confidential default tier.
+    const options = this.cardOptions()
+    const entityId = await this.primaryUserEntityId(scope)
+    const facts = entityId === undefined
+      ? []
+      : (await this.repo.byEntity(entityId, { status: ['active'] })).filter(f => cardVisible(f, options))
     const actions = diffUserMdEdits(parsed.lines, { facts })
 
     const now = this.now()
@@ -444,29 +470,42 @@ export class MemoryService {
   }
 
   /**
-   * The session/event entry point: fast-channel capture, then background
-   * extraction + storage (enqueued, never blocking the caller).
+   * The session/event entry point (design §4.2 / §6.4 mode B): the fast channel
+   * is a **deterministic, zero-LLM gate** — a message is captured only when a
+   * configured trigger phrase fires, or when it looks fact-worthy (a
+   * number/date/version/entity signal). Everything else is left alone; the
+   * accepted capture is handed to the background queue, never blocking the
+   * caller.
+   *
+   * @returns whether the message was accepted for capture.
    */
   extractAndRemember(input: { text: string; scope: string; sourceUri?: string }): { accepted: boolean } {
-    // Fast channel: deterministic-rule capture (mode B) always applies first.
-    const accepted = this.captureEnabled
-    if (accepted) {
-      this.queue.enqueue(input.scope, () => this.slowPath(input))
-    }
-    return { accepted }
+    if (!this.captureEnabled) return { accepted: false }
+    const policy = this.policy()
+    const match = matchRules(input.text, policy.extraction.triggers)
+    if (match === null && !looksFactWorthy(input.text)) return { accepted: false }
+    // A trigger match stores the assertion with the trigger phrase stripped
+    // ("记住，项目部署在阿里云" → "项目部署在阿里云"); a fact-worthy hit keeps the
+    // message as-is.
+    const text = match !== null && match.statement.length > 0 ? match.statement : input.text
+    this.queue.enqueue(input.scope, () => this.slowPath({ ...input, text }))
+    return { accepted: true }
   }
 
   private async slowPath(input: { text: string; scope: string; sourceUri?: string }): Promise<void> {
     const policy = this.policy()
     const source = { type: 'conversation' as const, uri: input.sourceUri, credibility: 0.7 }
-    // PII scan: flag/isolate sensitive content before it reaches memory.
+    // PII scan: flag/isolate sensitive content before it reaches memory. The
+    // redacted form is what gets stored, so passwords/IDs/card numbers do not
+    // enter memory at all (§12.7) — the same rule the explicit tool path uses.
     const pii = scanPii(input.text)
+    const text = pii.redacted
 
     let assertions: RawAssertion[] | undefined
     if (this.extract !== undefined && this.llmExtractionEnabled) {
       this.metric.incr(MetricKeys.extractAttempt)
       try {
-        assertions = await this.extract(pii.redacted)
+        assertions = await this.extract(text)
         if (assertions !== undefined && assertions.length > 0) this.metric.incr(MetricKeys.extractSuccess)
         else this.metric.incr(MetricKeys.extractFail)
       } catch {
@@ -476,14 +515,14 @@ export class MemoryService {
     }
 
     if (assertions === undefined || assertions.length === 0) {
-      if (policy.extraction.fallback === 'ignore' || input.text.trim().length === 0) return
+      if (policy.extraction.fallback === 'ignore' || text.trim().length === 0) return
       // fallback 'store_raw_event': persist a low-confidence semantic fact so
       // nothing is silently lost (design §12 backpressure / degradation).
       assertions = [{
         subject: { type: 'user', name: '用户' },
         predicate: 'stated',
-        object: { type: 'concept', name: input.text.slice(0, 80) },
-        content: input.text,
+        object: { type: 'concept', name: text.slice(0, 80) },
+        content: text,
         type: 'semantic',
         confidence: policy.extraction.ruleConfidence,
         privacy: policy.privacy.default,

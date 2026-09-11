@@ -170,7 +170,11 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
         const body = (v.groups ?? [])
           .map(g => `${g.title}\n${g.lines.map(l => `- ${l}`).join('\n')}`)
           .join('\n\n')
-        return [{ type: 'text', text: head || '（暂无画像）' + (body ? `\n\n${body}` : '') }]
+        // `head || '…' + body` used to drop every group whenever a summary
+        // existed: `+` binds tighter than `||`.
+        const sections = [head.length > 0 ? head : '（暂无画像）']
+        if (body.length > 0) sections.push(body)
+        return [{ type: 'text', text: sections.join('\n\n') }]
       },
     },
     async execute(args, exec) {
@@ -181,8 +185,9 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
         ? { entityId: 'user', entityName: '用户', entityType: 'user', updatedAt: 0, count: 0, summary: [], groups: [] }
         : await svc.getCard(entityId)
       const topic = args.topic
-      const groups = (topic === undefined ? card.groups : card.groups.filter(g => g.title === topic))
-        .map(g => ({ title: g.title, lines: g.facts.map(f => f.content) }))
+      const matched = topic === undefined ? card.groups : card.groups.filter(g => g.title === topic)
+      const groups = matched.map(g => ({ title: g.title, lines: g.facts.map(f => f.content) }))
+      if (topic !== undefined && groups.length === 0) groups.push({ title: topic, lines: ['（该主题暂无偏好）'] })
       return { entityId: card.entityId, count: card.count, summary: card.summary, groups }
     },
   })))

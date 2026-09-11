@@ -6,6 +6,114 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (P0 batch B — privacy & wiring, audit 2026-09-11)
+
+Five defects where the plugin's documented privacy/behaviour claims were not
+implemented at all. Both privacy fixes were reviewed as security-relevant
+changes; `docs/code-review-2026-09-11.md` §7 records what was verified.
+
+- **PII no longer reaches the model-facing read path** (§12.7): recall built its
+  filter without any PII dimension, so a fact flagged `pii: true` (e.g. a phone
+  number captured from chat) was injected into the system prompt verbatim and
+  returned by `memory_recall`. The read path now drops PII-flagged facts at
+  every entry point — the recall engine (`excludePii`, default on), the
+  degradation fallback (which bypasses the store query), and therefore the
+  context injection and tool output. The capture path also stores the
+  **redacted** text now, matching the explicit `memory_remember` path, so
+  passwords/IDs/card numbers do not enter memory at all.
+- **`secret` is blocked by default and `confidential` is really redacted**
+  (§12.7): `secretRequiresExplicitAuth` had no reader, so whether a secret was
+  surfaced depended entirely on the tier list; `filterByPrivacy` and
+  `redactForRecall` were dead code (absent from the shipped bundle).
+  Secrets are now dropped unless the operator sets
+  `secretRequiresExplicitAuth: false` **and** the tier list admits `secret`, and
+  `confidential` content is PII-masked and tier-marked on the way out
+  (`[confidential] …`). `privacy.default` / `privacy.retrievalFilter` are now
+  validated as closed sets, so a typo cannot silently widen retrieval.
+- **The fast channel is a real gate** (§4.2/§6.4 mode B): `matchRules` had no
+  call site and was tree-shaken out of the bundle, so with the default config
+  (`captureEnabled: true`, LLM extraction off) **every** direct user message was
+  persisted as a `stated` fact. Capture now requires a configured trigger phrase
+  or a fact-worthy signal (number/date/proper noun/version — the §6.4 mode B
+  pattern), stores the trigger-stripped statement, and honours
+  `extraction.triggers`. Also fixed the trigger stripper leaving the separator
+  behind (`记住，项目部署在阿里云` stored a leading `，`).
+- **`read_user_profile` returned no groups** (`src/adapters/tools.ts`): the
+  render expression `head || '（暂无画像）' + body` evaluated as
+  `head || ('…' + body)`, so every per-topic group was dropped whenever a
+  summary existed — contradicting the README. A `topic` filter that matches
+  nothing now says so instead of returning an empty list.
+- **`recallTimeout` is counted when recall actually degrades**: the metric
+  compared measured elapsed time against the budget, which both missed real
+  timeouts by sub-millisecond rounding (flaky) and counted a successful but slow
+  recall as a degradation. `withTimeout` now reports the timeout it took.
+
+### Tests
+
+- Suite is now **160 unit tests** (was 134):
+  `tests/recall-privacy.test.ts` (9 — PII/secret/confidential on the recall and
+  degradation paths), `tests/capture.test.ts` (8 — the fast-channel gate,
+  redaction, configured triggers), `tests/adapters-tools.test.ts` (8 — the tool
+  registry, `read_user_profile` rendering, tool-level PII handling), plus the
+  trigger-stripper cases in `tests/rules.test.ts`.
+
+### Fixed (P0 batch — data correctness, audit 2026-09-11)
+
+Four data-correctness defects found by the full audit
+(`docs/code-review-2026-09-11.md`), each with a regression test:
+
+- **Non-ASCII predicates are no longer erased** (`src/domain/predicate.ts`): the
+  unknown-predicate fallback stripped every character outside `[a-z0-9_]`, so
+  all Chinese predicates collapsed onto one string (`喜欢瑜伽` and `讨厌瑜伽`
+  both became `____`) and therefore shared a single `semantic_key` — two
+  opposite assertions silently superseded each other. Letters/digits of any
+  script are now preserved; only whitespace and separator punctuation fold to
+  `_`. New `tests/predicate.test.ts` locks non-collision.
+- **The JSON store survives a failed write** (`src/infrastructure/json-repo.ts`):
+  `enqueue` chained with `then(onFulfilled)` only, so one failed `persist()`
+  (file lock / full disk) turned the chain into a permanently rejected promise —
+  after that *every* read and write failed with the stale error, silently (the
+  capture path swallows it). The chain now records completion without carrying
+  failure, a failed write rolls the in-memory state back so memory and disk
+  cannot diverge, and the store refuses writes it could not persist.
+- **A corrupt document can no longer be overwritten by an empty store**
+  (`src/infrastructure/json-repo.ts`, `src/index.ts`): `open()` rethrew on
+  unparsable content, which `void repo.open()` turned into an unhandled
+  rejection while leaving the in-memory store empty — the next write then
+  replaced the whole file with `{"facts":{…one new fact…}}`. Corrupt content is
+  now moved aside to `<file>.corrupt-<ts>` (bytes preserved), an unreadable
+  document puts the store in read-only mode, and the plugin logs the outcome.
+- **`user.md` round-trip is idempotent again** (`src/application/usermd-sync.ts`
+  call site, `src/application/card.ts`, `src/service.ts`): the write-back diffed
+  against *every* active fact in the scope while the view only shows the primary
+  entity's facts in the current privacy tier and non-PII. Re-saving the rendered
+  file therefore archived everything the view could not represent (other
+  entities' facts, PII facts, and — under `profile: research`, whose default
+  tier is `confidential` — the entire profile). The baseline is now exactly the
+  card-visible set, via a shared `cardVisible()` rule, and the card's privacy
+  tier comes from `policy.privacy.retrievalFilter` instead of a hardcoded
+  `['public','private']`. New `tests/usermd-roundtrip.test.ts`.
+- **`profile: research` actually applies** (`src/build-policy.ts`,
+  `src/config.ts`): Cordis resolves the config through the exported schema
+  before `apply()`, and every profile-dependent key carried a `.default()`, so
+  `undefined` was impossible and the `?? researchValue` fallbacks were dead —
+  research ran byte-for-byte as personal (only the log line differed). Those
+  keys no longer carry schema defaults; the §10.2 differences are an explicit
+  per-profile table, with `tests/profile.test.ts` guarding both the table and
+  the "keys stay unset through the schema" property.
+
+### Changed
+
+- `privacy.retrievalFilter` is read as unset when absent **or** empty
+  (schemastery materializes an absent array as `[]`); an empty allow-list would
+  have disabled every recall. Set a non-empty list to override the profile.
+
+### Tests
+
+- Suite is now **134 unit tests** (was 117): `tests/predicate.test.ts` (6),
+  `tests/usermd-roundtrip.test.ts` (4), 3 storage-resilience cases in
+  `tests/json-repo.test.ts`, 4 schema/profile cases in `tests/profile.test.ts`.
+
 ### Added (P3 — 向量/图存储真实化 + 研究 Agent Profile + 观测)
 
 - **Vector/graph storage realized on the read path** (`src/infrastructure/index-backends.ts`,

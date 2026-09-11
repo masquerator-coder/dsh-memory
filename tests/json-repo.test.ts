@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -92,5 +92,59 @@ describe('JsonFileMemoryRepository', () => {
     await repo.delete(fact.id)
     expect(await repo.get(fact.id)).toBeUndefined()
     expect((await repo.stats()).total).toBe(0)
+  })
+
+  it('quarantines a corrupt document instead of overwriting every memory', async () => {
+    const dir = await tempDir()
+    const file = join(dir, 'facts.json')
+    const original = '{"facts":{"keep-me":{"id":"keep-me"'
+    await writeFile(file, original, 'utf8')
+
+    const repo = new JsonFileMemoryRepository(file)
+    // Must not throw: a rejection here used to leave an empty in-memory store
+    // pointed at a good-on-disk file, and the next write wiped it.
+    await expect(repo.open()).resolves.toBeUndefined()
+    const issue = repo.openIssue
+    expect(issue?.kind).toBe('corrupt')
+    expect(issue?.backupPath).toBeDefined()
+
+    await seed(repo, ['Alice 偏好素食'])
+    // The original bytes are preserved, untouched, in the quarantine copy.
+    expect(await readFile(issue!.backupPath!, 'utf8')).toBe(original)
+    // …and the live file holds only the new fact.
+    const persisted = JSON.parse(await readFile(file, 'utf8')) as { facts: Record<string, unknown> }
+    expect(Object.keys(persisted.facts)).toEqual([...Object.keys(persisted.facts)].filter(k => k !== 'keep-me'))
+    expect(JSON.stringify(persisted)).not.toContain('keep-me')
+  })
+
+  it('recovers from a failed write instead of poisoning every later operation', async () => {
+    const dir = await tempDir()
+    const file = join(dir, 'facts.json')
+    // Make the atomic temp write fail: a *directory* at the temp path.
+    await mkdir(`${file}.tmp`, { recursive: true })
+    const repo = new JsonFileMemoryRepository(file)
+    await repo.open()
+
+    await expect(seed(repo, ['第一次写入'])).rejects.toThrow()
+    // The failed write must leave no phantom fact, and reads must stay usable —
+    // previously the rejected chain made them throw the stale write error
+    // forever.
+    await expect(repo.stats()).resolves.toEqual({ active: 0, total: 0 })
+
+    await rm(`${file}.tmp`, { recursive: true, force: true })
+    await seed(repo, ['第二次写入'])
+    const facts = await repo.snapshotFacts()
+    expect(facts.map(f => f.content)).toEqual(['第二次写入'])
+  })
+
+  it('refuses writes when the previous document could not be read at all', async () => {
+    const dir = await tempDir()
+    // A directory as the data file: readable neither as a document nor safely
+    // movable, so the store must go read-only rather than overwrite it.
+    const repo = new JsonFileMemoryRepository(dir)
+    await expect(repo.open()).resolves.toBeUndefined()
+    expect(repo.openIssue?.kind).toBe('unreadable')
+    expect(repo.isReadOnly).toBe(true)
+    await expect(seed(repo, ['不应写入'])).rejects.toThrow(/refusing to write/)
   })
 })

@@ -30,6 +30,21 @@ function privacyVisible(privacy: PrivacyLevel, tiers: readonly PrivacyLevel[]): 
 }
 
 /**
+ * Whether a fact is representable in the rendered card / `user.md` view.
+ *
+ * Single source of truth: the writer that imports a hand-edited `user.md` must
+ * treat exactly this set as "the facts the view shows". Any fact the view
+ * cannot represent (another entity's, another privacy tier, PII) must be left
+ * untouched rather than read as "the user removed it".
+ */
+export function cardVisible(fact: AtomicFact, options: CardOptions = {}): boolean {
+  const tiers = options.privacy ?? DEFAULT_PRIVACY
+  if (!privacyVisible(fact.privacy, tiers)) return false
+  if ((options.redactPii ?? true) && fact.pii) return false
+  return true
+}
+
+/**
  * Build the entity card for one canonical entity id from the repository.
  * Non-throwing by design: an unknown entity yields an empty card, never an
  * error, so callers (tools, injection) degrade cleanly.
@@ -42,7 +57,6 @@ export async function buildEntityCard(
   const tiers = options.privacy ?? DEFAULT_PRIVACY
   const summaryMax = options.summaryMax ?? DEFAULT_SUMMARY_MAX
   const summaryTokens = options.summaryTokens ?? DEFAULT_SUMMARY_TOKENS
-  const redactPii = options.redactPii ?? true
 
   const facts = await repo.byEntity(entityId, {
     status: ['active'],
@@ -66,7 +80,7 @@ export async function buildEntityCard(
   }
 
   const visible: CardFact[] = facts
-    .filter(f => !(redactPii && f.pii))
+    .filter(f => cardVisible(f, options))
     .map(f => toCardFact(f))
     // Highest confidence first, then most recent.
     .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)

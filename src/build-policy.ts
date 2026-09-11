@@ -3,9 +3,16 @@
  * (design doc §10.3 hot-update: apply() holds the latest policy; in-flight
  * work snapshots it). Pure and testable.
  *
+ * The personal/research differences of design §10.2 are expressed as an
+ * explicit per-profile defaults table below, not as scattered ternaries: the
+ * profile-dependent config keys carry **no schema default** (see
+ * `src/config.ts`), so `undefined` reliably means "the deployment did not set
+ * it" and the table value applies. Personal resolves to the exact P0 defaults.
+ *
  * @module dsh-memory/build-policy
  */
 import type { Config } from './config.ts'
+import type { PrivacyLevel } from './domain/fact.ts'
 import type {
   AgentProfileKind,
   ForgettingPolicy,
@@ -20,22 +27,81 @@ export function resolveProfileKind(profile: string | undefined): AgentProfileKin
   return profile === 'research' || profile === 'research-agent' ? 'research' : 'personal'
 }
 
-export function buildPolicy(config: Config): MemoryPolicy {
-  const kind = resolveProfileKind(config.profile)
-  const research = kind === 'research'
+/** The profile-dependent slice of the policy (§10.2). */
+interface ProfileDefaults {
+  readonly versions: RetrievalPolicy['versions']
+  readonly maxDepth: number
+  readonly maxFanoutPerEntity: number
+  readonly maxCandidates: number
+  readonly forgetting: ForgettingPolicy
+  readonly privacyDefault: PrivacyLevel
+  readonly retrievalFilter: readonly PrivacyLevel[]
+}
+
+/**
+ * §10.2 profile differences, verbatim.
+ *
+ * personal — only `active` versions, a small graph fan-out, strong TTL, strict
+ * privacy, no confidential evidence.
+ * research — reads every version (evolution / contradiction analysis), allows a
+ * larger pruned fan-out, keeps history with weaker decay and longer TTL, and may
+ * surface `confidential` evidence.
+ */
+const PROFILE_DEFAULTS: Record<AgentProfileKind, ProfileDefaults> = {
+  personal: {
+    versions: 'active',
+    maxDepth: 2,
+    maxFanoutPerEntity: 30,
+    maxCandidates: 200,
+    forgetting: {
+      semantic: { ttl: '365d', lambda: 0.001 },
+      episodic: { ttl: '90d', lambda: 0.02 },
+      procedural: { ttl: '365d', lambda: 0.005 },
+      working: { ttl: null, lambda: 0 },
+    },
+    privacyDefault: 'private',
+    retrievalFilter: ['public', 'private'],
+  },
+  research: {
+    versions: 'all',
+    maxDepth: 3,
+    maxFanoutPerEntity: 60,
+    maxCandidates: 400,
+    forgetting: {
+      semantic: { ttl: '730d', lambda: 0.0001 },
+      episodic: { ttl: '365d', lambda: 0.005 },
+      procedural: { ttl: '730d', lambda: 0.001 },
+      working: { ttl: null, lambda: 0 },
+    },
+    privacyDefault: 'confidential',
+    retrievalFilter: ['public', 'private', 'confidential'],
+  },
+}
+
+/**
+ * `undefined` for an absent/empty list. Schemastery materializes an absent
+ * `z.array()` as `[]`, which must not be mistaken for "the deployment chose an
+ * empty list" (that would allow no privacy tier at all).
+ */
+function nonEmpty<T>(value: readonly T[] | undefined): readonly T[] | undefined {
+  return value !== undefined && value.length > 0 ? value : undefined
+}
+
+export function buildPolicy(config: Config): MemoryPolicy {  const kind = resolveProfileKind(config.profile)
+  const defaults = PROFILE_DEFAULTS[kind]
 
   const retrieval: RetrievalPolicy = {
     topK: config.retrieval?.topK ?? 20,
     maxTokens: config.retrieval?.maxTokens ?? 800,
     timeoutMs: config.retrieval?.timeoutMs ?? 80,
     // personal: only active; research: all versions (evolution/contradiction).
-    versions: config.retrieval?.versions ?? (research ? 'all' : 'active'),
+    versions: config.retrieval?.versions ?? defaults.versions,
     graph: {
       // research allows a larger, pruned fan-out (§10.2 "可较大,带剪枝").
-      maxDepth: config.retrieval?.graph?.maxDepth ?? (research ? 3 : 2),
+      maxDepth: config.retrieval?.graph?.maxDepth ?? defaults.maxDepth,
       maxSeedEntities: config.retrieval?.graph?.maxSeedEntities ?? 5,
-      maxFanoutPerEntity: config.retrieval?.graph?.maxFanoutPerEntity ?? (research ? 60 : 30),
-      maxCandidates: config.retrieval?.graph?.maxCandidates ?? (research ? 400 : 200),
+      maxFanoutPerEntity: config.retrieval?.graph?.maxFanoutPerEntity ?? defaults.maxFanoutPerEntity,
+      maxCandidates: config.retrieval?.graph?.maxCandidates ?? defaults.maxCandidates,
       relationWhitelist: config.retrieval?.graph?.relationWhitelist ?? [],
     },
     ranking: {
@@ -48,36 +114,31 @@ export function buildPolicy(config: Config): MemoryPolicy {
   }
 
   // research keeps history: weaker decay + longer TTL (§10.2 "保留历史").
-  const forgetting: ForgettingPolicy = research
-    ? {
-        semantic: { ttl: config.forgetting?.semantic?.ttl ?? '730d', lambda: config.forgetting?.semantic?.lambda ?? 0.0001 },
-        episodic: { ttl: config.forgetting?.episodic?.ttl ?? '365d', lambda: config.forgetting?.episodic?.lambda ?? 0.005 },
-        procedural: { ttl: config.forgetting?.procedural?.ttl ?? '730d', lambda: config.forgetting?.procedural?.lambda ?? 0.001 },
-        working: { ttl: config.forgetting?.working?.ttl ?? null, lambda: config.forgetting?.working?.lambda ?? 0 },
-      }
-    : {
-        semantic: {
-          ttl: config.forgetting?.semantic?.ttl ?? '365d',
-          lambda: config.forgetting?.semantic?.lambda ?? 0.001,
-        },
-        episodic: {
-          ttl: config.forgetting?.episodic?.ttl ?? '90d',
-          lambda: config.forgetting?.episodic?.lambda ?? 0.02,
-        },
-        procedural: {
-          ttl: config.forgetting?.procedural?.ttl ?? '365d',
-          lambda: config.forgetting?.procedural?.lambda ?? 0.005,
-        },
-        working: {
-          ttl: config.forgetting?.working?.ttl ?? null,
-          lambda: config.forgetting?.working?.lambda ?? 0,
-        },
-      }
+  const forgetting: ForgettingPolicy = {
+    semantic: {
+      ttl: config.forgetting?.semantic?.ttl ?? defaults.forgetting.semantic.ttl,
+      lambda: config.forgetting?.semantic?.lambda ?? defaults.forgetting.semantic.lambda,
+    },
+    episodic: {
+      ttl: config.forgetting?.episodic?.ttl ?? defaults.forgetting.episodic.ttl,
+      lambda: config.forgetting?.episodic?.lambda ?? defaults.forgetting.episodic.lambda,
+    },
+    procedural: {
+      ttl: config.forgetting?.procedural?.ttl ?? defaults.forgetting.procedural.ttl,
+      lambda: config.forgetting?.procedural?.lambda ?? defaults.forgetting.procedural.lambda,
+    },
+    working: {
+      ttl: config.forgetting?.working?.ttl ?? defaults.forgetting.working.ttl,
+      lambda: config.forgetting?.working?.lambda ?? defaults.forgetting.working.lambda,
+    },
+  }
 
   const privacy: PrivacyPolicy = {
-    default: config.privacy?.default ?? (research ? 'confidential' : 'private'),
+    default: config.privacy?.default ?? defaults.privacyDefault,
     // research may surface confidential evidence (§10.2 "可配置").
-    retrievalFilter: config.privacy?.retrievalFilter ?? (research ? ['public', 'private', 'confidential'] : ['public', 'private']),
+    // schemastery hands back `[]` for an absent array, so "empty" must be read
+    // as unset: an empty allow-list would silently disable every recall.
+    retrievalFilter: nonEmpty(config.privacy?.retrievalFilter) ?? defaults.retrievalFilter,
     secretRequiresExplicitAuth: config.privacy?.secretRequiresExplicitAuth ?? true,
     piiRedaction: config.privacy?.piiRedaction ?? true,
   }
@@ -95,7 +156,7 @@ export function buildPolicy(config: Config): MemoryPolicy {
   }
 
   return {
-    profile: config.profile ?? (research ? 'research' : 'personal'),
+    profile: config.profile ?? kind,
     profileKind: kind,
     retrieval,
     extraction: {
