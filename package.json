@@ -12,8 +12,7 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "prepare": "tsdown"
+    "test": "vitest run"
   },
   "dependencies": {},
   "devDependencies": {

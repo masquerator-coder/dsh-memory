@@ -100,7 +100,8 @@ mirror the design's Profile (§10). Selected defaults:
 
 ```bash
 # From within the profile that should host it:
-dsh plugin add dsh-memory@next        # or a git / local path
+dsh plugin add "https://github.com/masquerator-coder/dsh-memory.git"
+# or a tag / branch / registry spec / local path, e.g. dsh plugin add dsh-memory@next
 ```
 
 The plugin's `package.json` declares `dsh.bundle.patch: ./cordis.patch.yml`, so
@@ -110,13 +111,30 @@ the loader auto-inserts the `memory` row. To persist fact storage, patch
 To enable LLM extraction, add `extraction.provider`, `extraction.model`, and
 `llmExtractionEnabled: true` to the `memory` row.
 
+### Git installs need no `allowBuilds` key
+
+pnpm refuses to run a git dependency's install-time scripts until the consumer
+allowlists it, and that allowlist key embeds the commit SHA — so a plugin built
+by `prepare` forces every consumer to re-approve on **every** push. This package
+therefore declares **no `prepare` script** and **commits the built `lib/`**:
+`dsh plugin add <git-url>` works on any machine with no allowlist edit, and
+`dsh plugin update` keeps working.
+
+### Contributor rule: `src/` and `lib/` ship in the same commit
+
+`lib/` is the distributable artifact (`files` ships `lib/` + `cordis.patch.yml`)
+and is tracked on purpose. **Any change under `src/` — or to `cordis.patch.yml`
+/ `package.json` — must be followed by `pnpm build` and the rebuilt `lib/`
+committed together**, otherwise consumers install a stale build (git installs no
+longer rebuild from source). Run `pnpm typecheck && pnpm test` before committing.
+
 ## Development
 
 ```bash
 pnpm install
 pnpm typecheck      # tsc --noEmit
 pnpm test           # vitest run
-pnpm build          # tsdown -> lib/
+pnpm build          # tsdown -> lib/   (rebuild AND commit lib/ with any src change)
 ```
 
 ---

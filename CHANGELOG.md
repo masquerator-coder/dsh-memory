@@ -20,6 +20,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pipeline is testable without a full Cordis context. `index.ts` resolves the
   `llm` service once at the call site.
 
+### Packaging
+
+- **Git installs need no `allowBuilds` key any more.** Dropped the `prepare`
+  script and started committing the built `lib/` (`lib/` removed from
+  `.gitignore`). pnpm only demands an allowlist entry when a git dependency runs
+  an install-time script, and that key embeds the commit SHA — so the old
+  `prepare: tsdown` install forced every consumer to re-approve on every push.
+  `lib/` is now the shipped artifact: rebuild and commit it together with any
+  `src/` change (see README → Install & mount).
+
 ### Tests
 
 - `tests/recall.test.ts`: added recency-decay cases (per-type lambda ordering,
