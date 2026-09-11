@@ -32,6 +32,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "steps-as-content" into typed steps (tool / depends_on / on_failure /
   rollback). Procedural payload is not part of the semantic identity.
 
+### Fixed (P2)
+
+- **`parseUserMd` H1 entity recovery**: the `# User Profile: <name>` heading is
+  now parsed to just the entity name (the template prefix is stripped), so a
+  parsed `entity` matches the rendered `card.entityName`. Previously the whole
+  heading text (`User Profile: Alice`) leaked through.
+
 ### Changed (P1 hardening)
 
 - **Per-memory-type recency decay in fusion ranking** (`src/application/recall.ts`):

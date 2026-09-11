@@ -27,7 +27,11 @@ export function parseUserMd(markdown: string): ParsedUserMd {
 
     const h1 = line.match(H1_RE)
     if (h1 !== null && h1 !== undefined) {
-      entity = h1[1].trim()
+      // The template renders `# User Profile: <name>`; recover just the name.
+      // Tolerate any other H1 by falling back to the raw heading text.
+      const title = h1[1].trim()
+      const prefix = /^User Profile:\s*/i
+      entity = title.replace(prefix, '').trim() || title
       continue
     }
     const h3 = line.match(H3_RE)
