@@ -1,2 +1,6 @@
-.workbuddy/
+node_modules/
+lib/
+*.tsbuildinfo
 docs/diagrams/
+*.tgz
+.DS_Store

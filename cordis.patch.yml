@@ -1,31 +1,22 @@
-# dsh-memory — bundle patch
+# dsh-memory bundle layer.
 #
-# Applied automatically when the package is installed as a profile bundle:
-# `dsh plugin --profile <name> add <spec>` mounts this file as that bundle
-# layer's loader patch. The loader resolves `name: dsh-memory` against the
-# profile's dependency graph, then calls the package's `apply` with `config`.
-
+# Mounts the memory plugin into the runtime's plugin tree. This is an insert
+# (not an id-targeted override) because the base layer has no row of id
+# `memory` — insert rows carry a `name`; override rows, which would omit it,
+# are for replacing an existing loader id.
+#
+# `dataFile` defaults to empty (in-memory). To persist across restarts, set it
+# to a real path in your profile's cordis.patch.yml, e.g.:
+#   - id: memory
+#     name: dsh-memory
+#     config:
+#       dataFile: "~/.dsh/memory/facts.json"
 - insert:
     - id: memory
       name: dsh-memory
       config:
-        enableInjection: true # always-on Tier-0 memory section in the system prompt
-        # timeInjection: true         # prepend current real-world date (internet-anchored, local tz) to the system prompt
-        # timeRefreshIntervalMs: 900000  # ms between internet date re-pins (default 15 min)
-        # customPromptEnabled: true  # master switch for the custom prompt section (default true)
-        # customSystemPrompt: |      # user-authored instruction injected verbatim on every session
-        #   - 先给结论，再给依据。
-        #   - 中文为主，保留英文术语原样。
-        # forgetEnabled: true     # active forgetting (demote/archive/hard-delete)
-        # forgetDays:             # expected time-to-forget (days until heat ≈ 0.05)
-        #   env: 365
-        #   lesson: 180
-        #   decision: 90
-        #   general: 60
-        # windowDays: 30          # frequency sliding window (recall-count boost)
-        # episodeRetentionDays: 180  # episodes older than this are archived
-        # budgetTier0: 900
-        # budgetUser: 400
-        # budgetMemory: 500
-        # importanceThreshold: 3
-        # memoryHome: /abs/path    # override storage dir (default <DSH_HOME>/memory)
+        profile: personal
+        injectContext: true
+        captureEnabled: true
+        llmExtractionEnabled: false
+        dataFile: ""

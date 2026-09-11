@@ -1,0 +1,6 @@
+# Allow the esbuild postinstall (downloads the platform binary) to run and any
+# other native build scripts the toolchain pulls in. pnpm runs a sub-install in
+# a temp checkout of this repo when preparing the plugin; an un-allowlisted
+# build script would fail that sub-install.
+allowBuilds:
+  esbuild: true
