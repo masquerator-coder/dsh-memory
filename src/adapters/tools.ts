@@ -201,7 +201,8 @@ export function registerMemoryTools(tc: ToolContext): (() => void)[] {
  * scope has no user-typed facts (an empty profile).
  */
 async function primaryUserEntity(svc: MemoryService, scope: string): Promise<string | undefined> {
-  const facts = await svc.repo.listScope(scope)
+  // Include `global` facts so the shared/user card is not empty in a fresh session.
+  const facts = await svc.repo.listScopeIncludingGlobal(scope)
   let best: string | undefined
   let bestCount = 0
   const counts = new Map<string, number>()

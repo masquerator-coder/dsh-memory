@@ -87,3 +87,25 @@ function guessSubject(text: string, triggerIdx: number): string | undefined {
 export function looksFactWorthy(text: string): boolean {
   return /\d{2,}|[A-Z][a-z]+\s+[A-Z][a-z]+|版本|版本号|v\d+/.test(text)
 }
+
+/**
+ * Heuristic guard against capturing a pasted terminal/console dump as memory.
+ * Multi-line command output (a `pnpm test` transcript, an installer error log,
+ * a shell history) is not durable user knowledge and pollutes the store with
+ * low-value `stated` facts. We only reject when the text is clearly multi-line
+ * machine output: a shell prompt, or a build/test/error transcript signal.
+ *
+ * Conservative by design: single-line commands/queries (e.g. "跑一下 pnpm test",
+ * "为什么 EPERM？") pass through so the fast channel still works for normal talk.
+ */
+export function looksLikeTerminalDump(text: string): boolean {
+  const norm = text.trim()
+  if (!norm.includes('\n') && !norm.includes('\r')) return false
+
+  // A shell prompt anywhere in a multi-line message (PS >, C:\>, user@host~$ …).
+  const hasShellPrompt = /(?:^|\n)\s*(?:PS\s+[^\n>]*>|C:\\[^\n>]*>|[a-zA-Z_-]+@[^\n:]*[>:~$])/m.test(norm)
+  const transcript = /Test Files|Tests\s+(?:passed|failed)|\bvitest\b|\bpnpm\s+\w+\b|\bnpm\s+\w+\b|\[\s*\d+\/\d+\s*\]|ELIFECYCLE|ERR_[A-Z_]+|error\s+TS\d+/i
+
+  return hasShellPrompt
+    || (transcript.test(norm) && norm.split(/\r?\n/).length >= 3)
+}

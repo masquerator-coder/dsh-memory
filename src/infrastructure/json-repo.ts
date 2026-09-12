@@ -342,6 +342,24 @@ export class JsonFileMemoryRepository implements MemoryRepository {
     return [...ids].map(id => this.facts.get(id)!).filter(Boolean)
   }
 
+  async listScopeIncludingGlobal(scope: string): Promise<AtomicFact[]> {
+    await this.chain
+    if (scope === 'global') return this.listScope('global')
+    const seen = new Set<string>()
+    const out: AtomicFact[] = []
+    for (const s of [scope, 'global']) {
+      const ids = this.byScope.get(s)
+      if (ids === undefined) continue
+      for (const id of ids) {
+        if (seen.has(id)) continue
+        seen.add(id)
+        const fact = this.facts.get(id)
+        if (fact !== undefined) out.push(fact)
+      }
+    }
+    return out
+  }
+
   async bySemanticKey(key: string): Promise<AtomicFact[]> {
     await this.chain
     const fact = this.byKey.get(key)

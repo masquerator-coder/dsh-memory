@@ -115,4 +115,20 @@ describe('fast-channel gate', () => {
     await h.drain('s')
     expect(await h.stored('s')).toEqual(['项目部署在阿里云 ACK'])
   })
+
+  it('rejects a pasted terminal dump even when it has a trigger or version text', async () => {
+    const h = await harness()
+    const dump = [
+      'PS D:\\Apps\\deepseek-harness> pnpm test',
+      '$ vitest run',
+      ' Test Files  16 passed (16)',
+      '      Tests  84 passed (84)',
+      'PS D:\\Apps\\deepseek-harness>',
+    ].join('\n')
+    // Contains a trigger and digits — but because it is a multi-line terminal
+    // transcript it must NOT be captured as durable memory.
+    expect(h.accepted(dump)).toBe(false)
+    await h.drain('s')
+    expect(await h.stored('s')).toEqual([])
+  })
 })

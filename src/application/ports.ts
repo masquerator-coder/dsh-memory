@@ -65,6 +65,13 @@ export interface MemoryRepository {
   get(id: string): Promise<AtomicFact | undefined>
   /** All facts for a scope. */
   listScope(scope: string): Promise<AtomicFact[]>
+  /**
+   * All facts for a scope **plus** the `global` scope (deduplicated). The read
+   * side uses this so `global` facts — which are shared across sessions — are
+   * never hidden from a session-scoped profile/recall. The plain `listScope` is
+   * kept exact-scope so `forgetAll`/consolidation never touch `global`.
+   */
+  listScopeIncludingGlobal(scope: string): Promise<AtomicFact[]>
   /** Facts matching a canonical semantic_key. */
   bySemanticKey(key: string): Promise<AtomicFact[]>
   /** Highest-version fact for a semantic_key (for conflict resolution). */

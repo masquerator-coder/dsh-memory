@@ -66,6 +66,9 @@ export function privacyAllowed(level: PrivacyLevel, filter: readonly PrivacyLeve
  * recall engine's local guard:
  *
  * - `scope` / `status` / `types` / `indexState` / `now` — the plain selectors;
+ * - `scope` treats the `global` scope as shared: a fact scoped `global` is
+ *   visible to every scope's read path, so cross-session/short-lived global
+ *   facts are never hidden from a session-scoped recall;
  * - `privacy` — the tier list the deployment allows to be surfaced;
  * - `pii: true` — *only* PII facts (a selector, not a filter);
  * - `excludePii` — drop PII-flagged facts (the model-facing default: PII is
@@ -74,7 +77,7 @@ export function privacyAllowed(level: PrivacyLevel, filter: readonly PrivacyLeve
  *   surfacing them requires explicit authorization the plugin does not model.
  */
 export function factAllowed(fact: AtomicFact, filter: FactFilter): boolean {
-  if (filter.scope !== undefined && fact.scope !== filter.scope) return false
+  if (filter.scope !== undefined && fact.scope !== filter.scope && fact.scope !== 'global') return false
   if (filter.status !== undefined && !filter.status.includes(fact.status)) return false
   if (filter.privacy !== undefined && !filter.privacy.includes(fact.privacy)) return false
   if (filter.excludeSecret === true && fact.privacy === 'secret') return false

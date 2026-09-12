@@ -27,7 +27,7 @@ import { rememberOne, type StoreOutcome } from './application/remember.ts'
 import { recall, type RecallQuery, type ScoredMemory } from './application/recall.ts'
 import { consolidateScope } from './application/consolidate.ts'
 import { scanPii, filterByPrivacy, redactForRecall } from './application/privacy.ts'
-import { matchRules, looksFactWorthy } from './extraction/rules.ts'
+import { matchRules, looksFactWorthy, looksLikeTerminalDump } from './extraction/rules.ts'
 import { ScopeQueue } from './infrastructure/queue.ts'
 import { composeIndexRead } from './infrastructure/index-backends.ts'
 import { withTimeout } from './util/timeout.ts'
@@ -209,7 +209,7 @@ export class MemoryService {
         // research. This path bypasses the store query, so it must apply the
         // privacy gate itself (§12.7): no PII, no unauthorized secret.
         const statuses = policy.retrieval.versions === 'all' ? ['active', 'superseded'] : ['active']
-        const fallback = await this.repo.listScope(query.scope)
+        const fallback = await this.repo.listScopeIncludingGlobal(query.scope)
         const visible = filterByPrivacy(
           fallback.filter(f => statuses.includes(f.status) && !isExpired(f, this.now()) && !f.pii),
           policy.privacy,
@@ -347,7 +347,8 @@ export class MemoryService {
   }
 
   private async primaryUserEntityId(scope: string): Promise<string | undefined> {
-    const facts = await this.repo.listScope(scope)
+    // Include `global` facts so cross-session/shared user facts feed the card.
+    const facts = await this.repo.listScopeIncludingGlobal(scope)
     let best: string | undefined
     let bestCount = 0
     const counts = new Map<string, number>()
@@ -482,6 +483,9 @@ export class MemoryService {
   extractAndRemember(input: { text: string; scope: string; sourceUri?: string }): { accepted: boolean } {
     if (!this.captureEnabled) return { accepted: false }
     const policy = this.policy()
+    // Pasted terminal/console dumps are not durable user knowledge — drop them
+    // before the fact-worthy / trigger rules can admit a whole transcript.
+    if (looksLikeTerminalDump(input.text)) return { accepted: false }
     const match = matchRules(input.text, policy.extraction.triggers)
     if (match === null && !looksFactWorthy(input.text)) return { accepted: false }
     // A trigger match stores the assertion with the trigger phrase stripped

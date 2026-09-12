@@ -85,6 +85,52 @@ describe('JsonFileMemoryRepository', () => {
     expect(neighbors).toContain(fact.object.id)
   })
 
+  it('listScopeIncludingGlobal merges scope + global but listScope stays exact', async () => {
+    const repo = new JsonFileMemoryRepository()
+    await seed(repo, [
+      '会话内事实',
+    ])
+    // Add a global-scoped fact alongside the session-scoped one.
+    const res = resolver()
+    const globalFact = buildFact(raw('全局共享事实', { scope: 'global' }), {
+      resolver: res,
+      forgetting: policy.forgetting,
+      defaultPrivacy: 'private',
+      now: 1000,
+      idOverride: 'id-global-1',
+    })
+    await repo.put(globalFact)
+
+    // Exact scope: only the session fact.
+    const exact = await repo.listScope('session:abc')
+    expect(exact.map(f => f.content)).toEqual(['会话内事实'])
+    // Including global: both, deduplicated.
+    const merged = await repo.listScopeIncludingGlobal('session:abc')
+    expect(merged.map(f => f.content).sort()).toEqual(['会话内事实', '全局共享事实'].sort())
+
+    // scope==='global' path is a passthrough to the exact global scope.
+    expect((await repo.listScopeIncludingGlobal('global')).length).toBe(1)
+  })
+
+  it('recall query admits global-scoped facts under a session scope filter', async () => {
+    const repo = new JsonFileMemoryRepository()
+    await seed(repo, ['会话内事实'])
+    const res = resolver()
+    const globalFact = buildFact(raw('全局偏好用 Go', { scope: 'global' }), {
+      resolver: res,
+      forgetting: policy.forgetting,
+      defaultPrivacy: 'private',
+      now: 1000,
+      idOverride: 'id-global-2',
+    })
+    await repo.put(globalFact)
+
+    // The query path applies the shared read gate, which lets global facts
+    // through even though the filter scope is a session.
+    const hits = await repo.query({ scope: 'session:abc', status: ['active'] }, ['Go'], [])
+    expect(hits.map(h => h.fact.content)).toContain('全局偏好用 Go')
+  })
+
   it('delete removes the fact and its indexes', async () => {
     const repo = new JsonFileMemoryRepository()
     await seed(repo, ['事实 A'])

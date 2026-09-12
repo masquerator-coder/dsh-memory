@@ -133,6 +133,7 @@ describe('the degradation fallback is gated too', () => {
       },
       get: inner.get.bind(inner),
       listScope: inner.listScope.bind(inner),
+      listScopeIncludingGlobal: inner.listScopeIncludingGlobal.bind(inner),
       put: inner.put.bind(inner),
       delete: inner.delete.bind(inner),
       bySemanticKey: inner.bySemanticKey.bind(inner),
