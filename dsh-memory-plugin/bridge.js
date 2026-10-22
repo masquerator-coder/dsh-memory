@@ -208,10 +208,19 @@ export class BridgeClient {
         this.logger.warn(`[dsh-memory] non-JSON line from bridge: ${line.slice(0, 300)}`)
         continue
       }
-      const entry = this.pending.shift()
+      // Match by the response id, not arrival order: several HTTP routes share
+      // this bridge, so requests interleave, and a timed-out request that has
+      // already left `pending` must not shift the next answer onto a
+      // neighbour's promise.
+      const at = message.id === undefined ? -1 : this.pending.findIndex((item) => item.id === message.id)
+      const entry = at >= 0 ? this.pending[at] : this.pending.shift()
       if (!entry) {
         this.logger.warn('[dsh-memory] bridge answered with no request pending')
         continue
+      }
+      if (at >= 0) this.pending.splice(at, 1)
+      else if (message.id !== undefined) {
+        this.logger.warn(`[dsh-memory] bridge answered an unknown id: ${String(message.id).slice(0, 40)}`)
       }
       clearTimeout(entry.timer)
       if (message.ok) {
@@ -239,7 +248,8 @@ export class BridgeClient {
     const child = this.ensureChild()
     if (signal?.aborted) throw new BridgeError('请求已取消', 'ABORTED')
     this.seq += 1
-    const body = `${JSON.stringify({ id: `h${this.seq}`, command, payload })}\n`
+    const requestId = `h${this.seq}`
+    const body = `${JSON.stringify({ id: requestId, command, payload })}\n`
     return await new Promise((resolve, reject) => {
       let entry
       const remove = () => {
@@ -253,6 +263,9 @@ export class BridgeClient {
         reject(new BridgeError('请求已取消', 'ABORTED'))
       }
       entry = {
+        // The id lets `onStdout` answer exactly the request that produced this
+        // line, instead of relying on FIFO order across concurrent callers.
+        id: requestId,
         timer: setTimeout(() => {
           remove()
           reject(new BridgeError(`记忆桥无响应（${command}）`, 'TIMEOUT'))

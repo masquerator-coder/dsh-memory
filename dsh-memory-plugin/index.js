@@ -341,6 +341,15 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Digest runs in progress, keyed by scope identity.
+   *
+   * Automatic generation fires per idle session and the settings page can ask
+   * for one at the same time, so without this guard two runs would write two
+   * digests for the same scope.
+   */
+  const digestInFlight = new Map()
+
+  /**
  * Plan a digest, ask the model to write it, and commit it.
  * @param {object} options - generation options.
  * @param {string} [options.cwd] - project working directory.
@@ -357,6 +366,40 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
     if (scopeName === 'project' && !projectId) {
       throw new BridgeError('无法确定当前项目：会话没有工作目录', 'NO_PROJECT')
     }
+    // Several sessions can go idle at once, and the manual button can fire
+    // while an automatic run is mid-flight. Two overlapping runs would each
+    // pay for a model call and then commit two digests for the same scope, so
+    // a second caller joins the first instead of starting its own.
+    //
+    // The joined caller does not forward its own `signal`: aborting one
+    // client must not cancel a run that other callers are waiting on.
+    const key = `${scopeName}:${scopeName === 'project' ? projectId : ''}`
+    const running = digestInFlight.get(key)
+    if (running) {
+      if (reason === 'auto') return { digest: null, skipped: 'in-flight' }
+      try {
+        return await running
+      } catch {
+        // The earlier run failed; fall through and try once more.
+      }
+    }
+    const task = runDigest({ scopeName, projectId, signal, reason, length })
+    digestInFlight.set(key, task)
+    try {
+      return await task
+    } finally {
+      // Only the owner removes the entry, so a late finisher cannot clear a
+      // run that replaced it.
+      if (digestInFlight.get(key) === task) digestInFlight.delete(key)
+    }
+  }
+
+  /**
+   * The body of one digest run, without the in-flight bookkeeping.
+   * @param {object} options - resolved scope identity and generation options.
+   * @returns {Promise<any>} `{ digest }` as committed.
+   */
+  async function runDigest({ scopeName, projectId, signal, reason, length }) {
     const plan = await call(
       'digest.plan',
       {

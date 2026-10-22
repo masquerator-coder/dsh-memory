@@ -551,8 +551,8 @@ window.__ModuleLoader__.load({
       const [length, setLength] = useState(1000)
       const [savingLength, setSavingLength] = useState(false)
       const [lengthNote, setLengthNote] = useState(null)
-      // Last value the server confirmed. Slider changes commit only once the
-      // user pauses, so a drag does not fire one write per tick.
+      // Last value the server confirmed. The slider only updates `length`, so
+      // a drag never writes; the debounced effect below commits on settle.
       const [savedLength, setSavedLength] = useState(1000)
 
       // profile
@@ -628,28 +628,47 @@ window.__ModuleLoader__.load({
         void loadDigest('project')
       }, [loadStatus, loadProfile, loadDigest])
 
-      // Debounced commit: after the slider settles on a new preset for a beat,
+      // Debounced commit: once the slider settles on a new preset for a beat,
       // write it. A range input fires `onChange` on every step, so writing
       // directly there would send one request per tick.
+      //
+      // Refs hold the newest values so the timer and the unmount flush never
+      // read a stale closure, and neither effect depends on `savedLength`
+      // (a landed save must not re-arm the timer).
       const savedLengthRef = React.useRef(savedLength)
       savedLengthRef.current = savedLength
       const lengthRef = React.useRef(length)
       lengthRef.current = length
+
       React.useEffect(() => {
         if (typeof length !== 'number' || length === savedLengthRef.current) return undefined
         const timer = setTimeout(() => {
-          // Compare against the ref again: a save may have landed meanwhile.
-          if (length !== savedLengthRef.current) void saveLength(length)
+          // Re-check: a save may have landed while the timer was pending.
+          if (lengthRef.current !== savedLengthRef.current) void saveLength(lengthRef.current)
         }, 400)
         return () => clearTimeout(timer)
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [length])
 
-      // Flush a pending change if the page unmounts mid-drag.
+      // Flush a pending change if the page unmounts before the timer fires.
+      // The component is going away, so this deliberately skips React state:
+      // calling setState on an unmounted tree is a no-op warning, and there is
+      // no UI left to update. A keepalive POST survives the navigation.
       React.useEffect(() => {
         return () => {
-          if (typeof lengthRef.current === 'number' && lengthRef.current !== savedLengthRef.current) {
-            void saveLength(lengthRef.current)
+          const pending = lengthRef.current
+          if (pending === savedLengthRef.current) return
+          try {
+            void fetch(ROUTE_SETTINGS, {
+              method: 'POST',
+              credentials: 'same-origin',
+              cache: 'no-store',
+              keepalive: true,
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ length: pending }),
+            })
+          } catch {
+            // Best effort: the next load reconciles from the server.
           }
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -663,9 +682,13 @@ window.__ModuleLoader__.load({
         setLengthNote(null)
         try {
           const result = await api(ROUTE_SETTINGS, { length: nextLength })
+          // Trust the server's echo, falling back to what we sent.
           const saved = result?.settings?.settings?.length ?? nextLength
-          setLength(saved)
           setSavedLength(saved)
+          // Only reconcile the slider if the user has not moved it since this
+          // request went out; otherwise the echo would yank the thumb back
+          // mid-drag.
+          setLength((current) => (current === nextLength ? saved : current))
           setLengthNote({ kind: 'ok', text: '摘要长度已保存' })
         } catch (error) {
           // Keep the slider where the user put it; the note explains why the
