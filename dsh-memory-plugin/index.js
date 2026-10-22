@@ -12,7 +12,7 @@
  * @module dsh-memory
  */
 
-import { BridgeClient, BridgeError, defaultMemoryHome } from './bridge.js'
+import { BridgeClient, BridgeError, defaultMemoryHome, defaultMemorySystemRoot } from './bridge.js'
 import { buildTools } from './tools.js'
 
 /** Tool names this plugin owns; also the user-facing memory surface. */
@@ -118,7 +118,7 @@ export function apply(ctx, rawConfig) {
   const home = config.memoryHome || defaultMemoryHome()
   const client = new BridgeClient({
     pythonPath: config.pythonPath,
-    root: config.memorySystemRoot,
+    root: config.memorySystemRoot || defaultMemorySystemRoot(),
     timeoutMs: config.requestTimeoutMs,
     logger,
   })

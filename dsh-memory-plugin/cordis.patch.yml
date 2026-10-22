@@ -1,11 +1,13 @@
 - insert:
     - id: dsh-memory
-      name: 'dsh-memory'
+      # Relative to this patch file, so the bundle works from wherever it is installed.
+      name: ./index.js
       config:
         # Python interpreter that can import `memory_system`.
         pythonPath: ''
-        # Repository root that owns the `memory_system` package.
-        memorySystemRoot: 'D:\\Coding\\dsh-memory'
+        # Repository root that owns the `memory_system` package; empty means the
+        # directory one level above this file.
+        memorySystemRoot: ''
         # Directory holding memory.db; empty means ~/.dsh/memory.
         memoryHome: ''
         # Freeze the project id instead of deriving it from the session cwd.

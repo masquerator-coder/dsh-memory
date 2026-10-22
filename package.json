@@ -1,0 +1,15 @@
+{
+  "name": "dsh-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dsh-memory-plugin/index.js",
+    "./client": "./dsh-memory-plugin/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh-memory-plugin/cordis.patch.yml"
+    }
+  }
+}

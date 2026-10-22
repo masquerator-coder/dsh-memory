@@ -1,6 +1,8 @@
 window.__ModuleLoader__.load({
   id: 'dsh-memory',
   factory(require) {
+    const module = { exports: {} }
+    const exports = module.exports
     const React = require('react')
     const h = React.createElement
     const useState = React.useState
@@ -1382,8 +1384,8 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** Local `useState` shorthand, so the page reads without React.useState noise. */
-    return {
+    /** What the browser half exports once the factory returns. */
+    const pagePlugin = {
       inject: ['slots', 'locale'],
       apply(ctx) {
         const bound = ctx.locale.bind(NS)
@@ -1414,5 +1416,9 @@ window.__ModuleLoader__.load({
         )
       },
     }
+    // The loader reads the factory's return value; without this the browser
+    // half registers and serves but exports nothing usable.
+    Object.assign(module.exports, pagePlugin)
+    return module.exports
   },
 })

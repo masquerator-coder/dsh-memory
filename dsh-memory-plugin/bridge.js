@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
-import { delimiter, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 
 /**
@@ -298,6 +299,16 @@ export function defaultMemoryHome() {
   if (process.env.DSH_MEMORY_HOME) return process.env.DSH_MEMORY_HOME
   if (process.env.DSH_HOME) return join(process.env.DSH_HOME, 'memory')
   return join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh', 'memory')
+}
+
+/**
+ * Repository root that ships `memory_system`, derived from this file's own
+ * location so the plugin works wherever it was installed (a git checkout, a
+ * linked package, or a copied directory) instead of naming one machine.
+ * @returns {string} the directory one level above the plugin directory.
+ */
+export function defaultMemorySystemRoot() {
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..')
 }
 
 /** Internals exposed for the plugin's self-check. */

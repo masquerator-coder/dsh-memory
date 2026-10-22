@@ -26,20 +26,28 @@ DSH 记忆插件：把 `D:\Coding\dsh-memory\memory_system` 的长期记忆接�
 
 ## 安装
 
+仓库根就是组合包：根目录 `package.json` 声明 `dsh.bundle`，指向
+`dsh-memory-plugin/cordis.patch.yml`。因此安装的 spec 是**仓库根**（Git 地址或本仓库目录），
+不是 `dsh-memory-plugin` 子目录——子目录本身不声明组合包，DSH 会报「这个包没有声明组合包」。
+
 ```powershell
-# 1. 确保 Python 能 import memory_system（插件默认把 memorySystemRoot 放进 PYTHONPATH）
+# 1. 确保 Python 能 import memory_system（插件默认把仓库根放进子进程 PYTHONPATH）
 python -c "import sys; sys.path.insert(0, r'D:\Coding\dsh-memory'); import memory_system; print(memory_system.__file__)"
 
-# 2. 安装插件包（在 DSH 里）
-#    plugin_manager action=install_bundle target=D:\Coding\dsh-memory\dsh-memory-plugin
+# 2a. 在 DSH 里安装：插件页「添加插件」，或
+#     plugin_manager action=install_bundle target=D:\Coding\dsh-memory
+# 2b. 或直接用 CLI（目录形式以 link: 记在 profile 里）：
+dsh plugin --profile web add D:\Coding\dsh-memory
 ```
+
+patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪里都能被解析。
 
 ## 配置（`cordis.patch.yml` 中的 `dsh-memory` 行）
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
 | `pythonPath` | `''` | 指定解释器；留空则依次尝试 `DSH_MEMORY_PYTHON`、`DSH_PYTHON`、`python` |
-| `memorySystemRoot` | `D:\Coding\dsh-memory` | 含 `memory_system` 包的仓库根目录，会加入子进程 `PYTHONPATH` |
+| `memorySystemRoot` | `''` | 含 `memory_system` 包的仓库根目录，会加入子进程 `PYTHONPATH`；留空则按插件自身位置推导（`bridge.js` 的上一级目录），不绑定某台机器 |
 | `memoryHome` | `''` | 记忆库目录，留空为 `~/.dsh/memory`（或 `$DSH_HOME/memory`） |
 | `projectOverride` | `''` | 固定项目 id，不再按会话工作目录推导 |
 | `captureTurns` | `true` | 自动把用户消息与回合结果记入情景记忆 |
