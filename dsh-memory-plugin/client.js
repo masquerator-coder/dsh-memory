@@ -551,6 +551,9 @@ window.__ModuleLoader__.load({
       const [length, setLength] = useState(1000)
       const [savingLength, setSavingLength] = useState(false)
       const [lengthNote, setLengthNote] = useState(null)
+      // Last value the server confirmed. Slider changes commit only once the
+      // user pauses, so a drag does not fire one write per tick.
+      const [savedLength, setSavedLength] = useState(1000)
 
       // profile
       const [profile, setProfile] = useState('')
@@ -582,10 +585,15 @@ window.__ModuleLoader__.load({
           const result = await api(ROUTE_STATUS, {})
           setStatus(result)
           setStatusError('')
+          // `/status` returns the settings payload flattened: `length` sits directly
+          // beside `presets`. (`/settings` nests it under `settings.settings`.)
           const settings = result?.settings ?? {}
           if (Array.isArray(settings.presets) && settings.presets.length > 0) setPresets(settings.presets)
           if (typeof settings.min === 'number') setBounds({ min: settings.min, max: settings.max ?? 3000 })
-          if (typeof settings.length === 'number') setLength(settings.length)
+          if (typeof settings.length === 'number') {
+            setLength(settings.length)
+            setSavedLength(settings.length)
+          }
           setDigestScope('project')
         } catch (error) {
           setStatusError(error.message)
@@ -620,6 +628,33 @@ window.__ModuleLoader__.load({
         void loadDigest('project')
       }, [loadStatus, loadProfile, loadDigest])
 
+      // Debounced commit: after the slider settles on a new preset for a beat,
+      // write it. A range input fires `onChange` on every step, so writing
+      // directly there would send one request per tick.
+      const savedLengthRef = React.useRef(savedLength)
+      savedLengthRef.current = savedLength
+      const lengthRef = React.useRef(length)
+      lengthRef.current = length
+      React.useEffect(() => {
+        if (typeof length !== 'number' || length === savedLengthRef.current) return undefined
+        const timer = setTimeout(() => {
+          // Compare against the ref again: a save may have landed meanwhile.
+          if (length !== savedLengthRef.current) void saveLength(length)
+        }, 400)
+        return () => clearTimeout(timer)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [length])
+
+      // Flush a pending change if the page unmounts mid-drag.
+      React.useEffect(() => {
+        return () => {
+          if (typeof lengthRef.current === 'number' && lengthRef.current !== savedLengthRef.current) {
+            void saveLength(lengthRef.current)
+          }
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
       const isPreset = presets.includes(length)
 
       /** Persist the length budget. */
@@ -630,8 +665,11 @@ window.__ModuleLoader__.load({
           const result = await api(ROUTE_SETTINGS, { length: nextLength })
           const saved = result?.settings?.settings?.length ?? nextLength
           setLength(saved)
+          setSavedLength(saved)
           setLengthNote({ kind: 'ok', text: '摘要长度已保存' })
         } catch (error) {
+          // Keep the slider where the user put it; the note explains why the
+          // value will not survive a reload.
           setLengthNote({ kind: 'error', text: `保存失败：${error.message}` })
         } finally {
           setSavingLength(false)
@@ -881,7 +919,11 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'mem-rail-unit' }, '字'),
               ),
             ),
-            h(Note, { kind: lengthNote?.kind }, lengthNote?.text),
+            h(
+              Note,
+              { kind: savingLength ? 'warn' : lengthNote?.kind },
+              savingLength ? '正在保存…' : lengthNote?.text,
+            ),
           ),
 
           // ── user profile ───────────────────────────────────────────────
