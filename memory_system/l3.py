@@ -217,26 +217,45 @@ class SemanticMemory:
         entity_type: str = "thing",
         *,
         create: bool = True,
+        persist: bool = True,
         aliases: Sequence[str] | None = None,
         attributes: dict[str, Any] | None = None,
     ) -> Entity | None:
-        """Find-or-create by normalized name, then alias, then similarity probe."""
+        """Find-or-create by normalized name, then alias, then similarity probe.
+
+        ``persist=False`` resolves without writing: a caller that validates the
+        resolved endpoints (type constraints, cycles) must not leave an entity
+        behind when it goes on to reject the fact. Such a placeholder carries
+        ``ordinal=None``; persist it later with ``_create_entity``.
+        """
         norm = normalize_name(name)
         if not norm:
             raise ValidationError("entity name is empty")
+        # Match the declared type first so two same-named nodes of different
+        # types (a car and a company both called "Toyota") resolve to the one
+        # the caller meant instead of whichever row happens to come back.
         row = self.store.query_one(
-            "SELECT * FROM l3_entities WHERE project_id = ? AND name_norm = ?",
-            (project_id, norm),
+            "SELECT * FROM l3_entities WHERE project_id = ? AND name_norm = ? AND type = ?",
+            (project_id, norm, entity_type),
         )
+        if row is None:
+            row = self.store.query_one(
+                "SELECT * FROM l3_entities WHERE project_id = ? AND name_norm = ? ORDER BY type = 'thing' DESC, ord",
+                (project_id, norm),
+            )
         if row is not None:
             entity = self._entity_from_row(row)
             # An explicitly typed caller upgrades an untyped placeholder node.
             upgrade = entity_type if (entity.type == "thing" and entity_type not in ("thing", "")) else None
             if aliases or attributes or upgrade:
-                self._merge_entity(
-                    entity, aliases=aliases, attributes=attributes, entity_type=upgrade
-                )
-                return self.get_entity(entity.entity_id)
+                if persist:
+                    self._merge_entity(
+                        entity, aliases=aliases, attributes=attributes, entity_type=upgrade
+                    )
+                    return self.get_entity(entity.entity_id)
+                # Dry run: report the upgrade without applying it.
+                entity.type = upgrade or entity.type
+                return entity
             return entity
         # Alias hit: an alternate form already registered for another node.
         for candidate in self.store.query(
@@ -246,7 +265,49 @@ class SemanticMemory:
             return self._entity_from_row(candidate)
         if not create:
             return None
+        if not persist:
+            # A placeholder for validation only: no row, no vector, no change log.
+            now = to_iso(utcnow())
+            return Entity(
+                entity_id=new_entity_id(),
+                project_id=project_id,
+                name=name.strip(),
+                type=entity_type,
+                aliases=_dedupe_aliases(name, aliases or []),
+                attributes=dict(attributes or {}),
+                created_at=now,
+                updated_at=now,
+                ordinal=None,
+            )
         return self._create_entity(project_id, name, entity_type, aliases, attributes)
+
+    def _materialize_entity(
+        self,
+        project_id: str,
+        entity: Entity,
+        name: str,
+        *,
+        aliases: Sequence[str] | None,
+        attributes: dict[str, Any] | None,
+    ) -> Entity:
+        """Persist a placeholder from ``resolve_entity(persist=False)``.
+
+        An entity that already exists comes back with an ordinal and only needs
+        its aliases/attributes folded in; a placeholder is inserted now, after
+        the caller's validation has passed.
+        """
+        if entity.ordinal is not None:
+            self._merge_entity(entity, aliases=aliases, attributes=attributes, entity_type=None)
+            return self.get_entity(entity.entity_id)
+        # Re-resolve against the store: a concurrent caller may have inserted
+        # the same name while this request was validating.
+        existing = self.store.query_one(
+            "SELECT * FROM l3_entities WHERE project_id = ? AND name_norm = ? AND type = ?",
+            (project_id, normalize_name(name), entity.type),
+        )
+        if existing is not None:
+            return self._entity_from_row(existing)
+        return self._create_entity(project_id, name, entity.type, aliases, attributes)
 
     def _create_entity(
         self,
@@ -434,15 +495,19 @@ class SemanticMemory:
         if not (fact.head or "").strip() or not (fact.tail or "").strip():
             return EdgeDecision(status="rejected", reason="empty_endpoint")
 
+        # Resolve both endpoints *without persisting*: every rejection below
+        # returns before any write, so a refused fact must not leave the two
+        # nodes it mentioned behind as orphans in the graph.
         head = self.resolve_entity(
             project_id,
             fact.head,
             fact.head_type or (spec.domain[0] if spec and spec.domain else "thing"),
             attributes=fact.attributes,
             aliases=[fact.head],
+            persist=False,
         )
         tail = self.resolve_entity(
-            project_id, fact.tail, fact.tail_type or "thing", aliases=[fact.tail]
+            project_id, fact.tail, fact.tail_type or "thing", aliases=[fact.tail], persist=False
         )
         assert head is not None and tail is not None
 
@@ -463,6 +528,12 @@ class SemanticMemory:
                     reason="type_constraint",
                     conflict={"end": "tail", "expected": list(spec.range), "actual": declared_tail},
                 )
+
+        # Validation passed: commit the endpoints for real (creating the ones
+        # that were placeholders), then re-read their stored form.
+        head = self._materialize_entity(project_id, head, fact.head, aliases=[fact.head], attributes=fact.attributes)
+        tail = self._materialize_entity(project_id, tail, fact.tail, aliases=[fact.tail], attributes=None)
+
         # Type promotion: an explicit type on a previously untyped node upgrades it.
         if fact.head_type and head.type == "thing":
             self._merge_entity(head, aliases=None, attributes=None, entity_type=fact.head_type)
@@ -806,13 +877,26 @@ class SemanticMemory:
         return False
 
     def _strengthen_edge(self, edge: Edge, fact: FactInput) -> None:
-        """A repeated claim raises confidence and accumulates evidence."""
+        """A repeated claim raises confidence and accumulates evidence.
+
+        Confidence only moves when the repeat brings *new* support: an episode
+        the edge has not seen, or a fresh observation context. Repeating the
+        same claim with no new evidence must not ratchet a hallucinated fact up
+        to 0.99, which would defeat the "low evidence cannot override high
+        evidence" rule in ``_resolve_conflict``.
+        """
         meta = dict(edge.meta or {})
-        episodes = list(dict.fromkeys([*meta.get("episode_ids", []), *(fact.episode_ids or [])]))
+        known = list(meta.get("episode_ids", []))
+        incoming = [e for e in (fact.episode_ids or []) if e not in known]
         observations = list(meta.get("observations", []))
-        if fact.observed_context:
+        new_observation = bool(fact.observed_context) and fact.observed_context not in observations
+        if new_observation:
             observations.append(fact.observed_context)
             observations = observations[-10:]
+        if not incoming and not new_observation:
+            # Same claim, same evidence: nothing to record.
+            return
+        episodes = list(dict.fromkeys([*known, *incoming]))
         new_confidence = min(0.99, edge.confidence + 0.02)
         meta["episode_ids"] = episodes
         meta["observations"] = observations
@@ -821,15 +905,15 @@ class SemanticMemory:
                 "UPDATE l3_edges SET confidence = ?, meta = ? WHERE edge_id = ?",
                 (new_confidence, json_dumps(meta), edge.edge_id),
             )
-            if fact.episode_ids:
+            if incoming:
                 change_id = self._record_change(
                     edge.project_id,
                     kind="edge.strengthened",
                     target_kind="edge",
                     target_id=edge.edge_id,
-                    detail={"confidence": new_confidence, "episodes": fact.episode_ids},
+                    detail={"confidence": new_confidence, "episodes": incoming},
                 )
-                self._link_episodes(change_id, fact.episode_ids)
+                self._link_episodes(change_id, incoming)
 
     def _evidence_strength(self, episode_ids: Sequence[str], confidence: float) -> float:
         if not episode_ids or self.episodic is None:

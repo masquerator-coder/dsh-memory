@@ -365,6 +365,12 @@ VEC_TABLES = {
     "l4_archive": "vec_l4_archive",
 }
 
+# `PRAGMA journal_mode` takes a keyword, not a bound value, so the configured
+# mode is validated against this set before it is interpolated.
+_JOURNAL_MODES = frozenset(
+    {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+)
+
 
 def utcnow(tz: _dt.timezone = _dt.timezone.utc) -> _dt.datetime:
     """Single clock entry point so tests can freeze time."""
@@ -425,7 +431,12 @@ class Store:
         c.execute("PRAGMA foreign_keys = ON")
         c.execute("PRAGMA busy_timeout = 5000")
         if not memory_db:
-            c.execute(f"PRAGMA journal_mode = {self.config.journal_mode}")
+            # PRAGMA values cannot be parameterised, so this one is the only
+            # place a config string reaches SQL: accept a known mode or don't
+            # execute it at all.
+            mode = str(self.config.journal_mode or "").strip().upper()
+            if mode in _JOURNAL_MODES:
+                c.execute(f"PRAGMA journal_mode = {mode}")
         c.execute("PRAGMA synchronous = NORMAL")
         c.execute("PRAGMA temp_store = MEMORY")
 

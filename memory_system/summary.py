@@ -800,6 +800,11 @@ class DigestService:
 
         if want_summary:
             latest = self.latest(scope=scope, project_id=project_id)
+            # A global anchor with no global digest yet must not hide the
+            # project digest: the model would lose the memory context it had
+            # before anyone asked for a global one.
+            if latest is None and scope == "global" and project_id:
+                latest = self.latest(scope="project", project_id=project_id)
             if latest is not None and latest.content.strip():
                 updated = latest.created_at[:16].replace("T", " ")
                 stale = _age_days(latest.created_at) >= 7
@@ -1046,13 +1051,19 @@ class MemoryNotepad:
                 raise ValidationError("state must be active | dormant | archived")
             sets.append("state = ?")
             params.append(state)
-        if not sets:
+        # `tags` is not a column: it lives in a meta blob and is written through
+        # set_tags below. A patch that only touches tags is still a real edit,
+        # so it must not trip the empty-patch guard.
+        has_tags = "tags" in patch
+        if not sets and not has_tags:
             raise ValidationError("nothing to update")
-        sets.append("updated_at = ?")
-        params.append(_iso_now())
-        params.append(memory_id)
+        if sets:
+            sets.append("updated_at = ?")
+            params.append(_iso_now())
+            params.append(memory_id)
         with self.store.transaction():
-            self.store.execute(f"UPDATE l2_episodes SET {', '.join(sets)} WHERE memory_id = ?", params)
+            if sets:
+                self.store.execute(f"UPDATE l2_episodes SET {', '.join(sets)} WHERE memory_id = ?", params)
             # Keep the lexical index in step with the text.
             if "summary" in patch:
                 current = self.store.query_one(
@@ -1063,8 +1074,11 @@ class MemoryNotepad:
                     "INSERT INTO l2_fts(memory_id, body) VALUES (?, ?)",
                     (memory_id, f"{current['summary']} {current['event_type'] or ''}"),
                 )
-        if "tags" in patch:
-            self.set_tags(memory_id, patch.get("tags") or ())
+            # Tags live in a meta blob, so they are written through their own
+            # helper. Keep it inside this transaction: otherwise a failure
+            # leaves the fields updated but the tags silently stale.
+            if "tags" in patch:
+                self.set_tags(memory_id, patch.get("tags") or ())
         return self.get(memory_id)
 
     def forget(self, memory_id: str) -> dict[str, Any]:

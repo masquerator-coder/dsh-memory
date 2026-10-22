@@ -161,6 +161,16 @@ def summary_hash(text: str) -> str:
     return hashlib.sha1(" ".join(text.split()).lower().encode("utf-8")).hexdigest()
 
 
+def _descending_time(raw: str) -> float:
+    """Sort helper: later timestamps first.
+
+    ``created_at`` is an ISO string, and mixing a negated float into the same
+    sort key as ``-score`` keeps one comparison instead of two passes.
+    """
+    ts = parse_iso(raw)
+    return -ts.timestamp() if ts is not None else float("inf")
+
+
 class EpisodicMemory:
     """L2 store. All methods are synchronous and cheap; callers own scheduling."""
 
@@ -269,18 +279,37 @@ class EpisodicMemory:
         """Spacing effect: retrieval strengthens the memory's stability."""
         if not memory_ids:
             return 0
-        now = to_iso(utcnow())
+        now = utcnow()
+        now_iso = to_iso(now)
         with self.store.transaction():
             count = 0
             for memory_id in memory_ids:
+                row = self.store.query_one(
+                    "SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,)
+                )
+                if row is None:
+                    continue
+                episode = Episode.from_row(row)
+                bumped = Episode.from_row(row)
+                bumped.access_count = episode.access_count + amount
+                bumped.last_access = now_iso
+                # An access may revive an archived memory, but the state it
+                # revives *into* follows the usual retention thresholds: a run
+                # of retrievals on a stale memory should not oscillate between
+                # archived and active on every refresh_states pass.
+                state = (
+                    self.compute(bumped, now).state
+                    if episode.state == STATE_ARCHIVED
+                    else episode.state
+                )
                 cur = self.store.execute(
                     """UPDATE l2_episodes
                           SET access_count = access_count + ?,
                               last_access  = ?,
-                              state        = CASE WHEN state = 'archived' THEN 'active' ELSE state END,
+                              state        = ?,
                               updated_at   = ?
                         WHERE memory_id = ?""",
-                    (amount, now, now, memory_id),
+                    (amount, now_iso, state, now_iso, memory_id),
                 )
                 count += cur.rowcount or 0
         return count
@@ -430,7 +459,9 @@ class EpisodicMemory:
                     stability_hours=ret.stability_hours,
                 )
             )
-        hits.sort(key=lambda h: (-h.score, h.episode.created_at), reverse=False)
+        # Score descending; ties go to the newest memory, so a fresh fact
+        # outranks an equally relevant old one.
+        hits.sort(key=lambda h: (-h.score, _descending_time(h.episode.created_at)))
         hits = hits[:k]
         for i, hit in enumerate(hits):
             hit.rank = i + 1

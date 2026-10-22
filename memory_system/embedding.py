@@ -404,6 +404,9 @@ def build_checked_provider(config: EmbeddingConfig) -> tuple[EmbeddingProvider, 
         raise ProviderError(f"embedding endpoint unavailable: {result.error}")
     if config.on_unavailable == "fallback":
         result.degraded = True
+        # 256-dim hash vectors are a distinct space. `MemorySystem` refuses this
+        # degradation on a database that already has vectors, so the width here
+        # only ever applies to a fresh store that will be written in this space.
         return HashEmbedding(256, (1, 2, 3), config.normalize), result
     return DegradedProvider(provider.dim, reason=result.error or "probe failed",
                             normalize=config.normalize), result
