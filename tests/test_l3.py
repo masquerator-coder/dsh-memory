@@ -105,9 +105,44 @@ def test_type_constraint_rejected(memory: MemorySystem, project: str):
 
 def test_duplicate_strengthens_confidence(memory: MemorySystem, project: str):
     first = memory.l3.add_fact(project, fact("x", "uses", "y", confidence=0.5))
-    second = memory.l3.add_fact(project, fact("x", "uses", "y", confidence=0.5))
+    # A repeat that brings a *new* observation is real corroboration.
+    second = memory.l3.add_fact(
+        project, fact("x", "uses", "y", confidence=0.5, observed_context="seen in config")
+    )
     assert second.status == "duplicate"
     assert memory.l3.get_edge(first.edge.edge_id).confidence > 0.5
+
+
+def test_duplicate_without_new_evidence_does_not_ratchet(memory: MemorySystem, project: str):
+    """Repeating the same claim with no new evidence must not raise confidence:
+    otherwise a hallucinated fact could be talked up to certainty."""
+    first = memory.l3.add_fact(project, fact("x", "uses", "y", confidence=0.5))
+    for _ in range(5):
+        decision = memory.l3.add_fact(project, fact("x", "uses", "y", confidence=0.5))
+        assert decision.status == "duplicate"
+    assert memory.l3.get_edge(first.edge.edge_id).confidence == 0.5
+
+
+def test_rejected_fact_leaves_no_orphan_entities(memory: MemorySystem, project: str):
+    """Validation runs before persistence, so a refused fact must not add nodes."""
+    before = memory.store.scalar("SELECT count(*) FROM l3_entities", default=0)
+    decision = memory.l3.add_fact(
+        project, fact("a_thing", "depends_on", "b_thing"), recorded_at="2026-01-01T00:00:00+00:00"
+    )
+    assert decision.status == "accepted"
+    memory.l3.add_fact(
+        project, fact("b_thing", "depends_on", "c_thing"), recorded_at="2026-01-01T00:00:01+00:00"
+    )
+    after_ok = memory.store.scalar("SELECT count(*) FROM l3_entities", default=0)
+    # Closing the triangle would be a cycle, so the third fact is refused.
+    rejected = memory.l3.add_fact(
+        project, fact("c_thing", "depends_on", "a_thing"), recorded_at="2026-01-01T00:00:02+00:00"
+    )
+    assert rejected.status == "rejected"
+    assert rejected.reason == "cycle"
+    # No new entities appeared for the refused fact.
+    assert memory.store.scalar("SELECT count(*) FROM l3_entities", default=0) == after_ok
+    assert after_ok == before + 3
 
 
 def test_history_and_provenance(memory: MemorySystem, project: str):

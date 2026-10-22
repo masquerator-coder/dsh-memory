@@ -51,6 +51,39 @@ def test_refresh_states_updates_only_what_changed(memory: MemorySystem, project:
     assert memory.l2.get(fresh.memory_id).state == "active"
 
 
+def test_search_ties_prefer_the_newer_memory(memory: MemorySystem, project: str):
+    """Equal scores must not rank the oldest memory first."""
+    older = memory.l2.add(project_id=project, summary="identical text", importance=0.5)
+    newer = memory.l2.add(
+        project_id=project, summary="identical text", importance=0.5, dedup=False
+    )
+    # Give both the same clock reading so only the tie-break decides.
+    stamp = to_iso(utcnow())
+    memory.store.execute(
+        "UPDATE l2_episodes SET created_at = ?, last_access = ? WHERE memory_id IN (?, ?)",
+        (stamp, stamp, older.memory_id, newer.memory_id),
+    )
+    hits = memory.l2.search("identical text", project_ids=[project], reinforce=False)
+    ids = [h.episode.memory_id for h in hits]
+    assert ids.index(newer.memory_id) < ids.index(older.memory_id)
+
+
+def test_reinforce_revives_archived_by_retention_not_blindly(memory: MemorySystem, project: str):
+    """An archived memory comes back, but into the state its age implies."""
+    stale = memory.l2.add(project_id=project, summary="Long forgotten fact", importance=0.2)
+    old = to_iso(utcnow() - dt.timedelta(days=400))
+    memory.store.execute(
+        "UPDATE l2_episodes SET last_access = ?, created_at = ?, state = 'archived' WHERE memory_id = ?",
+        (old, old, stale.memory_id),
+    )
+    memory.l2.reinforce([stale.memory_id])
+    revived = memory.l2.get(stale.memory_id)
+    # It was accessed just now, so it is live again...
+    assert revived.access_count == 1
+    # ...and the state agrees with what retention now says.
+    assert revived.state == memory.l2.compute(revived).state
+
+
 def test_dedup_returns_same_memory(memory: MemorySystem, project: str):
     a = memory.l2.add(project_id=project, summary="Same   Text  here", importance=0.5)
     b = memory.l2.add(project_id=project, summary="same text here", importance=0.5)

@@ -154,6 +154,22 @@ def test_anchor_is_empty_without_memory(service: DigestService, project: str):
     assert service.anchors(project_id=project)["text"] == ""
 
 
+def test_global_anchor_falls_back_to_project_digest(service: DigestService, project: str):
+    """A global anchor must not blank out the project digest."""
+    record = service.commit(scope="project", project_id=project, text="## project\nkeep me")
+    assert service.latest(scope="global") is None
+
+    anchors = service.anchors(project_id=project, scope="global")
+    assert anchors["summary"] is not None
+    assert anchors["summary"]["digest_id"] == record.digest_id
+    assert "memory_digest_read" in anchors["text"]
+
+    # Once a global digest exists, it takes over.
+    global_record = service.commit(scope="global", project_id=None, text="## global\nall projects")
+    anchors = service.anchors(project_id=project, scope="global")
+    assert anchors["summary"]["digest_id"] == global_record.digest_id
+
+
 # ── notepad ─────────────────────────────────────────────────────────────
 
 
@@ -170,6 +186,19 @@ def test_memory_edit_updates_text_importance_and_index(memory: MemorySystem, pro
     # The lexical index was rewritten, so search sees the edited text.
     hits = memory.l2.search("summary", project_ids=[project], reinforce=False)
     assert created["memory_id"] in {h.episode.memory_id for h in hits}
+
+
+def test_memory_edit_accepts_tags_only(memory: MemorySystem, project: str):
+    """Tags live in a meta blob, not a column, so they must not trip the
+    empty-patch guard on their own."""
+    created = memory.remember(project_id=project, summary="tagged later")
+    notepad = MemoryNotepad(memory)
+    assert notepad.update(created["memory_id"], {"tags": ["架构", "缓存"]})["tags"] == ["架构", "缓存"]
+    # Clearing is an edit too, not a no-op.
+    assert notepad.update(created["memory_id"], {"tags": []})["tags"] == []
+    # A truly empty patch still fails.
+    with pytest.raises(Exception):
+        notepad.update(created["memory_id"], {})
 
 
 def test_forget_is_soft_and_restorable(memory: MemorySystem, project: str):
