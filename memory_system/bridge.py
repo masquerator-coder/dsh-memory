@@ -78,30 +78,45 @@ class BridgeError(Exception):
 
 
 def _git_remote_from_config(directory: Path) -> str | None:
-    """Read ``remote.origin.url`` from ``.git/config`` without running git.
+    """Read a remote URL from ``.git/config`` without running git.
 
     Running ``git`` per turn would add process latency to a hot path and fail
     in environments without git; the config file is the same source of truth
     git itself uses.
+
+    ``origin`` wins when present, but a fork that only has ``upstream`` (or a
+    hand-named mirror) must still resolve to the same project, so any other
+    remote is better than falling back to the directory path.
     """
     config = directory / ".git" / "config"
     try:
         text = config.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    in_origin = False
+    remotes: dict[str, str] = {}
+    current: str | None = None
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip().lower()
-            in_origin = section in ("remote \"origin\"", "remote 'origin'")
+            if section.startswith("remote ") and len(section) > 8:
+                current = section[7:].strip().strip("\"'")
+            else:
+                current = None
             continue
-        if in_origin and line.lower().startswith("url"):
-            _, _, value = line.partition("=")
+        if current is None:
+            continue
+        # `url = ...` only: a bare `startswith("url")` also matches `urlx`.
+        if line.lower().startswith("url"):
+            key, sep, value = line.partition("=")
+            if not sep or key.strip().lower() != "url":
+                continue
             value = value.strip()
             if value:
-                return value
-    return None
+                remotes.setdefault(current, value)
+    if "origin" in remotes:
+        return remotes["origin"]
+    return next(iter(remotes.values()), None)
 
 
 def resolve_project_id(cwd: str | None) -> str:
@@ -600,7 +615,7 @@ def parse_backup_markdown(text: str) -> dict[str, Any]:
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         stripped = line.strip()
-        if stripped.startswith(f"<!--{BACKUP_MARKER_HINT}"):
+        if stripped.startswith(f"<!--{BACKUP_MARKER_HINT}") and stripped.endswith("-->"):
             start = stripped.find("{")
             end = stripped.rfind("}")
             if 0 <= start < end:
@@ -634,15 +649,31 @@ def parse_backup_markdown(text: str) -> dict[str, Any]:
                 continue
             if stripped.startswith("- ") and current is not None:
                 body = stripped[2:].strip()
+                # Strip the label prefix once, then keep the remainder whole: a
+                # value that itself contains ":" (an outcome of
+                # "错误: 超时") must not be cut down to its last segment.
                 if body.startswith("项目:") or body.startswith("项目："):
-                    current["project_id"] = body.split(":", 1)[-1].split("：", 1)[-1].strip().strip("`")
+                    current["project_id"] = _strip_label(body, "项目").strip("`")
                 elif body.startswith("结果:") or body.startswith("结果："):
-                    current["outcome"] = body.split(":", 1)[-1].split("：", 1)[-1].strip()
+                    current["outcome"] = _strip_label(body, "结果")
                 elif not current.get("summary"):
                     current["summary"] = body
                 continue
     profile = "\n".join(profile_section).strip()
     return {"header": header, "profile": profile, "memories": memories}
+
+
+def _strip_label(body: str, label: str) -> str:
+    """Drop a leading ``label:`` / ``label：`` from one backup metadata line.
+
+    The separator is removed once; whatever follows is the value, colons and
+    all, so ``结果: 错误: 超时`` yields ``错误: 超时``.
+    """
+    for sep in (":", "："):
+        prefix = f"{label}{sep}"
+        if body.startswith(prefix):
+            return body[len(prefix) :].strip()
+    return body.strip()
 
 
 BACKUP_MARKER_HINT = "dsh-memory-backup"
@@ -753,8 +784,11 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
             "ok": False,
             "error": {"code": "unknown_command", "message": f"unknown command {name!r}; try {commands()}"},
         }
-    scope = Scope.from_payload(payload)
+    # Parsing the scope touches the filesystem (``~`` expansion, an invalid
+    # drive), so it belongs inside the guard too: an exception here used to
+    # escape `handle` and end the serving process.
     try:
+        scope = Scope.from_payload(payload)
         with open_memory(scope) as memory:
             result = handler(memory, payload)
     except Exception as exc:  # noqa: BLE001 - the wire must always answer
@@ -806,7 +840,19 @@ def serve(stdin: Any = None, stdout: Any = None) -> int:
             elif request.get("command") == "__quit__":
                 return 0
             else:
-                response = handle(request)
+                # `handle` normally converts MemoryError into an error reply,
+                # but anything it does not catch (a path a payload points at,
+                # a permission failure, an unexpected internal bug) would escape
+                # this loop and end the process, leaving every later request
+                # unanswered. Answer with an error instead and keep serving.
+                try:
+                    response = handle(request)
+                except Exception as exc:  # noqa: BLE001 - last-resort guard
+                    response = {
+                        "id": request.get("id"),
+                        "ok": False,
+                        "error": {"code": "internal", "message": f"{type(exc).__name__}: {exc}"},
+                    }
         text = json.dumps(response, ensure_ascii=False)
         if len(text) > MAX_RESPONSE_CHARS:
             text = json.dumps(
