@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterator
 from .config import MemoryConfig
 from .errors import MemoryError, NotFoundError, ProviderError, ValidationError
 from .summary import (
-    AUTO_MODES,
+    AUTO_MODE,
     DEFAULT_LENGTH,
     LENGTH_MAX,
     LENGTH_MIN,
@@ -305,7 +305,7 @@ def _settings_payload(settings: SummarySettings) -> dict[str, Any]:
         "min": LENGTH_MIN,
         "max": LENGTH_MAX,
         "default": DEFAULT_LENGTH,
-        "modes": list(AUTO_MODES),
+        "modes": [AUTO_MODE],
     }
 
 

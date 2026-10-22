@@ -49,13 +49,6 @@
     "invalid": "Enter a number between {min} and {max}",
     "current": "Current budget: {n} chars (about {tokens} tokens)"
   },
-  "auto": {
-    "title": "Generate digests automatically",
-    "hint": "When enabled, each settled turn triggers one digest generation with the current model.",
-    "off": "Off",
-    "debounced": "After each turn (debounced)",
-    "idle": "When idle"
-  },
   "profile": {
     "title": "User profile",
     "hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",

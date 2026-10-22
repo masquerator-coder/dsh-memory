@@ -14,9 +14,10 @@
         projectOverride: ''
         # Snapshot conversation turns into episodic memory after each turn.
         captureTurns: true
-        # Ask the session model for a fresh digest once a turn settles.
-        autoSummary: false
-        # Minimal idle gap (ms) between a settled turn and that digest.
+        # Generate a fresh digest automatically once the turn settles and the
+        # harness goes idle. Always on; there is no user-facing switch.
+        autoSummary: true
+        # Idle gap (ms) after a settled turn before that digest is generated.
         autoSummaryDelayMs: 15000
         # Inject the memory anchor block into the system prompt.
         systemPromptAnchor: true

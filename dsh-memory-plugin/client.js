@@ -1,5 +1,13 @@
 window.__ModuleLoader__.load({
-  id: 'dsh-memory',
+  // Must equal the name of the package that owns `exports["./client"]`
+  // (`dsh-memory-plugin/package.json`), because the client module id is
+  // derived from that package. Do NOT use the `dsh-memory` bundle name or the
+  // `cordis.patch.yml` row id here: the host asks the loader for
+  // `dsh-memory-plugin`, and a mismatch fails with
+  // "loaded without registering \"dsh-memory-plugin\"" while still serving.
+  // (The `settings.section` registration further down keeps id 'dsh-memory';
+  // that one is a slot key in its own right, unrelated to the module id.)
+  id: 'dsh-memory-plugin',
   factory(require) {
     const module = { exports: {} }
     const exports = module.exports
@@ -60,11 +68,6 @@ window.__ModuleLoader__.load({
       "length.customPlaceholder": "输入 1000 到 4000000 之间的字符数",
       "length.invalid": "请输入 {min} 到 {max} 之间的数字",
       "length.current": "当前预算：{n} 字（约 {tokens} tokens）",
-      "auto.title": "自动生成摘要",
-      "auto.hint": "开启后，每次对话回合结束后自动用当前模型生成一次记忆摘要。",
-      "auto.off": "关闭",
-      "auto.debounced": "回合结束后（防抖）",
-      "auto.idle": "空闲时",
       "profile.title": "用户画像",
       "profile.hint": "写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。记忆摘要与助手都会参考它，系统提示词里会提示模型可以查看画像。",
       "profile.placeholder": "例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开",
@@ -188,11 +191,6 @@ window.__ModuleLoader__.load({
       "length.customPlaceholder": "Enter a value between 1000 and 4000000",
       "length.invalid": "Enter a number between {min} and {max}",
       "length.current": "Current budget: {n} chars (about {tokens} tokens)",
-      "auto.title": "Generate digests automatically",
-      "auto.hint": "When enabled, each settled turn triggers one digest generation with the current model.",
-      "auto.off": "Off",
-      "auto.debounced": "After each turn (debounced)",
-      "auto.idle": "When idle",
       "profile.title": "User profile",
       "profile.hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",
       "profile.placeholder": "For example:\n- Answer in Chinese, comment code in Chinese\n- Mostly TypeScript and Python\n- Prefer the conclusion first, then the detail",
@@ -330,17 +328,32 @@ window.__ModuleLoader__.load({
      * for the whole subtree and re-renders on the locale bump, so switching
      * language updates the labels without re-registering the slot.
      */
-    let translate = (key) => key
-    let localeSignal = null
+    // The live translator and its change signal live in one mutable box,
+    // filled in by `apply` below. Components never close over a stale
+    // function: `callTranslate` reads whatever the box holds at call time.
+    const localeState = {
+      translate: (key) => key,
+      signal: null,
+    }
+
+    /**
+     * @param {string} key
+     * @param {object} [vars]
+     * @returns {string}
+     */
+    function callTranslate(key, vars) {
+      return localeState.translate(key, vars)
+    }
 
     /** @returns {(key: string, vars?: object) => string} the live translator. */
     function useLocale() {
       const [, bump] = useState(0)
       useEffect(() => {
-        if (!localeSignal) return undefined
-        return localeSignal.subscribe(() => bump((n) => n + 1))
+        const { signal } = localeState
+        if (!signal) return undefined
+        return signal.subscribe(() => bump((n) => n + 1))
       }, [])
-      return translate
+      return callTranslate
     }
 
     /** Small helper: formatted date from an ISO string. */
@@ -364,7 +377,9 @@ window.__ModuleLoader__.load({
       return `${Math.round(hours / 24)} 天前`
     }
 
-    const formatLengthValue = (value) => (value >= 1000 ? `${Number((value / 1000).toFixed(1))}k` : String(value))
+    // Bare digits: seven labels share one rail, and a thousands separator would
+    // make each one wide enough to crowd its neighbours.
+    const formatLengthValue = (value) => String(value)
 
     const CSS = `
 .mem-root { display: flex; flex-direction: column; gap: 18px; color: var(--dsw-alias-label-primary); }
@@ -391,9 +406,59 @@ window.__ModuleLoader__.load({
 .mem-textarea { width: 100%; min-height: 150px; resize: vertical; line-height: 1.6; font-family: inherit; }
 .mem-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mem-range { flex: 1; min-width: 180px; accent-color: var(--dsw-alias-brand-primary); }
-.mem-range-wrap { flex: 1; min-width: 220px; display: flex; flex-direction: column; }
-.mem-range-rail { position: relative; padding-top: 24px; display: flex; flex-direction: column; }
-.mem-range-badge { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 999px; background: var(--dsw-alias-brand-primary); color: #fff; font-variant-numeric: tabular-nums; pointer-events: none; }
+/* Length rail: the tick labels sit ON the track, not beside it. */
+/* The rail and its unit form one horizontal row; the rail itself stretches,
+   the unit keeps its own width on the right. */
+.mem-rail-wrap { flex: 1; min-width: 260px; display: flex; flex-direction: row; align-items: center; gap: 0; }
+/* The box the ticks are positioned in. Everything is placed from one anchor —
+   --track-y, the distance from this box's top to the groove's centre — so the
+   painted groove, the tick marks, the native input and its thumb cannot drift
+   apart. padding-inline equals half a thumb because the browser's own track
+   spans half a thumb in at each end; the ticks sit on that same span. */
+/* Lanes: the groove lane (whose centre line is H --track-y) then the label row.
+   Every painted part derives from H, and the input's own box spans exactly the
+   groove lane, so its centre — where the browser centres the thumb — is H too.
+   align-items is reset because the enclosing .mem-row centres its items on the
+   cross axis, which would otherwise lay these two lanes out side by side. The
+   height is explicit because the groove and the input are absolutely positioned. */
+.mem-rail { --thumb: 16px; --lane: 24px; --track-y: calc(var(--lane) / 2); --labels: 21px; position: relative; flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: stretch; height: calc(var(--lane) + var(--labels)); padding-inline: calc(var(--thumb) / 2); }
+/* The painted groove and the ticks span the browser's own track, so resizing
+   keeps them aligned without measuring anything. */
+.mem-rail-track { box-sizing: border-box; position: absolute; top: calc(var(--track-y) - 4px); left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2); height: 8px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); }
+/* One painted tick per preset value, laid ON the groove: 2px wide, the full
+   groove height, centred on each value's position so it also reads as the
+   dividing line between one step and the next. The markup adds one .mem-rail-tick
+   per preset; this gradient layer is the fallback when that markup is absent. */
+.mem-rail::before { content: ''; position: absolute; top: calc(var(--track-y) - 4px); left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2); height: 8px; border-radius: 4px; background: repeating-linear-gradient(to right, var(--dsw-alias-label-secondary) 0 2px, transparent 2px var(--rail-gap, 50%)); opacity: 0; pointer-events: none; }
+.mem-rail:not(:has(.mem-rail-tick))::before { opacity: .5; }
+/* Tick layer: transparent to input; the spans inside place themselves. */
+.mem-rail-ticks { position: absolute; inset: 0; pointer-events: none; }
+/* A tick drawn by markup (one span per preset): the groove lane, 2px wide,
+   centred on its value so it doubles as the divider between two steps.
+   --thumb/2 offsets the first and last ticks onto the track's rounded ends. */
+.mem-rail-tick { position: absolute; top: calc(var(--track-y) - 4px); width: 3px; height: 8px; margin-left: -1.5px; border-radius: 1.5px; background: var(--dsw-alias-label-secondary); opacity: .55; pointer-events: none; }
+.mem-rail-tick[data-current='true'] { background: var(--dsw-alias-brand-primary); opacity: 1; }
+/* The input is anchored to the same line: its box spans the groove lane, so its
+   native track and thumb land on the groove. */
+.mem-rail input { position: absolute; top: 0; left: 0; z-index: 1; box-sizing: border-box; width: 100%; height: var(--lane); margin: 0; padding: 0; background: transparent; -webkit-appearance: none; appearance: none; cursor: pointer; }
+.mem-rail input:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; border-radius: 999px; }
+.mem-rail input::-webkit-slider-runnable-track { height: 8px; border-radius: 999px; background: transparent; }
+.mem-rail input::-moz-range-track { height: 8px; border-radius: 999px; background: transparent; }
+/* The thumb is centred in the groove lane, i.e. exactly on --track-y. */
+.mem-rail input::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: var(--thumb); height: var(--thumb); margin-top: 0; border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+.mem-rail input::-moz-range-thumb { width: var(--thumb); height: var(--thumb); border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+/* One slot per tick, holding its label inside its own width so neighbouring
+   labels keep clear of each other while the slot centres stay fixed at
+   0%/25%/50%/75%/100%. The row sits below the input's lane, never over it. */
+.mem-rail-labels { display: flex; flex: 0 0 var(--labels); margin-top: auto; }
+/* A fixed, one-line-tall row: every slot gets the same height, so all labels
+   share one baseline no matter how many presets there are. */
+.mem-rail-label { position: relative; flex: 1 1 0; min-width: 0; height: 13px; display: flex; align-items: flex-start; justify-content: center; }
+.mem-rail-label > span { max-width: 100%; text-align: center; white-space: nowrap; overflow: hidden; font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); text-shadow: 0 0 3px var(--dsw-alias-bg-layer-1), 0 0 3px var(--dsw-alias-bg-layer-1); }
+.mem-rail-label[data-current='true'] > span { color: var(--dsw-alias-brand-primary); font-weight: 600; }
+/* The unit sits beside the rail on the groove's line: same centre as the
+   thumb, so it reads as the rail's unit rather than as a stray word. */
+.mem-rail-unit { flex: 0 0 auto; display: flex; align-items: center; padding-left: 8px; padding-top: calc(var(--lane, 24px) / 2); transform: translateY(-50%); font-size: 11px; line-height: 1; color: var(--dsw-alias-label-secondary); }
 .mem-list { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow: auto; }
 .mem-item { text-align: left; font: inherit; font-size: 13px; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2); color: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
 .mem-item:hover { border-color: var(--dsw-alias-border-l2); }
@@ -481,11 +546,9 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = useState(true)
 
       // length / auto-summary
-      const [presets, setPresets] = useState([100000, 300000, 500000, 800000])
-      const [bounds, setBounds] = useState({ min: 1000, max: 4000000 })
-      const [length, setLength] = useState(100000)
-      const [customLength, setCustomLength] = useState('')
-      const [mode, setMode] = useState('off')
+      const [presets, setPresets] = useState([300, 500, 800, 1000, 1500, 2000, 3000])
+      const [bounds, setBounds] = useState({ min: 300, max: 3000 })
+      const [length, setLength] = useState(1000)
       const [savingLength, setSavingLength] = useState(false)
       const [lengthNote, setLengthNote] = useState(null)
 
@@ -521,12 +584,8 @@ window.__ModuleLoader__.load({
           setStatusError('')
           const settings = result?.settings ?? {}
           if (Array.isArray(settings.presets) && settings.presets.length > 0) setPresets(settings.presets)
-          if (typeof settings.min === 'number') setBounds({ min: settings.min, max: settings.max ?? 4000000 })
-          if (typeof settings.length === 'number') {
-            setLength(settings.length)
-            setCustomLength(String(settings.length))
-          }
-          setMode(settings.mode ?? 'off')
+          if (typeof settings.min === 'number') setBounds({ min: settings.min, max: settings.max ?? 3000 })
+          if (typeof settings.length === 'number') setLength(settings.length)
           setDigestScope('project')
         } catch (error) {
           setStatusError(error.message)
@@ -576,19 +635,6 @@ window.__ModuleLoader__.load({
           setLengthNote({ kind: 'error', text: `保存失败：${error.message}` })
         } finally {
           setSavingLength(false)
-        }
-      }
-
-      /** Persist the automatic generation mode. */
-      async function saveMode(nextMode) {
-        const previous = mode
-        setMode(nextMode)
-        try {
-          await api(ROUTE_SETTINGS, { mode: nextMode })
-          setLengthNote({ kind: 'ok', text: '自动生成设置已保存' })
-        } catch (error) {
-          setMode(previous)
-          setLengthNote({ kind: 'error', text: `保存失败：${error.message}` })
         }
       }
 
@@ -764,30 +810,41 @@ window.__ModuleLoader__.load({
               { className: 'mem-row' },
               h(
                 'div',
-                { className: 'mem-range-wrap' },
+                { className: 'mem-rail-wrap' },
                 (() => {
                   const sliderMax = Math.max(1, presets.length - 1)
                   const sliderValue = Math.max(
                     0,
                     presets.indexOf(isPreset ? length : presets.reduce((best, value, index) => (Math.abs(value - length) < Math.abs(presets[best] - length) ? index : best), 0)),
                   )
-                  const percent = Math.min(100, Math.max(0, (sliderValue / sliderMax) * 100))
+                  // Distance between neighbouring ticks, in % of the track.
+                  const railGap = sliderMax > 0 ? `${100 / sliderMax}%` : '100%'
                   return h(
                     'div',
                     {
-                      className: 'mem-range-rail',
-                      title: `${length.toLocaleString()} 字`,
+                      className: 'mem-rail',
+                      'data-preset-count': presets.length,
+                      style: { '--rail-gap': railGap },
                     },
+                    // The groove and the ticks are drawn separately from the
+                    // native input so the ticks can sit ON the rail; the input's
+                    // own track and thumb stay transparent above them.
+                    h('span', { className: 'mem-rail-track' }),
+                    // One tick per preset, positioned as a percentage of the
+                    // track so it stays aligned with its label at any width.
                     h(
                       'span',
-                      {
-                        className: 'mem-range-badge',
-                        style: { left: `calc(9px + (100% - 18px) * ${percent / 100})` },
-                      },
-                      formatLengthValue(length),
+                      { className: 'mem-rail-ticks', 'aria-hidden': 'true' },
+                      ...presets.map((preset, index) =>
+                        h('i', {
+                          key: preset,
+                          className: 'mem-rail-tick',
+                          'data-current': String(index === sliderValue),
+                          style: { left: `calc(var(--thumb) / 2 + (100% - var(--thumb)) * ${sliderMax > 0 ? index / sliderMax : 0})` },
+                        }),
+                      ),
                     ),
                     h('input', {
-                      className: 'mem-range',
                       type: 'range',
                       min: 0,
                       max: sliderMax,
@@ -796,81 +853,32 @@ window.__ModuleLoader__.load({
                       onChange: (event) => {
                         const next = presets[Number(event.target.value)]
                         setLength(next)
-                        setCustomLength(String(next))
                       },
+                      title: `${length.toLocaleString()} 字`,
                       'aria-label': '记忆摘要长度',
+                      'aria-valuetext': `${length.toLocaleString()} 字`,
                     }),
+                    // One slot per tick, each holding its own label.
+                    h(
+                      'div',
+                      { className: 'mem-rail-labels', 'aria-hidden': 'true' },
+                      ...presets.map((preset, index) =>
+                        h(
+                          'div',
+                          {
+                            key: preset,
+                            className: 'mem-rail-label',
+                            'data-current': String(index === sliderValue),
+                          },
+                          h('span', null, formatLengthValue(preset)),
+                        ),
+                      ),
+                    ),
                   )
                 })(),
-              ),
-              h(
-                'div',
-                { className: 'mem-row', style: { gap: '6px' } },
-                ...presets.map((preset) =>
-                  h(
-                    'button',
-                    {
-                      key: preset,
-                      type: 'button',
-                      className: preset === length ? 'mem-btn mem-btn-primary' : 'mem-btn',
-                      onClick: () => {
-                        setLength(preset)
-                        setCustomLength(String(preset))
-                        void saveLength(preset)
-                      },
-                      disabled: savingLength,
-                    },
-                    preset >= 1000 ? `${preset / 1000}k` : String(preset),
-                  ),
-                ),
-              ),
-            ),
-            h(
-              'div',
-              { className: 'mem-row' },
-              h(Field, { label: '自定义长度（字）' },
-                h('input', {
-                  className: 'mem-input',
-                  type: 'number',
-                  min: bounds.min,
-                  max: bounds.max,
-                  step: 1000,
-                  value: customLength,
-                  onChange: (event) => setCustomLength(event.target.value),
-                  style: { width: '160px' },
-                }),
-              ),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'mem-btn',
-                  disabled: savingLength,
-                  onClick: () => {
-                    const value = Number(customLength)
-                    if (!Number.isFinite(value) || value < bounds.min || value > bounds.max) {
-                      setLengthNote({ kind: 'error', text: `请输入 ${bounds.min} 到 ${bounds.max} 之间的数字` })
-                      return
-                    }
-                    setLength(value)
-                    void saveLength(value)
-                  },
-                },
-                savingLength ? '保存中…' : '应用',
-              ),
-              h('span', { className: 'mem-spacer' }),
-              h(Field, { label: '自动生成' },
-                h(
-                  'select',
-                  {
-                    className: 'mem-select',
-                    value: mode,
-                    onChange: (event) => void saveMode(event.target.value),
-                  },
-                  h('option', { value: 'off' }, '关闭'),
-                  h('option', { value: 'debounced' }, '回合结束后'),
-                  h('option', { value: 'idle' }, '空闲时'),
-                ),
+                // The unit is rendered once, beside the rail, instead of on
+                // every tick label.
+                h('span', { className: 'mem-rail-unit' }, '字'),
               ),
             ),
             h(Note, { kind: lengthNote?.kind }, lengthNote?.text),
@@ -1391,7 +1399,7 @@ window.__ModuleLoader__.load({
         const bound = ctx.locale.bind(NS)
         // Publish the live translator (and its change signal, when the service
         // exposes one) for the components above, which cannot receive ctx.
-        translate = (key, vars) => {
+        localeState.translate = (key, vars) => {
           try {
             const text = bound(key, vars)
             return text === undefined || text === null || text === '' ? key : text
@@ -1401,7 +1409,7 @@ window.__ModuleLoader__.load({
         }
         // `LocaleFace.subscribe` fires on a language switch and on a late
         // dictionary registration, so the page re-renders for both.
-        localeSignal = { subscribe: (fn) => ctx.locale.subscribe(fn) }
+        localeState.signal = { subscribe: (fn) => ctx.locale.subscribe(fn) }
         ctx.effect(() => ctx.locale.register(NS, { zh: ZH, en: EN }), 'dsh-memory:dictionaries')
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
@@ -1409,7 +1417,7 @@ window.__ModuleLoader__.load({
               name: 'settings.section',
               id: 'dsh-memory',
               order: 25,
-              label: () => translate('nav.title'),
+              label: () => callTranslate('nav.title'),
             },
             MemoryPage,
           ),

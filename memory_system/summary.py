@@ -52,16 +52,18 @@ from .text import estimate_tokens
 # ══ constants ═══════════════════════════════════════════════════════════
 
 PROMPT_VERSION = 1
-LENGTH_PRESETS: tuple[int, ...] = (100_000, 300_000, 500_000, 800_000)
-LENGTH_MIN = 1_000
-LENGTH_MAX = 4_000_000
-DEFAULT_LENGTH = 100_000
+LENGTH_PRESETS: tuple[int, ...] = (300, 500, 800, 1_000, 1_500, 2_000, 3_000)
+LENGTH_MIN = LENGTH_PRESETS[0]
+LENGTH_MAX = LENGTH_PRESETS[-1]
+DEFAULT_LENGTH = 1_000
 PROFILE_MAX_CHARS = 100_000
 
 LENGTH_REPLACE = "replace"
 LENGTH_APPEND = "append"
 
-AUTO_MODES: tuple[str, ...] = ("off", "debounced", "idle")
+# Automatic summary generation always runs when the host is idle; there is no
+# user-facing switch, so the stored mode is a single fixed value.
+AUTO_MODE = "idle"
 SCOPES: tuple[str, ...] = ("project", "global")
 
 _TABLE = """
@@ -125,7 +127,11 @@ def parse_iso(raw: str | None) -> datetime | None:
 
 
 def coerce_length(value: Any) -> int:
-    """Validate a slider/custom length. Raises :class:`ValidationError`."""
+    """Validate a summary-length budget. Raises :class:`ValidationError`.
+
+    Any integer inside ``[LENGTH_MIN, LENGTH_MAX]`` is accepted, not only the
+    presets, so a previously stored custom value keeps working.
+    """
     if isinstance(value, bool) or value is None:
         raise ValidationError(f"summary length must be an integer, got {value!r}")
     try:
@@ -139,11 +145,23 @@ def coerce_length(value: Any) -> int:
     return n
 
 
+def nearest_preset(n: int) -> int:
+    """Clamp an arbitrary budget onto the preset grid the slider exposes.
+
+    Used to migrate values stored before the presets shrank to characters
+    (e.g. a 100_000-character budget), instead of silently resetting them.
+    """
+    return min(LENGTH_PRESETS, key=lambda preset: (abs(preset - n), preset))
+
+
 def coerce_mode(value: Any) -> str:
-    mode = str(value or "off").strip().lower()
-    if mode not in AUTO_MODES:
-        raise ValidationError(f"unknown auto mode {value!r}; expected one of {AUTO_MODES}")
-    return mode
+    """Return the fixed auto mode, whatever legacy value was stored.
+
+    Older stores may hold "off" or "debounced" from when the mode was
+    selectable. Those are no longer meaningful, so they read as AUTO_MODE
+    instead of raising — an upgrade must not break on old state.
+    """
+    return AUTO_MODE
 
 
 def coerce_scope(value: Any) -> str:
@@ -201,7 +219,7 @@ class SummarySettings:
     """Everything the host's settings page persists for the memory feature."""
 
     length: int = DEFAULT_LENGTH
-    mode: str = "off"  # auto-generation mode
+    mode: str = AUTO_MODE  # fixed: summaries generate when the host is idle
     updated_at: str | None = None
     profile: str = ""
     profile_updated_at: str | None = None
@@ -227,10 +245,13 @@ def load_settings(store: Store) -> SummarySettings:
         try:
             length = coerce_length(raw_len)
         except ValidationError:
-            length = DEFAULT_LENGTH
-    mode = store.get_meta(META_MODE) or "off"
-    if mode not in AUTO_MODES:
-        mode = "off"
+            # A budget stored under an older, much larger preset grid: snap it
+            # onto the current presets rather than dropping the user's choice.
+            try:
+                length = nearest_preset(int(raw_len))
+            except (TypeError, ValueError):
+                length = DEFAULT_LENGTH
+    mode = coerce_mode(store.get_meta(META_MODE))
     return SummarySettings(
         length=length,
         mode=mode,
@@ -535,6 +556,7 @@ class DigestService:
         return self.settings()
 
     def set_mode(self, mode: Any) -> SummarySettings:
+        """Record the fixed auto mode; kept so old callers keep working."""
         value = coerce_mode(mode)
         with self.store.transaction():
             self.store.set_meta(META_MODE, value)

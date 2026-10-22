@@ -12,7 +12,9 @@ import pytest
 from memory_system import MemorySystem
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
 from memory_system.summary import (
+    AUTO_MODE,
     BACKUP_MARKER,
+    DEFAULT_LENGTH,
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
@@ -21,6 +23,7 @@ from memory_system.summary import (
     clip_to_budget,
     coerce_length,
     export_markdown,
+    nearest_preset,
 )
 
 
@@ -33,13 +36,21 @@ def service(memory: MemorySystem, project: str) -> DigestService:
 
 
 def test_length_presets_and_bounds():
-    assert LENGTH_PRESETS == (100_000, 300_000, 500_000, 800_000)
+    assert LENGTH_PRESETS == (300, 500, 800, 1_000, 1_500, 2_000, 3_000)
+    assert LENGTH_MIN == 300 and LENGTH_MAX == 3_000
     for preset in LENGTH_PRESETS:
         assert coerce_length(preset) == preset
-    assert coerce_length(123_456) == 123_456  # custom values are allowed
     for bad in (LENGTH_MIN - 1, LENGTH_MAX + 1, "abc", None, True):
         with pytest.raises(Exception):
             coerce_length(bad)
+
+
+def test_legacy_large_length_migrates_to_nearest_preset():
+    # Budgets stored under the old (100_000-character) grid snap onto presets.
+    assert nearest_preset(100_000) == 3_000
+    assert nearest_preset(800) == 800
+    assert nearest_preset(0) == 300
+    assert nearest_preset(1_200) == 1_000
 
 
 def test_clip_to_budget_keeps_whole_lines():
@@ -53,11 +64,12 @@ def test_clip_to_budget_keeps_whole_lines():
 
 
 def test_settings_round_trip(service: DigestService):
-    assert service.settings().length == 100_000
-    assert service.set_length(500_000).length == 500_000
-    assert service.set_mode("debounced").mode == "debounced"
-    with pytest.raises(Exception):
-        service.set_mode("sometimes")
+    assert service.settings().length == DEFAULT_LENGTH == 1_000
+    assert service.set_length(500).length == 500
+    # Automatic generation is fixed to idle; there is no switch to turn off.
+    assert service.settings().mode == AUTO_MODE == "idle"
+    assert service.set_mode("debounced").mode == AUTO_MODE
+    assert service.set_mode("off").mode == AUTO_MODE
 
 
 # ── profile ─────────────────────────────────────────────────────────────
@@ -83,14 +95,14 @@ def test_profile_too_long_is_refused(service: DigestService):
 
 def test_plan_uses_memory_and_never_calls_a_model(service: DigestService, memory: MemorySystem, project: str):
     memory.remember(project_id=project, summary="chose sqlite for storage", importance=0.9, event_type="decision")
-    request = service.plan(scope="project", project_id=project, length=300_000)
-    assert request.target_chars == 300_000
+    request = service.plan(scope="project", project_id=project, length=1_500)
+    assert request.target_chars == 1_500
     assert "chose sqlite for storage" in request.user
     assert request.materials["episodes"] == 1
     assert request.sources
     assert request.prompt_version >= 1
     # Same inputs, same prompt: the hash is the cache key a host can trust.
-    again = service.plan(scope="project", project_id=project, length=300_000)
+    again = service.plan(scope="project", project_id=project, length=1_500)
     assert again.prompt_hash == request.prompt_hash
 
 
@@ -248,14 +260,14 @@ def test_bridge_status_reports_project(tmp_path: Path):
     assert response["ok"], response
     result = response["result"]
     assert result["project_id"] == resolve_project_id(str(tmp_path))
-    assert result["settings"]["length"] == 100_000
+    assert result["settings"]["length"] == DEFAULT_LENGTH
     assert result["probe"]["provider"]
 
 
 def test_bridge_digest_flow(tmp_path: Path):
     home = str(tmp_path / "mem")
     base = {"home": home, "project_id": "demo"}
-    plan = handle({"id": "1", "command": "digest.plan", "payload": {**base, "length": 300_000}})
+    plan = handle({"id": "1", "command": "digest.plan", "payload": {**base, "length": 1_500}})
     assert plan["ok"], plan
     request = plan["result"]
     commit = handle(

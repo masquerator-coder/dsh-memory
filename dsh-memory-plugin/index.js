@@ -39,7 +39,8 @@ const DEFAULTS_INNER = {
   memoryHome: '',
   projectOverride: '',
   captureTurns: true,
-  autoSummary: false,
+  // Automatic digests are always on; the switch was removed from the UI.
+  autoSummary: true,
   autoSummaryDelayMs: 15000,
   systemPromptAnchor: true,
   requestTimeoutMs: 60000,
