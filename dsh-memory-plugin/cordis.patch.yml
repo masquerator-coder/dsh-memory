@@ -1,0 +1,26 @@
+- insert:
+    - id: dsh-memory
+      name: 'dsh-memory'
+      config:
+        # Python interpreter that can import `memory_system`.
+        pythonPath: ''
+        # Repository root that owns the `memory_system` package.
+        memorySystemRoot: 'D:\\Coding\\dsh-memory'
+        # Directory holding memory.db; empty means ~/.dsh/memory.
+        memoryHome: ''
+        # Freeze the project id instead of deriving it from the session cwd.
+        projectOverride: ''
+        # Snapshot conversation turns into episodic memory after each turn.
+        captureTurns: true
+        # Ask the session model for a fresh digest once a turn settles.
+        autoSummary: false
+        # Minimal idle gap (ms) between a settled turn and that digest.
+        autoSummaryDelayMs: 15000
+        # Inject the memory anchor block into the system prompt.
+        systemPromptAnchor: true
+        # Per-bridge-request timeout in ms.
+        requestTimeoutMs: 60000
+        # Default scope for the "记忆摘要生成" button: project | global.
+        digestScope: project
+        # Embedding preset forwarded to MemoryConfig (empty = library default).
+        embeddingPreset: ''

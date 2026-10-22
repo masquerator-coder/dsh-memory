@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-system"
+version = "0.1.0"
+description = "Layered agent memory system (L2 episodic / L3 semantic graph / L4 procedural) with a DSH-ready adapter boundary"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# Vector search. Without it the system falls back to a numpy exact scan,
+# which is correct and fast enough for tens of thousands of rows.
+vec = ["sqlite-vec>=0.1.6"]
+# Optional Chinese word segmentation for the lexical index.
+zh = ["jieba>=0.42"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["memory_system*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

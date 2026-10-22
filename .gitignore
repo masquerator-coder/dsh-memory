@@ -1,0 +1,31 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments and build output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Node dependencies for the host plugin
+node_modules/
+
+# Local memory databases and their write-ahead files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Memory backups exported from the running system. They contain conversation
+# text and local paths, so they stay on the machine that produced them.
+dsh-memory-*.md
+
+# Local scratch output
+.tmp_*
+*.log
