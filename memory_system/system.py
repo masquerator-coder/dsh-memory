@@ -256,18 +256,26 @@ class MemorySystem:
         content_key: str | None = None,
         meta: dict[str, Any] | None = None,
         facts: Sequence[FactInput | dict[str, Any]] | None = None,
+        report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """The single high-level write used by both agents and humans.
 
         One call = one episode + zero or more graph facts that cite it. Doing
         both together is what makes provenance complete: the graph never holds
         a claim without an L2 episode behind it.
+
+        ``report`` is an out-parameter, not part of the return value: callers
+        that need to know whether the row was new (a retry of the same
+        observation must not be counted as a write) pass a dict and read
+        ``report["reused"]`` afterwards. Keeping it out of the return type
+        leaves every existing caller untouched.
         """
         self.ensure_project(project_id)
         anchor_id = anchor.anchor_id if isinstance(anchor, Anchor) else anchor
         if anchor_id is None and session_key:
             latest = self.anchors.latest(session_key)
             anchor_id = latest.anchor_id if latest else None
+        before = self.l2.find_duplicate(project_id, summary, content_key) if report is not None else None
         episode = self.l2.add(
             project_id=project_id,
             summary=summary,
@@ -294,6 +302,11 @@ class MemorySystem:
                     "conflict": decision.conflict,
                 }
             )
+        if report is not None:
+            # An existing row was reused when the write did not create a new
+            # id — either the pre-check or ``l2.add``'s own dedup found it.
+            report["reused"] = before is not None or episode.memory_id == getattr(before, "memory_id", None)
+            report["memory_id"] = episode.memory_id
         return {
             "memory_id": episode.memory_id,
             "anchor_id": episode.anchor_id,

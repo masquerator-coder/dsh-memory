@@ -667,6 +667,18 @@ class EpisodicMemory:
             parts.extend(participants)
         return fts_index_text(" ".join(parts), tokenizer=self._tokenizer)
 
+    def find_duplicate(self, project_id: str, summary: str, content_key: str | None = None) -> Episode | None:
+        """The row a write of ``summary`` would be merged into, or ``None``.
+
+        Read-only twin of :meth:`_find_duplicate`: this one never reinforces
+        the match, so a caller may ask "would this be a new row?" *before*
+        writing without side effects.
+        """
+        summary = (summary or "").strip()
+        if not summary:
+            return None
+        return self._find_duplicate(project_id, summary, summary_hash(summary), content_key)
+
     def _find_duplicate(
         self, project_id: str, summary: str, h: str, content_key: str | None
     ) -> Episode | None:

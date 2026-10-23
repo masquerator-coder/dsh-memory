@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from memory_system import MemoryConfig, MemorySystem
 from memory_system.bridge import (
     _git_remote_from_config,
     _strip_label,
+    handle,
     parse_backup_markdown,
     serve,
 )
@@ -117,6 +120,114 @@ def test_git_remote_ignores_url_lookalike_keys(tmp_path):
         '[remote "origin"]\n\turlx = nope\n\turl = git@github.com:me/repo.git\n',
     )
     assert _git_remote_from_config(root) == "git@github.com:me/repo.git"
+
+
+# ── memory.capture idempotency ──────────────────────────────────────────
+#
+# These go through ``handle`` exactly as the host does, so they must pin the
+# store explicitly: ``handle`` resolves an absent ``home`` to the real
+# ``~/.dsh/memory`` and would write into the developer's live database.
+
+
+@pytest.fixture()
+def capture_home(tmp_path):
+    return str(tmp_path / "memory")
+
+
+def _capture(home: str, **payload) -> dict:
+    reply = handle(
+        {
+            "id": "t",
+            "command": "memory.capture",
+            "payload": {"home": home, "project_id": "p", **payload},
+        }
+    )
+    assert reply["ok"], reply.get("error")
+    return reply["result"]
+
+
+def _rows(home: str, project: str = "p") -> int:
+    reply = handle(
+        {
+            "id": "t",
+            "command": "memory.list",
+            "payload": {"home": home, "project_id": project, "limit": 1},
+        }
+    )
+    assert reply["ok"], reply.get("error")
+    return reply["result"]["total"]
+
+
+def test_capture_without_seq_still_absorbs_a_replay(capture_home):
+    """A missing ``seq`` must not cost retry protection.
+
+    The key falls back to ``(session_key, text)``, so a byte-identical replay
+    in the same session is merged instead of inflating the store.
+    """
+    text = "用户要求把记忆系统的备份恢复路径改好"
+    first = _capture(capture_home, text=text, session_key="s1")
+    second = _capture(capture_home, text=text, session_key="s1")
+    assert first["deduped"] is False and first["duplicate"] is False
+    assert second["deduped"] is True and second["captured"] is None
+    assert "text:" in first["dedupe_key"]
+    assert _rows(capture_home) == 1
+
+
+def test_capture_fallback_key_does_not_merge_different_text(capture_home):
+    a = "用户要求把记忆系统的备份恢复路径改好"
+    _capture(capture_home, text=a, session_key="s2")
+    b = _capture(capture_home, text=a + "，另外还要写测试", session_key="s2")
+    assert b["deduped"] is False
+    assert _rows(capture_home) == 2
+
+
+def test_capture_seq_dedupe_is_unchanged(capture_home):
+    text = "回合 3 完成"
+    first = _capture(capture_home, text=text, session_key="s3", seq=7)
+    second = _capture(capture_home, text=text, session_key="s3", seq=7)
+    assert first["deduped"] is False and second["deduped"] is True
+    assert first["dedupe_key"] == "dsh.capture:s3:7"
+    # 0 is a real sequence number, not a missing one.
+    zero = _capture(capture_home, text=text, session_key="s4", seq=0)
+    assert zero["dedupe_key"] == "dsh.capture:s4:0"
+    assert _capture(capture_home, text=text, session_key="s4", seq=0)["deduped"] is True
+
+
+def test_capture_reports_a_content_dedup_as_duplicate(capture_home):
+    """``deduped`` means "the retry key hit"; ``duplicate`` means "no new row".
+
+    Without a session key there is no retry key, yet the write path still
+    merges identical text — the reply must not report that as a fresh write.
+    """
+    text = "无会话键的重复消息内容"
+    first = _capture(capture_home, text=text)
+    second = _capture(capture_home, text=text)
+    assert first["dedupe_key"] is None
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    assert _rows(capture_home) == 1
+
+
+def test_capture_reports_a_genuinely_new_row(capture_home):
+    """A near-miss must not be reported as a duplicate."""
+    base = "用户要求把记忆系统的备份恢复路径改好，并且保留源项目不串味"
+    _capture(capture_home, text=base, session_key="s5")
+    other = _capture(capture_home, text=base.replace("源项目", "原项目"), session_key="s5")
+    assert other["duplicate"] is False
+    assert _rows(capture_home) == 2
+
+
+def test_remember_report_is_opt_in(memory: MemorySystem, project: str):
+    """Passing no ``report`` keeps the return value exactly as before."""
+    plain = memory.remember(project_id=project, summary="不带 report 的写入")
+    assert set(plain) == {"memory_id", "anchor_id", "facts"}
+    report: dict = {}
+    written = memory.remember(project_id=project, summary="带 report 的写入", report=report)
+    assert report["reused"] is False
+    again: dict = {}
+    reused = memory.remember(project_id=project, summary="带 report 的写入", report=again)
+    assert reused["memory_id"] == written["memory_id"]
+    assert again["reused"] is True
 
 
 # ── process survival ────────────────────────────────────────────────────

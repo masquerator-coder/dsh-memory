@@ -39,6 +39,7 @@ from typing import Any, Callable, Iterator
 
 from .config import MemoryConfig
 from .errors import MemoryError, NotFoundError, ProviderError, ValidationError
+from .l2 import summary_hash
 from .summary import (
     AUTO_MODE,
     DEFAULT_LENGTH,
@@ -545,9 +546,14 @@ def cmd_memory_recall(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     """Record one conversation step the host observed.
 
-    The host streams these on every settled turn, so this command is
-    idempotent per ``(session_key, seq)``: a retry, a resumed session, or two
-    host instances must not inflate importance by writing the step twice.
+    Idempotent per ``(session_key, seq)``: a retry, a resumed session, or two
+    host instances must not inflate the store by writing the step twice.
+
+    A caller that omits ``seq`` still gets retry protection — the key falls
+    back to ``(session_key, text)``, which absorbs a byte-identical replay.
+    Callers that omit ``session_key`` too are relying on the write path's
+    content dedup; that is not idempotency, so ``dedupe_key`` says which mode
+    applied instead of pretending the call was protected.
     """
     project = _project(payload)
     text = str(payload.get("text") or "").strip()
@@ -555,10 +561,24 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
         raise BridgeError("bad_request", "text is required")
     session_key = payload.get("session_key")
     seq = payload.get("seq")
-    dedupe_key = f"dsh.capture:{session_key}:{seq}" if session_key and seq is not None else None
+    if session_key and seq is not None:
+        dedupe_key = f"dsh.capture:{session_key}:{seq}"
+    elif session_key:
+        # No sequence number: fall back to the text so an identical replay of
+        # the same message in the same session is still absorbed.
+        dedupe_key = f"dsh.capture:{session_key}:text:{summary_hash(text)}"
+    else:
+        dedupe_key = None
     if dedupe_key and memory.store.get_meta(dedupe_key):
-        return {"captured": None, "deduped": True, "project_id": project}
+        return {
+            "captured": None,
+            "deduped": True,
+            "duplicate": True,
+            "dedupe_key": dedupe_key,
+            "project_id": project,
+        }
     memory.ensure_project(project, display_name=payload.get("display_name"))
+    report: dict[str, Any] = {}
     result = memory.remember(
         project_id=project,
         summary=text,
@@ -571,10 +591,20 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
             "session_id": payload.get("session_id"),
             "seq": seq,
         },
+        report=report,
     )
     if dedupe_key:
         memory.store.set_meta(dedupe_key, "1")
-    return {"captured": _jsonable(result), "deduped": False, "project_id": project}
+    # ``duplicate`` is the honest signal: it is True when no new row appeared,
+    # whether that came from the dedupe key or from the write path merging the
+    # text into an existing episode.
+    return {
+        "captured": _jsonable(result),
+        "deduped": False,
+        "duplicate": bool(report.get("reused")),
+        "dedupe_key": dedupe_key,
+        "project_id": project,
+    }
 
 
 # ── backup / restore ────────────────────────────────────────────────────
