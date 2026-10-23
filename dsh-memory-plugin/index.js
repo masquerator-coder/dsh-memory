@@ -38,11 +38,19 @@ const DEFAULTS_INNER = {
   memorySystemRoot: '',
   memoryHome: '',
   projectOverride: '',
-  captureTurns: true,
+  // Memory is written by the model through `memory_add`, never harvested from
+  // session traffic: the host injects many synthetic user-role messages
+  // (runtime context, skill catalog, compaction checkpoints), and capturing
+  // them as if they were the human's words poisons recall.
+  captureTurns: false,
   // Automatic digests are always on; the switch was removed from the UI.
   autoSummary: true,
   autoSummaryDelayMs: 15000,
   systemPromptAnchor: true,
+  // Model steps between memory reminders; 0 disables the heartbeat.
+  heartbeatSteps: 20,
+  // Ask the model once, at session teardown, for anything still unwritten.
+  sessionEndCheck: true,
   requestTimeoutMs: 60000,
   digestScope: 'project',
   embeddingPreset: '',
@@ -76,6 +84,16 @@ function resolveConfig(input) {
 /** Host services this plugin cannot work without. */
 export const inject = ['tools', 'systemPrompt', 'agents', 'connection']
 
+/** Working directory of the agent behind a tool or assembly context. */
+function cwdOf(context) {
+  return context?.agent?.session?.header?.cwd
+}
+
+/** Session id of the agent behind a tool context. */
+function sessionIdOf(context) {
+  return context?.agent?.session?.id
+}
+
 /** Text of a message's content blocks, ignoring non-text blocks. */
 function messageText(message) {
   const blocks = Array.isArray(message?.content) ? message.content : []
@@ -86,20 +104,67 @@ function messageText(message) {
     .trim()
 }
 
-/** First line of a text, bounded, for use as a memory summary. */
-function headline(text, limit = 400) {
-  const flat = String(text).replace(/\s+/g, ' ').trim()
-  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`
+/**
+ * The human/model exchange of a session, trimmed to what a reviewer needs.
+ *
+ * Only real user turns and assistant replies are kept: synthetic user-role
+ * messages (runtime context, skill catalog, compaction checkpoints) repeat
+ * every turn and would drown the actual conversation the same way they once
+ * poisoned capture. Tool traffic is dropped for the same reason.
+ * @param {any} session - a live or disposed session.
+ * @param {number} limit - characters to keep from the tail.
+ * @returns {string} the transcript tail, or '' when unreadable.
+ */
+function sessionTranscript(session, limit = 8000) {
+  let events = []
+  try {
+    events = session?.snapshotEvents?.() ?? session?.log ?? []
+  } catch {
+    return ''
+  }
+  const lines = []
+  for (const event of events) {
+    const data = event?.data
+    if (event?.type === 'user/message') {
+      if (data?.source?.kind !== 'user') continue
+      const text = messageText(data)
+      if (text) lines.push(`用户：${text}`)
+    } else if (event?.type === 'assistant/message') {
+      const text = messageText(data?.message ?? data)
+      if (text) lines.push(`助手：${text}`)
+    }
+  }
+  const joined = lines.join('\n\n')
+  return joined.length <= limit ? joined : joined.slice(-limit)
 }
 
-/** Working directory of the agent behind a tool or assembly context. */
-function cwdOf(context) {
-  return context?.agent?.session?.header?.cwd
-}
-
-/** Session id of the agent behind a tool context. */
-function sessionIdOf(context) {
-  return context?.agent?.session?.id
+/**
+ * Read the memory list out of a model reply, tolerating prose around the JSON.
+ * @param {string} reply - the raw assistant text.
+ * @returns {Array<{summary: string, event_type: string, importance: number}>} accepted items.
+ */
+function parseMemories(reply) {
+  const text = String(reply ?? '')
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return []
+  let parsed
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return []
+  }
+  const raw = Array.isArray(parsed?.memories) ? parsed.memories : []
+  const allowed = new Set(['decision', 'preference', 'fix', 'fact', 'note'])
+  const items = []
+  for (const entry of raw) {
+    const summary = typeof entry?.summary === 'string' ? entry.summary.trim() : ''
+    if (summary.length < 4) continue
+    const eventType = allowed.has(entry?.event_type) ? entry.event_type : 'note'
+    const importance = Math.min(Math.max(Number(entry?.importance ?? 0.6), 0), 1)
+    items.push({ summary: summary.slice(0, 600), event_type: eventType, importance })
+  }
+  return items.slice(0, 10)
 }
 
 /**
@@ -156,59 +221,7 @@ export function apply(ctx, rawConfig) {
     return client.call(command, { home, embedding_preset: config.embeddingPreset || undefined, ...payload }, signal)
   }
 
-  // ── capture ───────────────────────────────────────────────────────────
-
-  /**
-   * Record one settled user turn into episodic memory.
-   * @param {any} payload - the `session/event` payload.
-   * @returns {Promise<void>} resolves when the write is attempted.
-   */
-  async function captureUserMessage(session, event) {
-    if (!config.captureTurns) return
-    const cwd = session?.header?.cwd
-    rememberCwd(cwd)
-    const projectId = await projectFor(cwd)
-    if (!projectId) return
-    const text = messageText(event.data)
-    if (text.length < 4) return
-    if (projects.get(`skip:${session.id}`) === String(event.seq)) return
-    await call('memory.capture', {
-      project_id: projectId,
-      session_id: session.id,
-      text: headline(text, 1200),
-      event_type: 'user_message',
-      importance: 0.4,
-      source: 'dsh-session',
-      session_key: session.id,
-      seq: event.seq,
-    })
-  }
-
-  /**
-   * Fold one completed turn into a single higher-value memory item.
-   * @param {any} session - the live session.
-   * @param {any} event - the `turn/end` event.
-   * @returns {Promise<void>} resolves when the write is attempted.
-   */
-  async function captureTurnEnd(session, event) {
-    if (!config.captureTurns) return
-    const reason = event?.data?.reason?.kind
-    const projectId = await projectFor(session?.header?.cwd)
-    if (!projectId) return
-    const failed = reason === 'error' || reason === 'aborted'
-    await call('memory.capture', {
-      project_id: projectId,
-      session_id: session.id,
-      text: failed ? `回合 ${event.data.turn} 以 ${reason} 结束` : `回合 ${event.data.turn} 完成`,
-      event_type: failed ? 'turn_failed' : 'turn_completed',
-      importance: failed ? 0.5 : 0.3,
-      source: 'dsh-session',
-      session_key: session.id,
-      outcome: failed ? 'failure' : 'success',
-      seq: event.seq,
-    })
-    if (config.autoSummary) scheduleAutoSummary(session)
-  }
+  // ── heartbeat + auto-summary timing ───────────────────────────────────
 
   /** Pending auto-summary timers, so a later turn can coalesce them. */
   const autoTimers = new Map()
@@ -237,13 +250,101 @@ export function apply(ctx, rawConfig) {
     autoTimers.clear()
   }, 'dsh-memory.auto-summary-timers')
 
+  /**
+   * Model steps taken since the last `memory_add`, per session id.
+   *
+   * The heartbeat is host pacing, not memory logic: it decides *when* to
+   * remind the model, never *what* is worth remembering. The reminder rides
+   * the system-prompt section so it costs no session event.
+   */
+  const stepsSinceWrite = new Map()
+
+  /**
+   * Count one model step toward the next memory reminder.
+   * @param {string} sessionId - the session that took the step.
+   */
+  function bumpStep(sessionId) {
+    if (!sessionId) return
+    stepsSinceWrite.set(sessionId, (stepsSinceWrite.get(sessionId) ?? 0) + 1)
+  }
+
+  /**
+   * Clear a session's counter after it writes a memory.
+   * @param {string} sessionId - the session that called `memory_add`.
+   */
+  function noteMemoryWrite(sessionId) {
+    if (sessionId) stepsSinceWrite.set(sessionId, 0)
+  }
+
   ctx.on('session/event', (session, event) => {
     const type = event?.type
-    if (type !== 'user/message' && type !== 'turn/end') return
-    const task = type === 'user/message' ? captureUserMessage(session, event) : captureTurnEnd(session, event)
-    task.catch((error) => {
+    if (type === 'turn/start') {
+      bumpStep(session?.id)
+      return
+    }
+    if (type !== 'turn/end') return
+    if (config.autoSummary) scheduleAutoSummary(session)
+  })
+
+  ctx.effect(() => () => stepsSinceWrite.clear(), 'dsh-memory.heartbeat-state')
+
+  /**
+   * Last-chance memory check when a session goes away.
+   *
+   * The heartbeat only reminds the model mid-flight; a session that ends right
+   * after a valuable exchange never reaches the next reminder. One model call
+   * at teardown asks whether anything is still unwritten, and writes it
+   * through the same `memory.remember` command the tool uses, so the store
+   * keeps one write path.
+   *
+   * Teardown must never block or throw: the session is already gone, so a
+   * failure is a warning in the log, not an error the host has to handle.
+   * @param {any} session - the disposed session.
+   */
+  async function reviewSessionEnd(session) {
+    if (!config.sessionEndCheck) return
+    const cwd = session?.header?.cwd
+    const projectId = await projectFor(cwd)
+    if (!projectId) return
+    const transcript = sessionTranscript(session)
+    // Too little was said to hold anything the model could not state directly.
+    if (transcript.length < 200) return
+    const llm = ctx.get?.('llm')
+    if (!llm || !lastRoute) return
+    const reply = await collectText(
+      llm,
+      lastRoute,
+      [
+        {
+          role: 'system',
+          content: [
+            '你是记忆整理器。阅读下面这段会话记录，找出其中值得长期保留、但尚未写入记忆库的内容。',
+            '只输出一个 JSON 对象，不要任何解释或代码块：',
+            '{"memories":[{"summary":"一句话，含关键实体与结论","event_type":"decision|preference|fix|fact|note","importance":0.6}]}',
+            '没有值得保留的内容时输出 {"memories":[]}。',
+            '不要记录闲聊、能从代码直接读到的内容、一次性中间步骤。宁缺毋滥。',
+          ].join('\n'),
+        },
+        { role: 'user', content: transcript },
+      ],
+      undefined,
+    )
+    for (const item of parseMemories(reply)) {
+      await call('memory.remember', {
+        project_id: projectId,
+        summary: item.summary,
+        event_type: item.event_type,
+        importance: item.importance,
+        source: 'dsh-session-end',
+        session_key: session?.id,
+      })
+    }
+  }
+
+  ctx.on('session/disposed', (session) => {
+    void reviewSessionEnd(session).catch((error) => {
       if (error?.code === 'DISPOSED') return
-      logger.warn(`[dsh-memory] capture skipped: ${error?.message ?? error}`)
+      logger.warn(`[dsh-memory] session-end memory check failed: ${error?.message ?? error}`)
     })
   })
 
@@ -462,7 +563,24 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
   // ── tools ─────────────────────────────────────────────────────────────
 
   for (const definition of buildTools({ call, projectFor, generateDigest })) {
-    ctx.effect(() => ctx.tools.register(definition), `dsh-memory.tool(${definition.name})`)
+    // The heartbeat only needs to know that the model *made* a recording
+    // attempt, so wrapping here keeps `tools.js` a pure schema+execute module.
+    // A duplicate rejected by the memory store still counts: the model did its
+    // part, and re-reminding it about the same insight is noise.
+    const registered =
+      definition.name === 'memory_add'
+        ? {
+            ...definition,
+            async execute(args, exec) {
+              try {
+                return await definition.execute(args, exec)
+              } finally {
+                noteMemoryWrite(sessionIdOf(exec))
+              }
+            },
+          }
+        : definition
+    ctx.effect(() => ctx.tools.register(registered), `dsh-memory.tool(${registered.name})`)
   }
 
   // ── system prompt anchor ──────────────────────────────────────────────
@@ -531,6 +649,19 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
       })()
     }
 
+    /**
+     * The reminder line for one session, or '' when the heartbeat is quiet.
+     * @param {string | undefined} sessionId - the assembling session.
+     * @returns {string} a one-line nudge, or ''.
+     */
+    function heartbeatLine(sessionId) {
+      const threshold = Number(config.heartbeatSteps) || 0
+      if (threshold <= 0) return ''
+      const steps = stepsSinceWrite.get(sessionId ?? '') ?? 0
+      if (steps < threshold) return ''
+      return `\n\n**记忆提醒**：距上次调用 \`memory_add\` 已过 ${steps} 个回合。若这期间出现了值得长期保留的经验、决策或操作规则，现在就记下来；没有则忽略本条。`
+    }
+
     ctx.effect(
       () =>
         ctx.systemPrompt.section({
@@ -540,9 +671,13 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
           text: (context) => {
             refreshAnchor(context)
             // Same assembly context the refresh just looked at.
-            const slot = anchorCaches.get(context?.agent?.session?.header?.cwd ?? '')
-            if (!slot?.text) return ''
-            return ANCHOR_HEADER.replace('{{memory_anchor}}', slot.text)
+            const session = context?.agent?.session
+            const slot = anchorCaches.get(session?.header?.cwd ?? '')
+            // The rules are unconditional: a project with an empty store still
+            // needs to know that writing memory is its job. Only the anchor
+            // body and the heartbeat vary.
+            const body = slot?.text || '（本项目的记忆库还没有内容。）'
+            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', body)}${heartbeatLine(session?.id)}`
           },
         }),
       'dsh-memory.anchor-section',
@@ -870,6 +1005,11 @@ const ANCHOR_HEADER = [
   '本会话连接了持久记忆库（memory_system）。下面是记忆锚点：只有规模与时间，不含正文。',
   '',
   '{{memory_anchor}}',
+  '',
+  '**写入职责**：记忆库不会自动收录对话，**只有你主动调用 `memory_add` 才会写入**。',
+  '- 遇到**有价值的经验、决策、操作规则、用户明确偏好**时，主动用 `memory_add` 记下来，不要等用户要求。',
+  '- 反例：闲聊、能从代码直接读到的事实、一次性且不会再用的中间步骤，都不要记。',
+  '- 写一条好的记忆 = 一句话说清关键实体与结论，并选对 `event_type`（decision / preference / fix / fact / note）。',
   '',
   '使用方式：',
   '- 需要具体内容时调用 `memory_digest_read` 读摘要全文，或 `memory_recall` 按问题检索事件与事实。',

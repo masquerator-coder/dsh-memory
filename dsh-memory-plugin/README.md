@@ -50,10 +50,12 @@ patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪�
 | `memorySystemRoot` | `''` | 含 `memory_system` 包的仓库根目录，会加入子进程 `PYTHONPATH`；留空则按插件自身位置推导（`bridge.js` 的上一级目录），不绑定某台机器 |
 | `memoryHome` | `''` | 记忆库目录，留空为 `~/.dsh/memory`（或 `$DSH_HOME/memory`） |
 | `projectOverride` | `''` | 固定项目 id，不再按会话工作目录推导 |
-| `captureTurns` | `true` | 自动把用户消息与回合结果记入情景记忆 |
-| `autoSummary` | `true` | 回合结束、空闲后自动生成摘要；常开，界面不提供开关 |
+| `captureTurns` | `false` | 自动把用户消息与回合结果记入情景记忆。**默认关闭**：记忆只由模型通过 `memory_add` 主动写入；宿主注入的合成 user 消息（运行时上下文、技能目录、压缩检查点）若被当作用户发言收录，会污染召回 |
+| `autoSummary` | `true` | 回合结束、空闲后自动生成摘要；常开，界面不提供开关。摘要是**读**记忆，不受 `captureTurns` 影响 |
 | `autoSummaryDelayMs` | `15000` | 回合结束到生成摘要之间的空闲间隔 |
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
+| `heartbeatSteps` | `20` | 距上次 `memory_add` 经过多少个回合后，在系统提示词里追加一次记忆提醒；`0` 关闭 |
+| `sessionEndCheck` | `true` | 会话结束时调用一次模型，检查还有没有未写入的记忆 |
 | `requestTimeoutMs` | `60000` | 单次桥接调用超时；超时会重启子进程，避免响应错位 |
 | `digestScope` | `project` | 设置页「记忆摘要生成」的默认范围 |
 | `embeddingPreset` | `''` | 传给 `MemoryConfig` 的向量化预设 |

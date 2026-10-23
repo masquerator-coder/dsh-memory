@@ -12,8 +12,10 @@
         memoryHome: ''
         # Freeze the project id instead of deriving it from the session cwd.
         projectOverride: ''
-        # Snapshot conversation turns into episodic memory after each turn.
-        captureTurns: true
+        # Snapshot conversation turns into episodic memory. Off: memory is
+        # written by the model through `memory_add`, never harvested from
+        # session traffic.
+        captureTurns: false
         # Generate a fresh digest automatically once the turn settles and the
         # harness goes idle. Always on; there is no user-facing switch.
         autoSummary: true
@@ -21,6 +23,10 @@
         autoSummaryDelayMs: 15000
         # Inject the memory anchor block into the system prompt.
         systemPromptAnchor: true
+        # Model steps between memory reminders; 0 disables the heartbeat.
+        heartbeatSteps: 20
+        # Ask the model once, at session teardown, for anything still unwritten.
+        sessionEndCheck: true
         # Per-bridge-request timeout in ms.
         requestTimeoutMs: 60000
         # Default scope for the "记忆摘要生成" button: project | global.
