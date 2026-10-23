@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_system import MemorySystem
+from memory_system import MemoryConfig, MemorySystem
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
 from memory_system.summary import (
     AUTO_MODE,
@@ -244,15 +244,18 @@ def test_export_markdown_round_trips(memory: MemorySystem, project: str):
     assert len(parsed["memories"]) == 2
 
 
-def test_restore_imports_into_a_fresh_database(memory: MemorySystem, project: str):
+def test_restore_imports_into_a_fresh_database(memory: MemorySystem, project: str, tmp_path: Path):
     memory.remember(project_id=project, summary="第一个事实", event_type="decision")
     DigestService(memory).set_profile("画像内容")
     markdown = export_markdown(memory)
 
-    # Restore into a separate database through the bridge.
+    # Restore into a separate database through the bridge. ``home`` must be
+    # pinned: without it the bridge resolves the real ``~/.dsh/memory`` and the
+    # test would write into the developer's live store.
+    home = str(tmp_path / "restore")
     request = {
         "command": "backup.restore",
-        "payload": {"markdown": markdown, "project_id": project, "dry_run": True},
+        "payload": {"home": home, "markdown": markdown, "project_id": project, "dry_run": True},
     }
     preview = handle({**request, "id": "1"})
     assert preview["ok"], preview
@@ -264,9 +267,12 @@ def test_restore_imports_into_a_fresh_database(memory: MemorySystem, project: st
     assert done["result"]["imported"] == 1
     assert done["result"]["profile_restored"] is True
     # A restore must actually write: reporting an import without a row is the
-    # silent-drop bug a wrapping transaction used to cause.
-    assert memory.store.scalar("SELECT count(*) FROM l2_episodes") == 1
-    assert memory.store.scalar("SELECT summary FROM l2_episodes") == "第一个事实"
+    # silent-drop bug a wrapping transaction used to cause. Read the *restored*
+    # store, not the source one — asserting on ``memory`` here passed even when
+    # the bridge wrote somewhere else entirely.
+    with MemorySystem(MemoryConfig.for_home(home)) as restored:
+        assert restored.store.scalar("SELECT count(*) FROM l2_episodes") == 1
+        assert restored.store.scalar("SELECT summary FROM l2_episodes") == "第一个事实"
 
 
 # ── bridge ──────────────────────────────────────────────────────────────
