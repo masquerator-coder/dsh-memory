@@ -47,7 +47,7 @@ from typing import Any, Iterable, Sequence
 from .errors import ValidationError
 from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
-from .text import estimate_tokens
+from .text import estimate_tokens, fts_index_text
 
 # ══ constants ═══════════════════════════════════════════════════════════
 
@@ -57,6 +57,9 @@ LENGTH_MIN = LENGTH_PRESETS[0]
 LENGTH_MAX = LENGTH_PRESETS[-1]
 DEFAULT_LENGTH = 1_000
 PROFILE_MAX_CHARS = 100_000
+# Ceiling for one memory's summary text, shared by the editor and the restore
+# path so a backup written by another host still round-trips.
+SUMMARY_MAX_CHARS = 8_000
 
 LENGTH_REPLACE = "replace"
 LENGTH_APPEND = "append"
@@ -277,33 +280,77 @@ class Materials:
     chars: int = 0
 
     def render(self, *, max_chars: int) -> str:
-        """One Markdown block. Sections are dropped whole when over budget."""
+        """One Markdown block, trimmed *within* sections to fit ``max_chars``.
+
+        Trimming happens per line, not per section: dropping a whole section
+        when the total overshoots by one character turns "34 memories" into
+        "the memory store is empty", and the digest is then generated from
+        nothing. Sections are emitted in priority order (requests, facts,
+        events, profile) and each one takes the space it needs until the
+        budget runs out; the profile is reserved first because it is the
+        shortest section and the only one the user wrote by hand.
+        """
         budget = max_chars
-        head: list[str] = []
-        if self.user_texts:
-            head.append("## 用户最近的请求\n" + "\n".join(f"- {_one_line(t, 240)}" for t in self.user_texts[:10]))
-        body_facts = [
-            f"- {f['head']} --{f['relation']}--> {f['tail']}（{f['project_id']}，置信度 {f['confidence']:.2f}）"
-            for f in self.facts
-        ]
-        body_eps = [
-            f"- [{e['created_at'][:16]}]（{e['project_id']}，{e.get('event_type') or 'event'}，重要度 {e['importance']:.2f}）"
-            f"{_one_line(e['summary'], 400)}"
-            for e in self.episodes
-        ]
-        if body_facts:
-            head.append("## 已确认的事实\n" + "\n".join(body_facts))
-        if body_eps:
-            head.append("## 事件（由新到旧）\n" + "\n".join(body_eps))
-        if self.profile.strip():
-            head.append("## 用户画像（已由用户确认）\n" + self.profile.strip())
-        if not head:
+        if budget <= 0:
             return ""
-        # Trim from the tail (which holds the profile and the oldest events) so
-        # the freshest material always reaches the model.
-        while head and sum(len(s) for s in head) > budget:
-            head.pop()
-        text = "\n\n".join(head)
+        sections: list[tuple[str, list[str]]] = []
+        if self.user_texts:
+            sections.append(
+                ("## 用户最近的请求", [f"- {_one_line(t, 240)}" for t in self.user_texts[:10]])
+            )
+        if self.facts:
+            sections.append(
+                (
+                    "## 已确认的事实",
+                    [
+                        f"- {f['head']} --{f['relation']}--> {f['tail']}"
+                        f"（{f['project_id']}，置信度 {f['confidence']:.2f}）"
+                        for f in self.facts
+                    ],
+                )
+            )
+        if self.episodes:
+            sections.append(
+                (
+                    "## 事件（由新到旧）",
+                    [
+                        f"- [{e['created_at'][:16]}]（{e['project_id']}，"
+                        f"{e.get('event_type') or 'event'}，重要度 {e['importance']:.2f}）"
+                        f"{_one_line(e['summary'], 400)}"
+                        for e in self.episodes
+                    ],
+                )
+            )
+        profile = self.profile.strip()
+        if profile:
+            sections.append(("## 用户画像（已由用户确认）", [profile]))
+
+        # Reserve the profile first, then spend what is left in priority order.
+        reserve = 0
+        if profile:
+            reserve = min(len(profile) + len(sections[-1][0]) + 2, budget)
+        remaining = budget - reserve
+        out: list[str] = []
+        for title, lines in sections:
+            if title.startswith("## 用户画像"):
+                out.append(f"{title}\n{profile}")
+                continue
+            if remaining <= len(title) + 2:
+                continue
+            keep: list[str] = []
+            used = len(title) + 1
+            for line in lines:
+                cost = len(line) + 1
+                if used + cost > remaining:
+                    break
+                keep.append(line)
+                used += cost
+            if keep:
+                out.append(f"{title}\n" + "\n".join(keep))
+                remaining -= used
+            if remaining <= 0:
+                break
+        text = "\n\n".join(out)
         if len(text) > budget:
             text = text[:budget]
         return text
@@ -967,6 +1014,12 @@ class MemoryNotepad:
         if state:
             where.append("state = ?")
             params.append(state)
+        else:
+            # "No state filter" means "the memories that are still in play", not
+            # "everything ever written": the default listing feeds the entry
+            # counter in the UI, which must not count what the user asked to
+            # forget. Pass ``state="archived"`` to see those.
+            where.append("state != 'archived'")
         if event_type:
             where.append("event_type = ?")
             params.append(event_type)
@@ -1022,8 +1075,8 @@ class MemoryNotepad:
             summary = " ".join(str(patch["summary"] or "").split())
             if not summary:
                 raise ValidationError("summary must be non-empty")
-            if len(summary) > 8000:
-                raise ValidationError("summary is longer than 8000 characters")
+            if len(summary) > SUMMARY_MAX_CHARS:
+                raise ValidationError(f"summary is longer than {SUMMARY_MAX_CHARS} characters")
             sets += ["summary = ?", "summary_hash = ?"]
             from .l2 import summary_hash
 
@@ -1064,7 +1117,9 @@ class MemoryNotepad:
         with self.store.transaction():
             if sets:
                 self.store.execute(f"UPDATE l2_episodes SET {', '.join(sets)} WHERE memory_id = ?", params)
-            # Keep the lexical index in step with the text.
+            # Keep the lexical index in step with the text. The body goes through
+            # the same segmentation the write path uses, or an edited row would
+            # silently drop out of Chinese lexical recall.
             if "summary" in patch:
                 current = self.store.query_one(
                     "SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,)
@@ -1072,7 +1127,13 @@ class MemoryNotepad:
                 self.store.execute("DELETE FROM l2_fts WHERE memory_id = ?", (memory_id,))
                 self.store.execute(
                     "INSERT INTO l2_fts(memory_id, body) VALUES (?, ?)",
-                    (memory_id, f"{current['summary']} {current['event_type'] or ''}"),
+                    (
+                        memory_id,
+                        fts_index_text(
+                            f"{current['summary']} {current['event_type'] or ''}",
+                            tokenizer=self.memory.config.lexical.tokenizer,
+                        ),
+                    ),
                 )
             # Tags live in a meta blob, so they are written through their own
             # helper. Keep it inside this transaction: otherwise a failure
@@ -1082,11 +1143,31 @@ class MemoryNotepad:
         return self.get(memory_id)
 
     def forget(self, memory_id: str) -> dict[str, Any]:
-        """Down-weight instead of deleting: archived rows leave default recall."""
-        return self.update(memory_id, {"state": "archived"})
+        """Soft-delete: archived, and marked so recall will not resurface it.
+
+        The ``forgotten_at`` marker travels outside ``state`` on purpose — decay
+        also writes ``state='archived'``, and only an explicit user instruction
+        should pin an item out of recall regardless of the retention window.
+        """
+        return self._mark_forgotten(memory_id, forgotten=True)
 
     def restore(self, memory_id: str) -> dict[str, Any]:
-        return self.update(memory_id, {"state": "active"})
+        return self._mark_forgotten(memory_id, forgotten=False)
+
+    def _mark_forgotten(self, memory_id: str, *, forgotten: bool) -> dict[str, Any]:
+        updated = self.update(memory_id, {"state": "archived" if forgotten else "active"})
+        with self.store.transaction():
+            if forgotten:
+                self.store.execute(
+                    "UPDATE l2_episodes SET meta = json_set(meta, '$.forgotten_at', ?) WHERE memory_id = ?",
+                    (_iso_now(), memory_id),
+                )
+            else:
+                self.store.execute(
+                    "UPDATE l2_episodes SET meta = json_remove(meta, '$.forgotten_at') WHERE memory_id = ?",
+                    (memory_id,),
+                )
+        return self.get(memory_id)
 
 
 # ══ Markdown export ═════════════════════════════════════════════════════
@@ -1148,7 +1229,17 @@ def export_markdown(
     out += ["## 记忆条目", ""]
     exported = 0
     for pid in selected:
-        listing = notepad.list(project_id=pid, limit=max_episodes, include_superseded=True)
+        if exported >= max_episodes:
+            break
+        # Explicit state so the cap is honoured and archived rows stay out of
+        # the default backup; without ``state`` the listing would fall back to
+        # its "everything still in play" default.
+        listing = notepad.list(
+            project_id=pid,
+            limit=max(1, max_episodes - exported),
+            include_superseded=True,
+            state="active",
+        )
         if not listing["items"]:
             continue
         out += [f"### 项目 {pid}", ""]

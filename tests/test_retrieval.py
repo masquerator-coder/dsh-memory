@@ -103,7 +103,10 @@ def test_token_budget_trims_results(memory: MemorySystem, project: str):
         "hub", SearchOptions(project_ids=[project], k_l3=30, token_budget=40)
     )
     assert result.tokens_estimated <= 40
-    assert result.degraded and "budget_trimmed" in result.degraded
+    # Budget trimming is normal operation, so it is reported on its own field:
+    # ``degraded`` stays reserved for actual failures (a broken search path).
+    assert result.trimmed
+    assert result.degraded is None
 
 
 def test_empty_query_returns_empty(memory: MemorySystem, project: str):

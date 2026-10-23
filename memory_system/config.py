@@ -121,7 +121,17 @@ class L2Config:
     # Below this blended similarity a candidate is dropped before re-ranking:
     # multiplying a near-zero similarity by a high retention would otherwise
     # promote irrelevant-but-fresh rows.
+    #
+    # The floor depends on what "similarity" means for the active backend, so
+    # it is expressed per backend rather than as one number. A real embedding
+    # model puts unrelated text near 0 and synonyms near 0.8; character-ngram
+    # feature hashing gives unrelated CJK text in the same script 0.1-0.2 and
+    # only drops to ~0 when the strings share no n-grams at all. One shared
+    # floor therefore either floods hash recall with noise or starves model
+    # recall — which is exactly what a single 0.12 did.
     min_similarity: float = 0.12
+    # Applied instead of ``min_similarity`` when the provider is purely lexical.
+    min_similarity_lexical: float = 0.25
     # Near-duplicate suppression on the write path.
     dedup_similarity: float = 0.95
     candidate_limit: int = 32

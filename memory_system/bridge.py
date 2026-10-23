@@ -46,6 +46,7 @@ from .summary import (
     LENGTH_MIN,
     LENGTH_PRESETS,
     PROMPT_VERSION,
+    SUMMARY_MAX_CHARS,
     DigestService,
     MemoryNotepad,
     SummarySettings,
@@ -689,10 +690,17 @@ def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
     if not text.strip():
         raise BridgeError("bad_request", "nothing to restore: pass path or markdown")
     dry_run = _bool(payload.get("dry_run"))
+    # ``project_id`` here is only the fallback for items that carry none (a
+    # foreign Markdown file). An exported backup records its own project on
+    # every item; honouring that is what keeps a restore from dumping every
+    # project into whichever one happens to be current.
     default_project = _project(payload)
     parsed = parse_backup_markdown(text)
     imported: list[str] = []
     skipped = 0
+    failed: list[dict[str, Any]] = []
+    too_long = 0
+    limit = SUMMARY_MAX_CHARS
     notepad = MemoryNotepad(memory)
     service = DigestService(memory)
     # No enclosing transaction: ``remember`` opens its own, and an outer BEGIN
@@ -709,16 +717,28 @@ def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
         if not summary:
             skipped += 1
             continue
+        if len(summary) > limit:
+            # The editor's ceiling, enforced here so a backup of a row written
+            # through another path still restores: a crash on one entry would
+            # abort the remaining ones, and silently skipping it loses data.
+            too_long += 1
+            summary = summary[:limit]
         project = item.get("project_id") or default_project
         if dry_run:
             imported.append(project)
             continue
-        result = memory.remember(
-            project_id=project,
-            summary=summary,
-            event_type=payload.get("event_type") or "restored",
-            meta={"source": "backup-restore", "memory_id": item.get("memory_id")},
-        )
+        try:
+            result = memory.remember(
+                project_id=project,
+                summary=summary,
+                event_type=payload.get("event_type") or "restored",
+                meta={"source": "backup-restore", "memory_id": item.get("memory_id")},
+            )
+        except (ValidationError, MemoryError, BridgeError) as exc:
+            # Report, never swallow: an entry that did not land must not be
+            # counted in ``imported``.
+            failed.append({"memory_id": item.get("memory_id"), "error": str(exc)[:200]})
+            continue
         memory_id = result["memory_id"]
         if item.get("outcome"):
             try:
@@ -732,6 +752,8 @@ def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
         "planned": len(imported),
         "projects": sorted(set(imported)),
         "skipped": skipped,
+        "truncated": too_long,
+        "failed": failed,
         "profile_restored": bool(parsed["profile"]) and not dry_run,
         "header": parsed["header"],
     }

@@ -129,6 +129,12 @@ def tokenize(text: str, *, tokenizer: str = "auto", max_term_len: int = 24) -> l
 
     Order is preserved and duplicates kept: FTS5 uses positions, so repeated
     terms carry phrase-proximity information.
+
+    Single Han characters are dropped when the segmenter produces them: a
+    one-character term such as 的 / 了 / 是 appears in almost every Chinese
+    sentence, so indexing it matches everything and defeats the BM25 ranking.
+    The bigram path never emits a lone character for a multi-character run, so
+    this only prunes noise, not recall.
     """
     if not text:
         return []
@@ -143,6 +149,11 @@ def tokenize(text: str, *, tokenizer: str = "auto", max_term_len: int = 24) -> l
             for word in _jieba().cut(run, HMM=False):
                 word = word.strip()
                 if not word or all(not (is_han(c) or c.isalnum()) for c in word):
+                    continue
+                # A 1-char Chinese term is a function word or a stray particle
+                # more often than a real term; a multi-char run's bigrams cover
+                # the case where it matters.
+                if len(word) == 1 and is_han(word):
                     continue
                 terms.append(word)
         else:
@@ -245,3 +256,16 @@ def fts_match_expression(text: str, *, tokenizer: str = "auto") -> str | None:
         return None
     quoted = ['"' + t.replace('"', '""') + '"' for t in terms]
     return " OR ".join(quoted)
+
+
+def fts_index_text(text: str, *, tokenizer: str = "auto") -> str:
+    """The body to store in an FTS5 column that is searched with :func:`tokenize`.
+
+    The tables use ``tokenize='unicode61'``, which splits on non-alphanumerics:
+    a Chinese sentence becomes **one** token and can never be matched by a
+    multi-character query. Storing the pre-segmented term stream (the same
+    stream ``fts_match_expression`` builds queries from) makes the index and
+    the queries speak the same vocabulary, and leaves Latin text intact because
+    ``tokenize`` already lowercases and splits it.
+    """
+    return " ".join(tokenize(text, tokenizer=tokenizer))

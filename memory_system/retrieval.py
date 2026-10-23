@@ -134,6 +134,9 @@ class SearchResult:
     rewrites: list[str] = field(default_factory=list)
     timings_ms: dict[str, float] = field(default_factory=dict)
     degraded: str | None = None
+    # Budget trimming is normal operation, not a fault: keep it out of
+    # ``degraded`` so a caller watching that field still sees real failures.
+    trimmed: bool = False
     tokens_estimated: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,6 +150,7 @@ class SearchResult:
             "rewrites": self.rewrites,
             "timings_ms": self.timings_ms,
             "degraded": self.degraded,
+            "trimmed": self.trimmed,
         }
 
     @property
@@ -230,6 +234,8 @@ class Retriever:
             return result
 
         # 1. L2 recall always (cheap, and the "what happened" half of recall).
+        # ``include_archived`` stays False: a user-archived row must not come
+        # back just because the caller widened the decay window.
         t0 = time.perf_counter()
         try:
             result.episodes = self.episodic.search(
@@ -631,7 +637,7 @@ class Retriever:
                 result.facts.pop()
             else:
                 result.episodes.pop()
-            result.degraded = (result.degraded or "") + " budget_trimmed" if result.degraded else "budget_trimmed"
+            result.trimmed = True
         result.tokens_estimated = self._estimate_tokens(result)
 
     def _embed(self, text: str) -> list[float]:

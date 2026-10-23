@@ -107,7 +107,6 @@ class Maintenance:
         force: bool = False,
     ) -> list[TaskReport]:
         """Run the due tasks (or the named ones; ``force`` ignores cadence)."""
-        wanted = tasks or self.due()
         reports: list[TaskReport] = []
         handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "decay": self._decay,
@@ -116,6 +115,16 @@ class Maintenance:
             "archive_scan": lambda **kw: self._archive_scan(project_ids=project_ids),
             "promotions": lambda **kw: self._promotions(),
         }
+        # ``force`` has to widen the candidate set, not just the guard below:
+        # deriving ``wanted`` from ``due()`` first made a forced run on a fresh
+        # database a no-op (nothing was due yet), which is the opposite of what
+        # every caller asking for ``force=True`` means.
+        if tasks:
+            wanted = list(tasks)
+        elif force:
+            wanted = list(handlers)
+        else:
+            wanted = self.due()
         for name in wanted:
             handler = handlers.get(name)
             if handler is None:

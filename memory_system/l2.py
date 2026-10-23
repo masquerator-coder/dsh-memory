@@ -35,7 +35,7 @@ from .config import L2Config, MemoryConfig
 from .embedding import EmbeddingProvider
 from .errors import NotFoundError
 from .storage import Store, json_dumps, json_loads, parse_iso, to_iso, utcnow
-from .text import estimate_tokens, fts_match_expression
+from .text import estimate_tokens, fts_index_text, fts_match_expression
 
 STATE_ACTIVE = "active"
 STATE_DORMANT = "dormant"
@@ -418,7 +418,14 @@ class EpisodicMemory:
         # A candidate whose blended similarity is negligible is noise from a
         # k-NN over-fetch, not a recollection. Dropping it early prevents
         # retention from *inflating* an irrelevant row into the answer list.
-        candidates = {mid: sim for mid, sim in candidates.items() if sim >= self.cfg.min_similarity}
+        # Lexical hits carry a normalised bm25 score (>= 0.45 by construction),
+        # so the floor is only meaningful for the vector half.
+        floor = self._similarity_floor()
+        candidates = {
+            mid: sim
+            for mid, sim in candidates.items()
+            if sim >= floor or mid in lex_hits
+        }
         if not candidates:
             return []
 
@@ -429,11 +436,18 @@ class EpisodicMemory:
             states.add(STATE_DORMANT)
         if include_archived:
             states.add(STATE_ARCHIVED)
+        forgotten = set(self._forgotten_ids(candidates.keys()))
         for memory_id, similarity in candidates.items():
             ep = episodes.get(memory_id)
             if ep is None or ep.project_id not in project_ids:
                 continue
             if ep.superseded_by and not include_superseded:
+                continue
+            # A user who said "forget this" must not get the item back from the
+            # next recall. Decay-archived rows may opt in through
+            # ``include_archived``; a user-archived row never does, because the
+            # request was explicit and is reversible only via ``restore``.
+            if memory_id in forgotten:
                 continue
             if event_types and ep.event_type not in event_types:
                 continue
@@ -560,6 +574,47 @@ class EpisodicMemory:
         )
         return {int(r["ord"]) for r in rows}
 
+    def _similarity_floor(self) -> float:
+        """Noise floor for cosine similarity, chosen for the active backend.
+
+        The provider's own ``name`` is the authority, but L2 may hold an
+        :class:`~memory_system.cache.EmbeddingCache` (which exposes no
+        ``name``) and a fallback provider can override it, so walk to the
+        innermost object that declares one before falling back to config.
+        """
+        name: Any = None
+        provider: Any = self.embeddings
+        for _ in range(4):
+            name = getattr(provider, "name", None)
+            if name is not None:
+                break
+            provider = getattr(provider, "provider", None)
+            if provider is None:
+                break
+        if name is None:
+            name = self.config.embedding.provider
+        if name in ("hash", "degraded"):
+            return self.cfg.min_similarity_lexical
+        return self.cfg.min_similarity
+
+    def _forgotten_ids(self, memory_ids: Iterable[str]) -> list[str]:
+        """Rows the user archived explicitly, as opposed to decay-archived ones.
+
+        ``forget()`` stamps ``meta.forgotten_at``; ``restore()`` clears it. The
+        marker, not the ``state`` column, is what distinguishes an instruction
+        ("never show me this again") from a consequence (decay).
+        """
+        ids = [m for m in memory_ids if m]
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        rows = self.store.query(
+            f"SELECT memory_id FROM l2_episodes "
+            f"WHERE memory_id IN ({marks}) AND json_extract(meta, '$.forgotten_at') IS NOT NULL",
+            ids,
+        )
+        return [row["memory_id"] for row in rows]
+
     def _ids_by_ordinal(self, ordinals: Iterable[int]) -> dict[int, str]:
         ords = [int(o) for o in ordinals]
         if not ords:
@@ -599,12 +654,18 @@ class EpisodicMemory:
         return out
 
     def _fts_body(self, summary: str, event_type: str | None, participants: Sequence[str] | None) -> str:
+        """The pre-segmented body stored in ``l2_fts``.
+
+        Segmentation happens here, not in SQLite: the table's ``unicode61``
+        tokenizer treats a whole Chinese sentence as one token, so a query term
+        would never match. See :func:`~memory_system.text.fts_index_text`.
+        """
         parts = [summary]
         if event_type:
             parts.append(event_type)
         if participants:
             parts.extend(participants)
-        return " ".join(parts)
+        return fts_index_text(" ".join(parts), tokenizer=self._tokenizer)
 
     def _find_duplicate(
         self, project_id: str, summary: str, h: str, content_key: str | None
