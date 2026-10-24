@@ -293,3 +293,34 @@ def test_communities_ignore_disputed_and_forgotten_source_edges(memory: MemorySy
     # After the forget the pair must not share a cluster: isolated entities
     # fall under min_size and drop out entirely (None), or land elsewhere.
     assert epsilon is None or zeta is None or epsilon != zeta
+
+
+def test_as_of_recall_answers_the_belief_state_at_that_time(memory: MemorySystem, project: str):
+    """``as_of`` must select the validity window, not be dropped: recall at T
+    shows the edges whose interval covers T — earlier beliefs stay visible
+    after they were superseded by intuition of "current", closed/retracted
+    rows are hidden after their ``valid_to``, future-dated facts do not leak
+    back in."""
+    early = memory.l3.add_fact(
+        project,
+        FactInput(head="gateway", relation="depends_on", tail="bank-api"),
+        recorded_at="2026-01-01T00:00:00+00:00",
+    )
+    assert early.status != "rejected"
+    memory.l3.close_edge(early.edge.edge_id, valid_to="2026-03-01T00:00:00+00:00")
+    late = memory.l3.add_fact(
+        project,
+        FactInput(head="gateway", relation="depends_on", tail="bank-api-eu"),
+        recorded_at="2026-04-01T00:00:00+00:00",
+    )
+    assert late.status != "rejected"
+
+    between = memory.recall("gateway depends_on", project_id=project, as_of="2026-02-01T00:00:00+00:00")
+    tails = {h.tail.name for h in between.facts}
+    assert "bank-api" in tails
+    assert "bank-api-eu" not in tails  # valid_from is 2026-04-01: not believed yet
+
+    after = memory.recall("gateway depends_on", project_id=project, as_of="2026-05-01T00:00:00+00:00")
+    tails = {h.tail.name for h in after.facts}
+    assert "bank-api-eu" in tails
+    assert "bank-api" not in tails  # closed at 2026-03-01

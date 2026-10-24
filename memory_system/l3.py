@@ -896,16 +896,32 @@ class SemanticMemory:
         sql = "SELECT * FROM l3_edges WHERE " + " AND ".join(clauses)
         return [Edge.from_row(r) for r in self.store.query(sql, params)]
 
-    def neighbors(self, entity_ids: Sequence[str], *, current_only: bool = True) -> list[Edge]:
+    def neighbors(self, entity_ids: Sequence[str], *, current_only: bool = True,
+                  at: str | None = None) -> list[Edge]:
         if not entity_ids:
             return []
         marks = ",".join("?" * len(entity_ids))
-        extra = " AND valid_to IS NULL" if current_only else ""
+        extra, extra_params = self._validity_clause(current_only, at)
         rows = self.store.query(
             f"SELECT * FROM l3_edges WHERE (head_id IN ({marks}) OR tail_id IN ({marks})){extra}",
-            [*entity_ids, *entity_ids],
+            [*entity_ids, *entity_ids, *extra_params],
         )
         return [Edge.from_row(r) for r in rows]
+
+    @staticmethod
+    def _validity_clause(current_only: bool, at: str | None) -> tuple[str, list[str]]:
+        """SQL fragment selecting the valid-at-``at`` interval of each triple.
+
+        ``at`` is the as-of point: an edge was believed at T iff its interval
+        contains it. closed edges tile the timeline exactly (a superseded
+        row's ``valid_to`` is the successor's ``valid_from``), so the strict
+        ``T < valid_to`` comparison picks exactly one version per triple.
+        """
+        if at is not None:
+            return " AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)", [at, at]
+        if current_only:
+            return " AND valid_to IS NULL", []
+        return "", []
 
     # ══ validation helpers ══════════════════════════════════════════════
     def _would_cycle(self, project_id: str, head_id: str, relation: str, tail_id: str) -> bool:
@@ -1187,7 +1203,7 @@ class SemanticMemory:
 
     # ══ bulk read helpers used by retrieval/communities ═════════════════
     def load_subgraph(
-        self, project_ids: Sequence[str], *, current_only: bool = True
+        self, project_ids: Sequence[str], *, current_only: bool = True, at: str | None = None
     ) -> tuple[dict[str, Entity], list[Edge]]:
         if not project_ids:
             return {}, []
@@ -1201,11 +1217,12 @@ class SemanticMemory:
                 )
             )
         }
-        extra = " AND valid_to IS NULL" if current_only else ""
+        extra, extra_params = self._validity_clause(current_only, at)
         edges = [
             Edge.from_row(r)
             for r in self.store.query(
-                f"SELECT * FROM l3_edges WHERE project_id IN ({marks}){extra}", list(project_ids)
+                f"SELECT * FROM l3_edges WHERE project_id IN ({marks}){extra}",
+                [*project_ids, *extra_params],
             )
         ]
         return entities, edges

@@ -255,6 +255,7 @@ class Retriever:
                 project_ids=project_ids,
                 k=options.k_l2,
                 include_dormant=options.include_dormant,
+                until=options.as_of,
             )
         except Exception as exc:  # noqa: BLE001 - recall must never break the turn
             result.degraded = f"l2_search_failed: {type(exc).__name__}: {exc}"
@@ -321,7 +322,7 @@ class Retriever:
             return []
 
         max_hops = min(options.max_hops or self.cfg.fast_max_hops, self.cfg.fast_max_hops)
-        adjacency = self._adjacency(project_ids)
+        adjacency = self._adjacency(project_ids, as_of=options.as_of)
         entities, _ = self.semantic.load_subgraph(project_ids)
         deadline = time.perf_counter() + self.cfg.fast_timeout_ms / 1000.0
 
@@ -401,15 +402,22 @@ class Retriever:
             path=path, source=source,
         )
 
-    def _adjacency(self, project_ids: Sequence[str]) -> dict[str, list[Edge]]:
-        """Cached current-edge adjacency for the given projects.
+    def _adjacency(self, project_ids: Sequence[str], *, as_of: str | None = None) -> dict[str, list[Edge]]:
+        """Current-edge adjacency for the given projects, or as-of adjacency.
 
         Edges justified *only* by user-forgotten episodes are left out: a fact
         whose every source was ``forget()``-ed must stop surfacing here too, or
         the graph would keep serving content L2 already refuses to return.
+
+        ``as_of`` answers "what did we believe at T" and bypasses the cache:
+        it reads the validity interval visible at T instead of the current
+        one, a different answer by construction.
         """
         if not project_ids:
             return {}
+        if as_of is not None:
+            edges = self.semantic.load_subgraph(project_ids, current_only=True, at=as_of)[1]
+            return self._build_adjacency(edges)
         signature = ",".join(sorted(project_ids))
         # Content-derived, not rowcount-derived: the graph mutates mostly by
         # UPDATE, not INSERT. close/retract flip valid_to (the row leaves the
@@ -440,6 +448,12 @@ class Retriever:
         if cache is not None and cache[0] == stamp and cache[1] == signature:
             return cache[2]
         _, edges = self.semantic.load_subgraph(project_ids, current_only=True)
+        adjacency = self._build_adjacency(edges)
+        self._adjacency_cache = (stamp, signature, adjacency)
+        return adjacency
+
+    def _build_adjacency(self, edges: list[Edge]) -> dict[str, list[Edge]]:
+        """Shared adjacency construction: drop lost-source edges, index both ends."""
         forgotten = set(self.episodic._forgotten_ids(itertools.chain.from_iterable(
             edge.meta.get("episode_ids") or () for edge in edges
         )))
@@ -449,7 +463,6 @@ class Retriever:
                 continue
             adjacency.setdefault(edge.head_id, []).append(edge)
             adjacency.setdefault(edge.tail_id, []).append(edge)
-        self._adjacency_cache = (stamp, signature, adjacency)
         return adjacency
 
     def _visible_edges(self, edges: Iterable[Edge]) -> list[Edge]:
@@ -519,16 +532,17 @@ class Retriever:
         if not seeds:
             return [], self._communities_for(query, project_ids), []
 
-        list_ppr = self._ppr_facts(query, project_ids, seeds)
-        rewrites, list_rewrite = self._iterative_rewrites(query, project_ids, seeds)
+        list_ppr = self._ppr_facts(query, project_ids, seeds, as_of=options.as_of)
+        rewrites, list_rewrite = self._iterative_rewrites(query, project_ids, seeds, as_of=options.as_of)
         communities = self._communities_for(query, project_ids)
         return [list_ppr, list_rewrite], communities, rewrites
 
     def _ppr_facts(
-        self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]]
+        self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]],
+        *, as_of: str | None = None,
     ) -> list[FactHit]:
         """Personalized PageRank from the seeds; edges are ranked by endpoint mass."""
-        adjacency = self._adjacency(project_ids)
+        adjacency = self._adjacency(project_ids, as_of=as_of)
         entities, _ = self.semantic.load_subgraph(project_ids, current_only=True)
         restart: dict[str, float] = {}
         total = sum(max(sim, 1e-6) for _, sim in seeds) or 1.0
@@ -557,7 +571,7 @@ class Retriever:
         ranked = sorted(rank.items(), key=lambda kv: -kv[1])
         top = {node: value for node, value in ranked[: self.cfg.deep_ppr_max_nodes]}
         hits: list[FactHit] = []
-        for edge in self._visible_edges(self.semantic.neighbors(list(top), current_only=True)):
+        for edge in self._visible_edges(self.semantic.neighbors(list(top), current_only=True, at=as_of)):
             if edge.disputed:
                 continue
             head = entities.get(edge.head_id)
@@ -582,7 +596,8 @@ class Retriever:
         return hits[: self.cfg.deep_top_k]
 
     def _iterative_rewrites(
-        self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]]
+        self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]],
+        *, as_of: str | None = None,
     ) -> tuple[list[str], list[FactHit]]:
         """Detect an evidence gap, run structured sub-queries, merge results.
 
@@ -594,7 +609,7 @@ class Retriever:
         if len(seeds) < 2:
             return rewrites, []
         seed_ids = [e.entity_id for e, _ in seeds[:4]]
-        adjacency = self._adjacency(project_ids)
+        adjacency = self._adjacency(project_ids, as_of=as_of)
         seed_set = set(seed_ids)
         connected = False
         for entity_id in seed_ids:
@@ -608,7 +623,7 @@ class Retriever:
         entities, _ = self.semantic.load_subgraph(project_ids, current_only=True)
         hits: list[FactHit] = []
         rewrites.append("connect_seeds:" + "+".join(sorted(seed_set))[:80])
-        for edge in self._visible_edges(self.semantic.neighbors(seed_ids, current_only=True)):
+        for edge in self._visible_edges(self.semantic.neighbors(seed_ids, current_only=True, at=as_of)):
             head = entities.get(edge.head_id)
             tail = entities.get(edge.tail_id)
             if head is None or tail is None or edge.disputed:

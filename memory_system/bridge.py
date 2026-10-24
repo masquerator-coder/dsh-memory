@@ -590,6 +590,7 @@ def cmd_memory_recall(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
         k_l2=_limit(payload, "k_l2", 6, 40),
         k_l3=_limit(payload, "k_l3", 8, 40),
         include_dormant=_bool(payload.get("include_dormant")),
+        as_of=str(payload["as_of"]) if payload.get("as_of") else None,
     )
     return {"result": _jsonable(result.to_dict()), "project_id": project}
 
