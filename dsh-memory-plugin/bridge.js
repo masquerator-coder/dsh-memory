@@ -209,19 +209,18 @@ export class BridgeClient {
         continue
       }
       // Match by the response id, not arrival order: several HTTP routes share
-      // this bridge, so requests interleave, and a timed-out request that has
-      // already left `pending` must not shift the next answer onto a
-      // neighbour's promise.
-      const at = message.id === undefined ? -1 : this.pending.findIndex((item) => item.id === message.id)
-      const entry = at >= 0 ? this.pending[at] : this.pending.shift()
-      if (!entry) {
-        this.logger.warn('[dsh-memory] bridge answered with no request pending')
+      // this bridge, so requests interleave, and a timed-out or aborted
+      // request that has already left `pending` must not shift the next answer
+      // onto a neighbour's promise. A response whose id matches nothing is a
+      // late answer to a request that is gone: drop it. Waiters resolve
+      // through their own timers or rejections.
+      const at = this.pending.findIndex((item) => item.id === message.id)
+      if (at < 0) {
+        this.logger.warn(`[dsh-memory] bridge answered an unknown id, dropping: ${String(message.id).slice(0, 40)}`)
         continue
       }
-      if (at >= 0) this.pending.splice(at, 1)
-      else if (message.id !== undefined) {
-        this.logger.warn(`[dsh-memory] bridge answered an unknown id: ${String(message.id).slice(0, 40)}`)
-      }
+      const entry = this.pending[at]
+      this.pending.splice(at, 1)
       clearTimeout(entry.timer)
       if (message.ok) {
         entry.resolve(message.result)
