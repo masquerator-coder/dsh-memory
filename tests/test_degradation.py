@@ -35,8 +35,50 @@ def test_facade_prewarms_on_open():
         system.close()
 
 
+def test_vec0_and_exact_agree_on_cosine_distance():
+    """vec0's native metric is Euclidean, but knn's contract is cosine
+    distance — every caller (`1.0 - distance`) and every stored threshold
+    (dedup 0.95, min_similarity 0.12, ...) is built on it. The sqlite-vec
+    branch must convert so both backends answer identically."""
+    import sqlite3
+
+    from memory_system.embedding import _l2_normalize
+    from memory_system.vectors import VectorIndex
+
+    pytest.importorskip("sqlite_vec")
+
+    vectors = [
+        _l2_normalize([1.0, 2.0, 0.0]),
+        _l2_normalize([2.0, 3.9, 0.0]),  # near-duplicate of the first
+        _l2_normalize([0.0, 0.0, 1.0]),  # orthogonal
+    ]
+    query = vectors[0]
+
+    results: dict[str, list[tuple[int, float]]] = {}
+    for backend, enabled in (("sqlite-vec", True), ("exact", False)):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        index = VectorIndex(conn, dim=3, enabled=enabled)
+        assert index.backend == backend
+        for i, vec in enumerate(vectors, start=1):
+            index.upsert("l2", i * 10, vec)
+        results[backend] = index.knn("l2", query, k=3)
+        conn.close()
+
+    vec_pairs, exact_pairs = results["sqlite-vec"], results["exact"]
+    assert [rowid for rowid, _ in vec_pairs] == [rowid for rowid, _ in exact_pairs]
+    for (_, vd), (_, ed) in zip(vec_pairs, exact_pairs):
+        assert vd == pytest.approx(ed, abs=1e-3)
+    by_rowid = dict(vec_pairs)
+    assert by_rowid[10] == pytest.approx(0.0, abs=1e-5)  # identical vector
+    assert by_rowid[20] < 0.05  # near-duplicate stays confidently close
+    assert by_rowid[30] == pytest.approx(1.0, abs=1e-3)  # orthogonal
+
+
 def test_exact_scan_fallback(monkeypatch):
     from memory_system.vectors import VectorIndex
+
 
     monkeypatch.setattr(
         VectorIndex, "_try_sqlite_vec", lambda self: setattr(self, "_load_error", "simulated missing")

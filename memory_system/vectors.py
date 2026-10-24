@@ -163,20 +163,32 @@ class VectorIndex:
             table = VEC_TABLES[kind]
             payload = self._sqlite_vec.serialize_float32(list(query))
             if allowed_rowids is None:
-                rows = self.conn.execute(
-                    f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (payload, k),
-                ).fetchall()
+                fetch = k
             else:
                 if not allowed_rowids:
                     return []
                 # vec0 cannot constrain by an arbitrary rowid set; over-fetch and filter.
-                rows = self.conn.execute(
-                    f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (payload, max(k * 8, 64)),
-                ).fetchall()
+                fetch = max(k * 8, 64)
+            rows = self.conn.execute(
+                f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (payload, fetch),
+            ).fetchall()
+            if allowed_rowids is not None:
                 rows = [r for r in rows if r["rowid"] in allowed_rowids][:k]
-            return [(int(r["rowid"]), float(r["distance"])) for r in rows]
+            out: list[tuple[int, float]] = []
+            for r in rows:
+                # vec0's default metric is Euclidean. For unit vectors the two
+                # are the same ordering — ||a-b||² = 2 - 2·cos — so converting
+                # here (cos_dist = ||a-b||²/2) honours the cosine-distance
+                # contract every caller builds on (`1.0 - distance`), and the
+                # over-fetch window above stays valid. Vectors are normalized
+                # at write time by the provider (`normalize=True` default);
+                # a provider that disables normalization breaks the geometry
+                # on the exact backend too, so this is the shared assumption,
+                # not a per-backend one.
+                l2 = float(r["distance"])
+                out.append((int(r["rowid"]), (l2 * l2) / 2.0))
+            return out
 
         rows = self.conn.execute(
             f"SELECT rowid, embedding FROM {_KIND_FALLBACK_TABLE} WHERE kind = ?", (kind,)
