@@ -129,6 +129,19 @@ def test_cycle_detection_for_acyclic_relations(memory: MemorySystem, project: st
     assert cyclic.reason == "cycle"
 
 
+def test_cycle_is_per_relation_not_crossed_between_rels(memory: MemorySystem, project: str):
+    """Separate acyclic relations must not merge into one cycle-detection
+    adjacency: a mix of is_a/causes/part_of chains is not a cycle in any
+    single relation, so writing `part_of` must not be refused."""
+    assert memory.l3.add_fact(project, fact("a", "is_a", "b")).status == "accepted"
+    assert memory.l3.add_fact(project, fact("b", "causes", "c")).status == "accepted"
+    assert memory.l3.add_fact(project, fact("a", "part_of", "c")).status == "accepted"
+    # A real cycle within one relation is still caught.
+    assert memory.l3.add_fact(project, fact("c", "depends_on", "d")).status == "accepted"
+    # A real cycle within one relation is still caught.
+    assert memory.l3.add_fact(project, fact("d", "depends_on", "c")).status == "rejected"
+
+
 def test_self_loop_rejected(memory: MemorySystem, project: str):
     decision = memory.l3.add_fact(project, fact("a", "depends_on", "a"))
     assert decision.status == "rejected"

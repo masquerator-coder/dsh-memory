@@ -884,24 +884,32 @@ class SemanticMemory:
         """True if adding ``head -[relation]-> tail`` closes a cycle in acyclic relations."""
         if head_id == tail_id:
             return True
+        # A cycle is defined *within one relation*: pooling every acyclic
+        # relation into one adjacency would call "a is_a b, b causes c,
+        # a part_of c" a cycle even though no single relation loops on its
+        # own — and, symmetrically, could miss real cycles whose path mixes
+        # directions. Only ``relation`` (plus its declared inverse, walked
+        # backwards) must close the loop before the fact is refused.
+        tracked = [relation]
         spec = self.relation_spec(relation)
-        acyclic_relations = [name for name, s in self._registry.items() if s.acyclic]
         if spec is not None and spec.inverse:
-            acyclic_relations.append(spec.inverse)
-        if not acyclic_relations:
-            return False
-        marks = ",".join("?" * len(acyclic_relations))
+            tracked.append(spec.inverse)
+        marks = ",".join("?" * len(tracked))
         # Walk forward from `tail`; reaching `head` means head -> tail closes a loop.
         frontier = [tail_id]
         seen = {tail_id}
         rows = self.store.query(
-            f"SELECT head_id, tail_id FROM l3_edges WHERE project_id = ? AND valid_to IS NULL "
+            f"SELECT head_id, tail_id, relation FROM l3_edges WHERE project_id = ? AND valid_to IS NULL "
             f"AND relation IN ({marks})",
-            (project_id, *acyclic_relations),
+            (project_id, *tracked),
         )
         adjacency: dict[str, list[str]] = {}
         for row in rows:
-            adjacency.setdefault(row["head_id"], []).append(row["tail_id"])
+            if spec is not None and spec.inverse is not None and row["relation"] == spec.inverse:
+                # x -[inverse]-> y is equivalent to y -[relation]-> x.
+                adjacency.setdefault(row["tail_id"], []).append(row["head_id"])
+            else:
+                adjacency.setdefault(row["head_id"], []).append(row["tail_id"])
         while frontier:
             node = frontier.pop()
             for nxt in adjacency.get(node, []):
