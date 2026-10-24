@@ -290,3 +290,28 @@ def test_serve_survives_an_unusable_scope():
     assert [r["id"] for r in replies] == ["a", "b"]
     assert replies[0]["ok"] is False
     assert replies[1]["ok"] is True
+
+
+# ── error codes for an unknown memory id ────────────────────────────────
+#
+# A caller routes on ``code``: "the thing you named is not here" (not_found)
+# and "your payload is malformed" (validation) need different handling, so
+# every notepad command that takes an id must agree on the first one.
+
+
+@pytest.mark.parametrize(
+    ("command", "payload"),
+    [
+        ("memory.get", {"memory_id": "ep_missing"}),
+        ("memory.forget", {"memory_id": "ep_missing"}),
+        ("memory.restore", {"memory_id": "ep_missing"}),
+        ("memory.update", {"memory_id": "ep_missing", "patch": {"importance": 0.5}}),
+    ],
+)
+def test_unknown_memory_id_reports_not_found(capture_home, command, payload):
+    reply = handle(
+        {"id": "t", "command": command, "payload": {"home": capture_home, **payload}}
+    )
+    assert reply["ok"] is False
+    assert reply["error"]["code"] == "not_found", reply["error"]
+    assert "not found" in reply["error"]["message"]

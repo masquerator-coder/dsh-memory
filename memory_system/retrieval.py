@@ -32,6 +32,7 @@ Design decisions worth calling out:
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Sequence
@@ -58,6 +59,17 @@ class RoutePlan:
     use_deep: bool
     reasons: list[str] = field(default_factory=list)
     latency_us: int = 0
+
+
+def edge_lost_its_sources(edge: Edge, forgotten: set[str]) -> bool:
+    """True when every episode citing ``edge`` was user-forgotten.
+
+    An edge with no recorded provenance stays: nothing says a user asked for it
+    to go (hand-written or imported edges carry no episodes), and hiding it
+    would need a marker that does not exist.
+    """
+    sources = edge.meta.get("episode_ids") or ()
+    return bool(forgotten) and bool(sources) and all(source in forgotten for source in sources)
 
 
 @dataclass(slots=True)
@@ -390,20 +402,56 @@ class Retriever:
         )
 
     def _adjacency(self, project_ids: Sequence[str]) -> dict[str, list[Edge]]:
-        """Cached current-edge adjacency for the given projects."""
+        """Cached current-edge adjacency for the given projects.
+
+        Edges justified *only* by user-forgotten episodes are left out: a fact
+        whose every source was ``forget()``-ed must stop surfacing here too, or
+        the graph would keep serving content L2 already refuses to return.
+        """
         signature = ",".join(sorted(project_ids))
         stamp = int(self.store.scalar("SELECT count(*) FROM l3_edges", default=0))
         stamp = stamp * 1_000_003 + hash(signature) % 1_000_003
+        # A forget/restore flips a source's visibility without adding an edge,
+        # so the edge count alone cannot invalidate the cache.
+        forgotten_at_stamp = int(
+            self.store.scalar(
+                "SELECT count(*) FROM l2_episodes WHERE json_extract(meta, '$.forgotten_at') IS NOT NULL",
+                default=0,
+            )
+        )
+        stamp = stamp * 1_000_003 + forgotten_at_stamp
         cache = self._adjacency_cache
         if cache is not None and cache[0] == stamp:
             return cache[2]
         _, edges = self.semantic.load_subgraph(project_ids, current_only=True)
+        forgotten = set(self.episodic._forgotten_ids(itertools.chain.from_iterable(
+            edge.meta.get("episode_ids") or () for edge in edges
+        )))
         adjacency: dict[str, list[Edge]] = {}
         for edge in edges:
+            if edge_lost_its_sources(edge, forgotten):
+                continue
             adjacency.setdefault(edge.head_id, []).append(edge)
             adjacency.setdefault(edge.tail_id, []).append(edge)
         self._adjacency_cache = (stamp, signature, adjacency)
         return adjacency
+
+    def _visible_edges(self, edges: Iterable[Edge]) -> list[Edge]:
+        """Drop edges whose every citing episode the user asked to forget.
+
+        ``SemanticMemory.neighbors`` reads the table directly, so the deep path
+        and the rewrite probe bypass :meth:`_adjacency`; this is the one place
+        that keeps them consistent with it.
+        """
+        edges = list(edges)
+        if not edges:
+            return edges
+        forgotten = set(self.episodic._forgotten_ids(itertools.chain.from_iterable(
+            edge.meta.get("episode_ids") or () for edge in edges
+        )))
+        if not forgotten:
+            return edges
+        return [edge for edge in edges if not edge_lost_its_sources(edge, forgotten)]
 
     def _edge_traversable(self, relation: str, spec: Any) -> bool:
         allow = self.cfg.traversal_edge_allowlist
@@ -493,7 +541,7 @@ class Retriever:
         ranked = sorted(rank.items(), key=lambda kv: -kv[1])
         top = {node: value for node, value in ranked[: self.cfg.deep_ppr_max_nodes]}
         hits: list[FactHit] = []
-        for edge in self.semantic.neighbors(list(top), current_only=True):
+        for edge in self._visible_edges(self.semantic.neighbors(list(top), current_only=True)):
             if edge.disputed:
                 continue
             head = entities.get(edge.head_id)
@@ -544,7 +592,7 @@ class Retriever:
         entities, _ = self.semantic.load_subgraph(project_ids, current_only=True)
         hits: list[FactHit] = []
         rewrites.append("connect_seeds:" + "+".join(sorted(seed_set))[:80])
-        for edge in self.semantic.neighbors(seed_ids, current_only=True):
+        for edge in self._visible_edges(self.semantic.neighbors(seed_ids, current_only=True)):
             head = entities.get(edge.head_id)
             tail = entities.get(edge.tail_id)
             if head is None or tail is None or edge.disputed:

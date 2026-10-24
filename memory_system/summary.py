@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .errors import ValidationError
+from .errors import NotFoundError, ValidationError
 from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens, fts_index_text
@@ -1038,7 +1038,7 @@ class MemoryNotepad:
     def get(self, memory_id: str) -> dict[str, Any]:
         row = self.store.query_one("SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,))
         if row is None:
-            raise ValidationError(f"memory {memory_id} not found")
+            raise NotFoundError(f"memory {memory_id} not found")
         return self._view(row, self._tags()).to_dict()
 
     def _view(self, row: Any, tag_map: dict[str, list[str]]) -> MemoryView:
@@ -1068,7 +1068,7 @@ class MemoryNotepad:
     def update(self, memory_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         row = self.store.query_one("SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,))
         if row is None:
-            raise ValidationError(f"memory {memory_id} not found")
+            raise NotFoundError(f"memory {memory_id} not found")
         sets: list[str] = []
         params: list[Any] = []
         if "summary" in patch:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from memory_system import FactInput, MemorySystem, SearchOptions
@@ -119,3 +121,63 @@ def test_recall_includes_episodes(memory: MemorySystem, project: str):
     result = memory.recall("billing service retries", project_id=project)
     assert result.episodes
     assert "retries" in result.episodes[0].episode.summary
+
+
+def edge_names(result) -> set[str]:
+    return {f"{f.head.name} {f.edge.relation} {f.tail.name}" for f in result.facts}
+
+
+@pytest.mark.parametrize("mode", ["fast", "deep"])
+def test_forgotten_episode_stops_serving_its_facts(memory: MemorySystem, project: str, mode: str):
+    """Forget must retire the L3 edges whose only source it archived.
+
+    L2 filters ``meta.forgotten_at`` on its own; the graph reads the edge table
+    directly, so without this every fact justified by the forgotten episode
+    would keep surfacing in recall.
+    """
+    from memory_system.summary import MemoryNotepad
+
+    remembered = memory.remember(
+        project_id=project,
+        summary="billing-service 迁移到 eu-west-1 区域",
+        event_type="decision",
+        facts=[{"head": "billing-service", "relation": "located_in", "tail": "eu-west-1"}],
+    )
+    memory_id = remembered["memory_id"]
+    assert "billing-service located_in eu-west-1" in edge_names(memory.recall("billing-service", project_id=project, mode=mode))
+
+    notepad = MemoryNotepad(memory)
+    notepad.forget(memory_id)
+    hidden = memory.recall("billing-service", project_id=project, mode=mode)
+    assert memory_id not in [h.episode.memory_id for h in hidden.episodes]
+    assert "billing-service located_in eu-west-1" not in edge_names(hidden)
+
+    notepad.restore(memory_id)
+    restored = memory.recall("billing-service", project_id=project, mode=mode)
+    assert "billing-service located_in eu-west-1" in edge_names(restored)
+
+
+def test_fact_with_one_live_source_outlives_a_forgotten_one(memory: MemorySystem, project: str):
+    """A fact still supported by a visible episode must not be hidden."""
+    from memory_system.summary import MemoryNotepad
+
+    first = memory.remember(
+        project_id=project,
+        summary="billing-service 部署在 postgres 之上",
+        facts=[{"head": "billing-service", "relation": "uses", "tail": "postgres"}],
+    )
+    second = memory.remember(
+        project_id=project,
+        summary="billing-service 再次确认使用 postgres 数据库",
+        facts=[{"head": "billing-service", "relation": "uses", "tail": "postgres"}],
+    )
+    edge = memory.store.query_one(
+        "SELECT edge_id, meta FROM l3_edges WHERE relation = 'uses' AND valid_to IS NULL"
+    )
+    assert edge is not None
+    sources = json.loads(edge["meta"])["episode_ids"]
+    assert set(sources) == {first["memory_id"], second["memory_id"]}
+
+    MemoryNotepad(memory).forget(first["memory_id"])
+    result = memory.recall("billing-service postgres", project_id=project, mode="fast")
+    assert "billing-service uses postgres" in edge_names(result)
