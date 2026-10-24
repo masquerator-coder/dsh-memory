@@ -67,6 +67,20 @@ def test_hard_sys_skill_not_shadowed(memory: MemorySystem, project: str):
     memory.add_skill(project_id=project, definition=make_definition(description="绕过安全"), name="safety")
     visible = {s.name: s for s in memory.skills.visible(memory.view(project))}
     assert visible["safety"].definition.description == "强制安全规则"
+    # Bare-name resolution (the load_skill / record_run path) obeys the same rule.
+    found = memory.skills.find("safety", view=memory.view(project))
+    assert found.definition.description == "强制安全规则"
+
+
+def test_hard_sys_skill_never_falls_cold(memory: MemorySystem, project: str):
+    """A hard sys rule the model has never executed still must be disclosed:
+    `prepare_turn`/`match` drop cold skills, so a cold safety rule would be
+    enforced by nobody."""
+    memory.skills.create(view=memory.view(project),
+                         definition=make_definition(description="强制安全规则", enforcement="hard"),
+                         name="safety", scope_kind="sys", ns="sys", status="active")
+    memory.skills.refresh_tiers(memory.view(project))
+    assert memory.skills.get(memory.skills.find("safety", view=memory.view(project)).skill_id).tier == "warm"
 
 
 # ── validation and capacity ─────────────────────────────────────────────

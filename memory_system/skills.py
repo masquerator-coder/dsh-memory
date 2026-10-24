@@ -196,8 +196,15 @@ class SkillRegistry:
         candidates = [s for s in self.visible(view, include_cold=True) if s.name == name_or_id]
         if not candidates:
             raise NotFoundError(f"skill {name_or_id} not found in {view.project_id}")
-        # Most specific scope wins.
-        candidates.sort(key=lambda s: -SCOPE_RANK[s.scope_kind])
+        # Same precedence as `_dedupe_by_name`: a hard sys rule is never
+        # shadowed—even by the most specific project-local twin of the same
+        # name. Everything else keeps the project > org > sys order.
+        candidates.sort(
+            key=lambda s: (
+                -(s.scope_kind == "sys" and s.definition.enforcement == "hard"),
+                -SCOPE_RANK[s.scope_kind],
+            )
+        )
         return candidates[0]
 
     # ══ writes ══════════════════════════════════════════════════════════
@@ -464,9 +471,15 @@ class SkillRegistry:
                 if hot_seen < self.cfg.hot_tier_limit and runs >= self.cfg.hot_min_executions_30d:
                     tier = "hot"
                     hot_seen += 1
-                elif runs >= 1 or skill.scope_kind != "sys":
+                elif runs >= 1 or skill.scope_kind != "sys" or (
+                    skill.definition.enforcement == "hard"
+                ):
                     tier = "warm"
                 else:
+                    # An untouched sys skill goes cold, but a *hard* sys rule
+                    # never does: `prepare_turn` and `match` drop cold skills,
+                    # so a safety rule that fell asleep would silently stop
+                    # being disclosed — enforcement without visibility.
                     tier = "cold"
                 if tier != skill.tier:
                     self.store.execute(
