@@ -42,10 +42,12 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
 
 from .errors import NotFoundError, ValidationError
-from .storage import Store, to_iso, utcnow
+from .retrieval import edge_lost_its_sources
+from .storage import Store, json_loads, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens, fts_index_text
 
@@ -388,6 +390,7 @@ def collect_materials(
         rows = store.query(
             "SELECT memory_id, project_id, summary, importance, event_type, outcome, "
             "created_at, state FROM l2_episodes WHERE project_id = ? AND superseded_by IS NULL "
+            "AND json_extract(meta, '$.forgotten_at') IS NULL "
             "ORDER BY created_at DESC LIMIT ?",
             (pid, episodes_per_project),
         )
@@ -409,14 +412,27 @@ def collect_materials(
     facts: list[dict[str, Any]] = []
     for pid in project_ids:
         rows = store.query(
-            "SELECT e.edge_id, e.relation, e.confidence, h.name AS head_name, t.name AS tail_name "
+            "SELECT e.edge_id, e.relation, e.confidence, e.meta AS edge_meta, "
+            "h.name AS head_name, t.name AS tail_name "
             "FROM l3_edges e JOIN l3_entities h ON h.entity_id = e.head_id "
             "JOIN l3_entities t ON t.entity_id = e.tail_id "
             "WHERE e.project_id = ? AND e.valid_to IS NULL ORDER BY e.confidence DESC, e.rowid DESC "
             "LIMIT ?",
             (pid, facts_per_project),
         )
+        # Same forgetting rule the retrieval path applies (`edge_lost_its_sources`):
+        # an edge whose every citing episode was user-forgotten must not surface
+        # in the digest either. Edges without recorded provenance stay, exactly
+        # as they do in recall.
+        wanted: list[str] = []
         for row in rows:
+            wanted.extend(json_loads(row["edge_meta"], {}).get("episode_ids") or ())
+        forgotten = set(memory.l2._forgotten_ids(set(wanted))) if wanted else set()
+        for row in rows:
+            if forgotten:
+                meta = json_loads(row["edge_meta"], {}) or {}
+                if edge_lost_its_sources(SimpleNamespace(meta=meta), forgotten):
+                    continue
             facts.append(
                 {
                     "edge_id": row["edge_id"],

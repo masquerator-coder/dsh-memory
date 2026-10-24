@@ -212,6 +212,32 @@ def test_forget_is_soft_and_restorable(memory: MemorySystem, project: str):
     assert notepad.restore(created["memory_id"])["state"] == "active"
 
 
+def test_forget_keeps_memory_out_of_digest_materials(memory: MemorySystem, project: str):
+    """A user-forgotten memory must not re-enter the prompt path (the digest
+    is the one thing a host injects), whatever recall does."""
+    from memory_system.summary import MemoryNotepad, collect_materials
+
+    kept = memory.remember(project_id=project, summary="keep-me: oracle driver upgraded to v23")
+    gone = memory.remember(
+        project_id=project,
+        summary="gone-me: temporary debug token minted in staging",
+        facts=[{"head": "debug-token", "relation": "located_in", "tail": "staging"}],
+    )
+    notepad = MemoryNotepad(memory)
+    notepad.forget(gone["memory_id"])
+    materials = collect_materials(memory, scope="project", project_id=project, material_char_budget=20_000)
+    summaries = " ".join(e["summary"] for e in materials.episodes)
+    assert "keep-me:" in summaries
+    assert "gone-me:" not in summaries
+    assert all(e["memory_id"] != gone["memory_id"] for e in materials.episodes)
+    # The edge justifying the forgotten episode must not surface either.
+    assert not any(f["head"] == "debug-token" for f in materials.facts)
+    # Restoring brings everything back.
+    notepad.restore(gone["memory_id"])
+    materials = collect_materials(memory, scope="project", project_id=project, material_char_budget=20_000)
+    assert any(e["memory_id"] == gone["memory_id"] for e in materials.episodes)
+
+
 def test_memory_update_validates(memory: MemorySystem, project: str):
     created = memory.remember(project_id=project, summary="x")
     notepad = MemoryNotepad(memory)
