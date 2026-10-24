@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -50,6 +50,31 @@ function candidateInterpreters(configured) {
     seen.add(key)
     return true
   })
+}
+
+/**
+ * Probe one candidate interpreter: exit 0 means it exists and can run.
+ *
+ * `spawn()` reports a missing or un-runnable interpreter through an *async*
+ * 'error' event, which the try/catch in `ensureChild` can never see, so the
+ * candidate loop would always marry the first candidate and never reach the
+ * documented "try in order" fallback. A sync `--version` probe is the only
+ * way to keep that promise.
+ *
+ * @param {string} candidate - interpreter path or name.
+ * @returns {boolean} true when the interpreter is runnable.
+ */
+function interpreterWorks(candidate) {
+  try {
+    const probe = spawnSync(candidate, ['--version'], {
+      timeout: 5000,
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    return !probe.error && probe.status === 0
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -146,6 +171,10 @@ export class BridgeClient {
     const attempted = []
     for (const candidate of candidateInterpreters(this.pythonPath)) {
       attempted.push(candidate)
+      if (!interpreterWorks(candidate)) {
+        this.logger.warn(`[dsh-memory] interpreter "${candidate}" is not runnable; trying the next candidate`)
+        continue
+      }
       let child
       try {
         child = spawnBridge(candidate, this.root, env)
