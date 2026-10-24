@@ -1171,8 +1171,14 @@ class MemoryNotepad:
         return self._mark_forgotten(memory_id, forgotten=False)
 
     def _mark_forgotten(self, memory_id: str, *, forgotten: bool) -> dict[str, Any]:
-        updated = self.update(memory_id, {"state": "archived" if forgotten else "active"})
+        # State and marker must commit together — visibility splits between
+        # them (search/_adjacency read the marker, state feeds lists/stats),
+        # so "archived without marker" resurfaces as decay junk and "active
+        # with marker" is unfindable. _Txn composes via savepoints: update()'s
+        # own transaction folds into this one and both writes commit or roll
+        # back as a unit.
         with self.store.transaction():
+            updated = self.update(memory_id, {"state": "archived" if forgotten else "active"})
             if forgotten:
                 self.store.execute(
                     "UPDATE l2_episodes SET meta = json_set(meta, '$.forgotten_at', ?) WHERE memory_id = ?",
@@ -1183,7 +1189,7 @@ class MemoryNotepad:
                     "UPDATE l2_episodes SET meta = json_remove(meta, '$.forgotten_at') WHERE memory_id = ?",
                     (memory_id,),
                 )
-        return self.get(memory_id)
+        return updated
 
 
 # ══ Markdown export ═════════════════════════════════════════════════════

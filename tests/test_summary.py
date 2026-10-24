@@ -212,6 +212,50 @@ def test_forget_is_soft_and_restorable(memory: MemorySystem, project: str):
     assert notepad.restore(created["memory_id"])["state"] == "active"
 
 
+def test_forget_and_restore_are_atomic(memory: MemorySystem, project: str, monkeypatch):
+    """State and forgotten_at must land in one transaction.
+
+    They were two commits: a failure between them left
+    archived-but-unforgotten (search would resurface it as decay junk) or
+    active-but-forgotten (unfindable, restore gone).
+    """
+    created = memory.remember(project_id=project, summary="atomic forget target")
+    notepad = MemoryNotepad(memory)
+    real_execute = memory.store.execute
+
+    def failing_when(sql, params=()):
+        if "forgotten_at" in sql:
+            raise RuntimeError("simulated crash between the two writes")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(memory.store, "execute", failing_when)
+    with pytest.raises(RuntimeError):
+        notepad.forget(created["memory_id"])
+    monkeypatch.undo()
+
+    row = memory.store.query_one(
+        "SELECT state, json_extract(meta, '$.forgotten_at') AS f FROM l2_episodes WHERE memory_id = ?",
+        (created["memory_id"],),
+    )
+    assert row["state"] == "active"      # no half-forget
+    assert row["f"] is None
+
+    # Symmetrically: a restore that fails mid-way leaves the memory archived
+    # and still marked - not resurrected while still invisible to recall.
+    notepad.forget(created["memory_id"])
+    monkeypatch.setattr(memory.store, "execute", failing_when)
+    with pytest.raises(RuntimeError):
+        notepad.restore(created["memory_id"])
+    monkeypatch.undo()
+
+    row = memory.store.query_one(
+        "SELECT state, json_extract(meta, '$.forgotten_at') AS f FROM l2_episodes WHERE memory_id = ?",
+        (created["memory_id"],),
+    )
+    assert row["state"] == "archived"
+    assert row["f"] is not None
+
+
 def test_forget_keeps_memory_out_of_digest_materials(memory: MemorySystem, project: str):
     """A user-forgotten memory must not re-enter the prompt path (the digest
     is the one thing a host injects), whatever recall does."""
