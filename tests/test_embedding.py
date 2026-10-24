@@ -236,6 +236,55 @@ class _TripWireEmbedding(HttpEmbedding):
         return super().embed(texts)
 
 
+def test_same_dim_different_model_open_does_not_reclaim_the_space(tmp_path):
+    """Opening with a same-dim provider whose fingerprint differs must not
+    overwrite the stored claim — needs_reembed() would otherwise stay False
+    forever over a silently mixed space. An empty store has nothing to mix
+    and may adopt the new provider."""
+    from memory_system.embedding import CallableEmbedding
+    from memory_system.errors import MemoryError
+
+    def _embed(texts):
+        import hashlib
+
+        out = []
+        for t in texts:
+            digest = hashlib.sha256(t.encode("utf-8")).digest()
+            out.append([(b / 255.0) * 2 - 1 for b in digest] * (dim // 32))
+        return out
+
+    db = str(tmp_path / "fingerprint-guard.db")
+    config = MemoryConfig(db_path=db)
+    dim = config.embedding.dim
+    system = MemorySystem(config, embedding=CallableEmbedding(_embed, dim, identity="v1"))
+    try:
+        system.ensure_project("p")
+        system.remember(project_id="p", summary="record one")
+        stored = system.store.get_meta("embedding_fingerprint")
+        assert stored == f"callable:v1:{dim}:True"
+    finally:
+        system.close()
+
+    # Non-empty store, different identity, same dim: refused, claim intact.
+    with pytest.raises(MemoryError, match="mix incomparable spaces"):
+        MemorySystem(MemoryConfig(db_path=db),
+                     embedding=CallableEmbedding(_embed, dim, identity="v2"))
+    reopened = MemorySystem(MemoryConfig(db_path=db),
+                            embedding=CallableEmbedding(_embed, dim, identity="v1"))
+    try:
+        assert reopened.store.get_meta("embedding_fingerprint") == f"callable:v1:{dim}:True"
+    finally:
+        reopened.close()
+
+    # Empty store: the new provider claims it (no rows exist to mix).
+    empty = MemorySystem(MemoryConfig(db_path=":memory:"),
+                         embedding=CallableEmbedding(_embed, dim, identity="v9"))
+    try:
+        assert empty.store.get_meta("embedding_fingerprint") == f"callable:v9:{dim}:True"
+    finally:
+        empty.close()
+
+
 def test_partial_reembed_does_not_claim_the_new_fingerprint(live):
     """A failed reembed must not rewrite `embedding_fingerprint`: that meta is
     the claim "every vector now lives in the new space". Claiming it after a

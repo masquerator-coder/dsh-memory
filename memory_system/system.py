@@ -92,7 +92,20 @@ class MemorySystem:
                 "switching embedding models requires re-embedding every row" + hint
             )
         self.embeddings = EmbeddingCache(provider)
-        self.store.set_meta("embedding_fingerprint", provider.fingerprint)
+        # The fingerprint is the claim "every stored vector lives in this
+        # provider's space" (needs_reembed consumes it). Stamping it on *any*
+        # open would let a same-dim different-model open silently re-claim a
+        # mixed space and permanently silence that check — the dim check
+        # above already refuses width changes, so only this hole remained.
+        stored_fingerprint = self.store.get_meta("embedding_fingerprint")
+        if stored_fingerprint != provider.fingerprint:
+            if stored_fingerprint and self._store_has_vectors():
+                raise MemoryError(
+                    f"database vectors were made by embedding '{stored_fingerprint}'; opening with "
+                    f"'{provider.fingerprint}' would mix incomparable spaces. Call change_embedding() "
+                    "to re-embed every row, or open with the model the database was built with."
+                )
+            self.store.set_meta("embedding_fingerprint", provider.fingerprint)
         # Move first-call costs (CJK segmenter dictionary) to open time.
         self.tokenizer_ready = prewarm(self.config.lexical.tokenizer)
 
