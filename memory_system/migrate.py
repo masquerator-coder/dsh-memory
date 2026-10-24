@@ -118,7 +118,14 @@ def reembed(
                 progress(Reprogress(kind=kind, done=done, total=len(rows)))
         report.reembedded[kind] = done
 
-    store.set_meta("embedding_fingerprint", provider.fingerprint)
+    # The fingerprint is the *claim* that every stored vector lives in the new
+    # model's space. After a partial failure that claim is false on disk, and
+    # writing it would silence `needs_reembed()` forever — the exact silent
+    # similarity distortion DESIGN §6.1 warns about. Leave it unclaimed so a
+    # retry finishes the job; the dim stays claimed because the physical index
+    # was rebuilt (or unchanged), which VectorIndex reflects one way or the other.
+    if not report.errors:
+        store.set_meta("embedding_fingerprint", provider.fingerprint)
     store.set_meta("embedding_dim", str(provider.dim))
     return report
 

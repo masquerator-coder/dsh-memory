@@ -222,6 +222,52 @@ def test_change_embedding_reembeds_in_place(live):
         system.close()
 
 
+class _TripWireEmbedding(HttpEmbedding):
+    """Delegate to a working provider but fail the first N embed calls."""
+
+    def __init__(self, failures: int = 1, **kwargs):
+        super().__init__(**kwargs)
+        self.remaining_failures = failures
+
+    def embed(self, texts):
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise ProviderError("forced outage")
+        return super().embed(texts)
+
+
+def test_partial_reembed_does_not_claim_the_new_fingerprint(live):
+    """A failed reembed must not rewrite `embedding_fingerprint`: that meta is
+    the claim "every vector now lives in the new space". Claiming it after a
+    partial write would keep `needs_reembed()` False forever and leave a
+    permanently mixed vector space (DESIGN §6.1)."""
+    from memory_system.migrate import needs_reembed
+
+    config = MemoryConfig(db_path=":memory:")
+    system = MemorySystem(config)
+    try:
+        system.ensure_project("p")
+        system.remember(project_id="p", summary="something durable")
+        old = system.store.get_meta("embedding_fingerprint")
+
+        broken = _TripWireEmbedding(url=live, model="m", dim=1024)
+        report = system.change_embedding(broken, allow_redimension=True)
+        assert report["errors"] == ["l2: forced outage"]
+        # The old fingerprint survives: the space on disk is still NOT fully
+        # the new one, and the claim must stay re-embeddable.
+        assert system.store.get_meta("embedding_fingerprint") == old
+        assert needs_reembed(system.store, broken) is True
+        assert "run again" in report["warning"]
+
+        healthy = _TripWireEmbedding(url=live, model="m", dim=1024, failures=0)
+        rerun = system.change_embedding(healthy, allow_redimension=True)
+        assert rerun["errors"] == []
+        assert system.store.get_meta("embedding_fingerprint") == healthy.fingerprint
+        assert needs_reembed(system.store, healthy) is False
+    finally:
+        system.close()
+
+
 def test_redimension_requires_explicit_consent(live):
     system = MemorySystem(MemoryConfig(db_path=":memory:"))
     try:

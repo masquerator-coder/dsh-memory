@@ -169,6 +169,8 @@ class MemorySystem:
         self.probe = ProbeResult(ok=True, provider=provider.name, dim=provider.dim)
         payload = report.to_dict()
         if report.errors:
+            # The fingerprint stays unclaimed on disk (`needs_reembed()` keeps
+            # returning True), so a rerun actually finishes the rebuild.
             payload["warning"] = "some layers failed to re-embed; run again to finish"
         return payload
 
