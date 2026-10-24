@@ -1,6 +1,6 @@
 # DSH Memory — 系统设计
 
-本文档描述 `memory-system` 的架构、接口契约，以及**与原始设计方案不一致之处**。实现代码在 `memory_system/`，测试在 `tests/`（85 项，全部通过）。
+本文档描述 `memory-system` 的架构、接口契约，以及**与原始设计方案不一致之处**。实现代码在 `memory_system/`，测试在 `tests/`（169 项，全部通过）。
 
 > 目标 Agent 是 DeepSeek Harness，但核心不依赖 DSH：没有任何 `memory_system.*` 模块 import `@deepseek-ai/*`。宿主接入通过 `memory_system/adapters/turns.py` 定义的端口完成。
 
@@ -119,13 +119,18 @@ L3.retract_dependents(launch_key, absent_tools) -> list[str]
 | 关系未注册 | `rejected / unknown_relation` |
 | 端点类型不符 | `rejected / type_constraint` |
 | 基数=1 且已有当前边 | `closed`（关闭旧边，保留历史） |
-| 无证据的新断言 | `needs_evidence` |
+| 引用的 episode id 不存在 | `rejected / needs_evidence`（证据链无所指即拒绝；悬空 id 会静默削弱所有证据比较） |
+| 完全无证据的新断言 | 默认放行 —— 手写/导入边合法地没有来源（与检索侧 `edge_lost_its_sources` 口径一致）；严格宿主设 `L3Config.require_evidence=True` 后才 `rejected / needs_evidence` |
 | 证据更弱 | `rejected / weaker_evidence`（附双方证据强度） |
-| 形成环 | `rejected / cycle` |
+| 形成环 | `rejected / cycle` —— 环在**单一关系内**判定（`is_a`/`causes`/`part_of` 混合链不是任一关系的环）；已声明的 `inverse` 关系以反方向参与图遍历 |
 | 完全重复 | `duplicate`（提升置信度） |
 | 冲突且策略为 `defer` | `disputed`（两条都标记争议） |
 
 双时间轴：`valid_from/valid_to`（世界何时如此）与 `recorded_at`（我们何时得知）。`edges_of(at=...)` 查询"某时刻为真"。
+
+三元组唯一索引强制"重开一条已关闭的边"时复用旧行、覆盖其区间 —— 因此旧行的
+世界态（`valid_from`/`valid_to`/置信度/证据 episode）以 `prior` 快照保留在
+`l3_changes` 的 `edge.created` 审计明细里，历史不会被改写。
 
 ### 3.4 L4 契约
 
@@ -149,9 +154,9 @@ promotions.propose() -> list[Promotion]
 
 **匹配打分**：`0.4·intent + 0.3·prereq + 0.2·semantic + 0.1·success`。前置不满足（工具不可用）时分数乘 0.45 —— 技能必须**可执行**才有资格被推荐。
 
-**作用域**：`project > org > sys`，同名时高优先覆盖低优先；但 `enforcement="hard"` 的 `sys` 技能**不可被覆盖**（安全规则不允许项目本地绕过）。
+**作用域**：`project > org > sys`，同名时高优先覆盖低优先；但 `enforcement="hard"` 的 `sys` 技能**不可被覆盖**（安全规则不允许项目本地绕过）。这条保护覆盖两条会绕开 `visible()` 的旁路：`find()` 裸名解析同按 hard-sys 优先，不被同名项目本地孪生遮蔽；`refresh_tiers` 中从未执行过的硬性 sys 技能**永不落入冷层** —— `prepare_turn` 与 `match` 会丢弃冷层技能，安全规则一旦"休眠"就无人执行。
 
-**成熟度 ≠ 运行状态**：运行状态是 `candidate → active → retired`；"mature" 只表示轨迹证据满足五个条件（≥3 次成功、≥2 个会话、步骤一致性 ≥0.6、有前置条件、非单步）。成熟的轨迹变成 `candidate` 技能，**必须经用户审核**才 `active`。
+**成熟度 ≠ 运行状态**：运行状态是 `candidate → active → retired`；"mature" 只表示轨迹证据满足五个条件（≥3 次成功、≥2 个会话、步骤一致性 ≥0.6、有前置条件、非单步）。步骤一致性在**同一 signature 的全部变体之间**计算（组内取众数 variant 作代表键）—— 变体是单条轨迹精确工具序列的哈希，按它分组等于每组与自身比较，不允许失败。成熟的轨迹变成 `candidate` 技能，**必须经用户审核**才 `active`。
 
 ---
 
@@ -252,7 +257,8 @@ DSH 插件拿不到任意会话原文，因此锚点**可存、可传，但系�
 建议先用 0.6B 在真实数据上测命中率再决定。
 
 **启动探测**：`MemorySystem` 打开时对 HTTP 端点做一次真实嵌入调用，校验可达性、
-维度、非零向量。策略由 `EmbeddingConfig.on_unavailable` 控制：
+维度、非零向量与有限值（NaN/inf 一律视为退化 —— NaN 会在相似度截断时变成 1.0，
+即用"完美匹配"撒谎，读路径对非有限分量一律取中性值）。策略由 `EmbeddingConfig.on_unavailable` 控制：
 
 | 策略 | 行为 |
 |---|---|
@@ -276,6 +282,11 @@ timeout 按次生效，`localhost`（解析出 v4+v6）在防火墙静默丢包�
 **换模型 = 重建，不是改配置**。`change_embedding()` 逐层重算全部向量；维度变化
 必须显式 `allow_redimension=True`（vec0 表宽固定）。已在 `tests/test_embedding.py` 覆盖。
 
+**部分失败不声明完成**。`embedding_fingerprint` 是"库内全部向量已属于新空间"的声明，
+只在逐层重算**零错误**时写入；部分失败时保持不声明，`needs_reembed()` 继续返回
+True，重跑即可收敛 —— 否则一个混合向量空间会从此静默失真，而系统没有任何外部
+信号能发现。`embedding_dim` 则始终如实反映物理索引（索引已重建或未变）。
+
 ---
 
 ## 7. 目录
@@ -295,13 +306,22 @@ memory_system/
   l3.py            L3 图
   retrieval.py     路由 / 快慢路径 / RRF
   communities.py   社区检测与摘要
+  summary.py       记忆摘要 / 用户画像（digest）
+  migrate.py       嵌入模型迁移（逐层重建向量）
   l4.py            技能结构 / 预算规划 / 渲染
   skills.py        L4 注册表 / 匹配 / 运行记录
   maturity.py      轨迹 → 成熟度 → 候选
   governance.py    归档池 / 提升推荐
   maintenance.py   后台批处理
+  errors.py        错误类型
+  bridge.py        stdio JSON 协议桥（`python -m memory_system --serve`，DSH 插件的子进程）
   adapters/
     turns.py       宿主端口（NormalizedEvent / TurnContext / ProjectResolver）
     dsh.py         DSH 接口桩（未实现，仅记录绑定点）
-tests/             85 项
+tests/             169 项
 ```
+
+**digest 的遗忘承诺**：digest 是宿主唯一注入提示词的路径，因此它与检索遵守同一条
+遗忘规则 —— 带 `forgotten_at` 的情节不进入材料；失去全部证据情节的边同样排除
+（复用检索侧 `edge_lost_its_sources`，无来源的手写/导入边照旧保留）。restore 后
+记忆随之回到 digest 候选池。已由 `tests/test_summary.py` 锁定。
