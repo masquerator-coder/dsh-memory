@@ -286,6 +286,17 @@ def _limit(payload: dict[str, Any], key: str, default: int, ceiling: int) -> int
     return max(1, min(value, ceiling))
 
 
+@command("ping")
+def _ping(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Liveness probe for the host's bridge lifecycle (a no-op read).
+
+    The host uses this to decide whether an unresponsive child must be
+    killed and restarted, or is merely slow on one request — so it must be
+    the cheapest command in the registry.
+    """
+    return {"version": BRIDGE_VERSION}
+
+
 # ── status ──────────────────────────────────────────────────────────────
 
 

@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -56,25 +56,45 @@ function candidateInterpreters(configured) {
  * Probe one candidate interpreter: exit 0 means it exists and can run.
  *
  * `spawn()` reports a missing or un-runnable interpreter through an *async*
- * 'error' event, which the try/catch in `ensureChild` can never see, so the
- * candidate loop would always marry the first candidate and never reach the
- * documented "try in order" fallback. A sync `--version` probe is the only
- * way to keep that promise.
+ * 'error' event, so a candidate loop that merely try/catches around a sync
+ * call can never observe it. The probe is therefore a promise over those
+ * events — waiting for the specific child instead of blocking the whole
+ * event loop the way `spawnSync` did.
  *
  * @param {string} candidate - interpreter path or name.
- * @returns {boolean} true when the interpreter is runnable.
+ * @returns {Promise<boolean>} true when the interpreter is runnable.
  */
 function interpreterWorks(candidate) {
-  try {
-    const probe = spawnSync(candidate, ['--version'], {
-      timeout: 5000,
-      windowsHide: true,
-      stdio: 'ignore',
-    })
-    return !probe.error && probe.status === 0
-  } catch {
-    return false
-  }
+  return new Promise((resolve) => {
+    let probe
+    try {
+      probe = spawn(candidate, ['--version'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      })
+    } catch {
+      resolve(false)
+      return
+    }
+    let settled = false
+    const finish = (ok) => {
+      if (!settled) {
+        settled = true
+        clearTimeout(timer)
+        if (probe.exitCode === null && !probe.killed) {
+          try {
+            probe.kill()
+          } catch {
+            // Already gone.
+          }
+        }
+        resolve(ok)
+      }
+    }
+    const timer = setTimeout(() => finish(false), 5000)
+    probe.once('error', () => finish(false))
+    probe.once('exit', (code) => finish(code === 0))
+  })
 }
 
 /**
@@ -100,8 +120,10 @@ function childEnv(root) {
  * A warm, strictly serialized NDJSON connection to one bridge process.
  *
  * One request is in flight at a time: the protocol has no multiplexing, and
- * answers arrive in order. A timeout kills the child, because a late answer
- * would otherwise be attributed to the next request.
+ * answers arrive in order. Responses are matched by request id, so a slow
+ * request costs that request alone: a timeout rejects only its own waiter,
+ * and a bounded liveness probe decides whether the child is actually wedged
+ * (kill and restart) or merely busy.
  */
 export class BridgeClient {
   /**
@@ -120,6 +142,10 @@ export class BridgeClient {
     this.child = undefined
     /** @type {Array<{ resolve: Function, reject: Function, timer: any }>} */
     this.pending = []
+    /** @type {Promise<import('node:child_process').ChildProcess> | undefined} */
+    this.spawning = undefined
+    /** Whether a health probe is in flight after a request timeout. */
+    this.probing = false
     this.buffer = ''
     this.seq = 0
     this.disposed = false
@@ -129,6 +155,7 @@ export class BridgeClient {
   stop(error) {
     const child = this.child
     this.child = undefined
+    this.probing = false
     this.buffer = ''
     if (child) {
       try {
@@ -162,16 +189,37 @@ export class BridgeClient {
 
   /**
    * Spawn the child on first use and wire its protocol streams.
-   * @returns {import('node:child_process').ChildProcess} the live child.
+   *
+   * Concurrent first calls share one spawn: the in-flight promise is handed
+   * to every waiter, so two racing requests never produce two children
+   * (the loser of that race used to overwrite `this.child`).
+   * @returns {Promise<import('node:child_process').ChildProcess>} the live child.
    */
-  ensureChild() {
+  async ensureChild() {
     if (this.disposed) throw new BridgeError('记忆插件已卸载', 'DISPOSED')
     if (this.child) return this.child
+    if (this.spawning) return this.spawning
+    this.spawning = this.spawnChild()
+    try {
+      return await this.spawning
+    } finally {
+      this.spawning = undefined
+    }
+  }
+
+  /**
+   * Try every interpreter candidate until one spawns. Awaits instead of
+   * probing synchronously, so a hanging interpreter cannot freeze the host.
+   * @returns {Promise<import('node:child_process').ChildProcess>} the live child.
+   */
+  async spawnChild() {
     const env = childEnv(this.root)
     const attempted = []
     for (const candidate of candidateInterpreters(this.pythonPath)) {
+      if (this.disposed) throw new BridgeError('记忆插件已卸载', 'DISPOSED')
       attempted.push(candidate)
-      if (!interpreterWorks(candidate)) {
+      const works = await interpreterWorks(candidate)
+      if (!works) {
         this.logger.warn(`[dsh-memory] interpreter "${candidate}" is not runnable; trying the next candidate`)
         continue
       }
@@ -273,7 +321,7 @@ export class BridgeClient {
    * @returns {Promise<any>} the command result.
    */
   async call(command, payload = {}, signal) {
-    const child = this.ensureChild()
+    const child = await this.ensureChild()
     if (signal?.aborted) throw new BridgeError('请求已取消', 'ABORTED')
     this.seq += 1
     const requestId = `h${this.seq}`
@@ -297,8 +345,12 @@ export class BridgeClient {
         timer: setTimeout(() => {
           remove()
           reject(new BridgeError(`记忆桥无响应（${command}）`, 'TIMEOUT'))
-          // A late answer must never be matched to a later request.
-          this.stop(new BridgeError('记忆桥超时，已重启', 'BRIDGE_RESTARTED'))
+          // A slow child is not a dead child: it may still be answering
+          // other valid requests via their ids. Kill it only when a
+          // liveness probe says it is wedged — blanket-killing healthy
+          // children turned one slow request into BRIDGE_RESTARTED for
+          // every concurrent caller.
+          this.probeHealth()
         }, this.timeoutMs),
         resolve: (value) => {
           remove()
@@ -316,6 +368,57 @@ export class BridgeClient {
         entry.reject(new BridgeError(`写入记忆桥失败：${error.message}`, 'BRIDGE_WRITE_FAILED', { cause: error }))
       })
     })
+  }
+
+  /**
+   * Decide whether one timed-out request means "child is wedged".
+   *
+   * Sends `ping` with a short, bounded budget on the same connection. A
+   * timely pong proves the child's event loop still drains stdin/stdout —
+   * the timed-out request was just heavy, do nothing. A failure (timeout,
+   * write error, exit) means the child cannot make progress at all: stop it,
+   * which rejects any remaining waiters with the restart error.
+   */
+  async probeHealth() {
+    const child = this.child
+    if (!child || this.probing) return
+    this.probing = true
+    const write = (chunk) => new Promise((resolve, reject) => child.stdin.write(chunk, 'utf8', (error) => error ? reject(error) : resolve()))
+    try {
+      await new Promise((resolve, reject) => {
+        this.seq += 1
+        const id = `hp${this.seq}`
+        const budget = Math.min(3_000, this.timeoutMs)
+        const rejectProbe = (error) => {
+          clearTimeout(timer)
+          this.removeEntry(id)
+          reject(error)
+        }
+        const timer = setTimeout(
+          () => rejectProbe(new BridgeError('健康探测超时', 'HEALTH_PROBE_FAILED')),
+          budget,
+        )
+        this.pending.push({ id, timer, resolve, reject: rejectProbe })
+        write(`${JSON.stringify({ id, command: 'ping', payload: {} })}\n`).catch((error) =>
+          rejectProbe(new BridgeError(`写入记忆桥失败：${error?.message ?? error}`, 'BRIDGE_WRITE_FAILED', { cause: error })),
+        )
+      })
+    } catch (error) {
+      if (this.child === child) {
+        this.stop(new BridgeError('记忆桥超时，已重启', 'BRIDGE_RESTARTED', { cause: error }))
+      }
+    } finally {
+      this.probing = false
+    }
+  }
+
+  /**
+   * Cancel one pending entry by id (a late probe timer must not clear the
+   * wrong waiter).
+   */
+  removeEntry(id) {
+    const at = this.pending.findIndex((item) => item.id === id)
+    if (at >= 0) this.pending.splice(at, 1)
   }
 }
 
