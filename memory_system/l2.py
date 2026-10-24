@@ -506,6 +506,7 @@ class EpisodicMemory:
         rows = self.store.query(
             f"SELECT * FROM l2_episodes WHERE project_id IN ({marks}) "
             f"AND state IN ({state_marks}) AND superseded_by IS NULL "
+            "AND json_extract(meta, '$.forgotten_at') IS NULL "
             "ORDER BY created_at DESC LIMIT ?",
             (*project_ids, *states, limit),
         )

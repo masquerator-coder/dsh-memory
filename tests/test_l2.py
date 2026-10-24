@@ -157,3 +157,22 @@ def pytest_approx(value: float, rel: float = 1e-6):
     import pytest
 
     return pytest.approx(value, rel=rel)
+
+
+def test_recent_never_resurfaces_user_forgotten_episodes(memory: MemorySystem, project: str):
+    """``recent()`` feeds timeline views; a user-forgotten row (the marker,
+    not the retention state — decay rows may opt back in) must not reappear
+    there, matching the rule search() already enforces."""
+    from memory_system.summary import MemoryNotepad
+
+    kept = memory.remember(project_id=project, summary="visible audit trail entry")
+    gone = memory.remember(project_id=project, summary="forgotten audit trail entry")
+    notepad = MemoryNotepad(memory)
+    notepad.forget(gone["memory_id"])
+
+    ids = {ep.memory_id for ep in memory.recent_episodes(project, limit=10)}
+    assert gone["memory_id"] not in ids
+    assert kept["memory_id"] in ids
+
+    notepad.restore(gone["memory_id"])
+    assert gone["memory_id"] in {ep.memory_id for ep in memory.recent_episodes(project, limit=10)}
