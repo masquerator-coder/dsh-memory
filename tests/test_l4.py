@@ -195,6 +195,34 @@ def test_maturity_requires_successes(memory: MemorySystem, project: str):
     assert "insufficient_successes" in evidences[0].failed_checks
 
 
+
+def test_step_consistency_gate_notices_drift(memory: MemorySystem, project: str):
+    """Consistency is graded across variants of one signature: the same
+    mutating tail with wildly different read-only detours must make the
+    step_consistency gate fire instead of answer 1.0 to itself."""
+    heavy = [TrajectoryStep(action="翻找上下文", tool="read")] * 9 + [
+        TrajectoryStep(action="修改实现文件", tool="edit"),
+        TrajectoryStep(action="重跑测试", tool="run_terminal"),
+    ]
+    light = [
+        TrajectoryStep(action="翻找上下文", tool="read"),
+        TrajectoryStep(action="修改实现文件", tool="edit"),
+        TrajectoryStep(action="重跑测试", tool="run_terminal"),
+    ]
+    for _ in range(3):
+        memory.capture_trajectory(project_id=project, steps=heavy, session_key="s0",
+                                  intent_label="fix failing test")
+    for _ in range(3):
+        memory.capture_trajectory(project_id=project, steps=light, session_key="s1",
+                                  intent_label="fix failing test")
+    evidences = memory.trajectories.evaluate(project)
+    # One graded procedure (same mutating tail -> same signature), visibly
+    # inconsistent across variants.
+    assert len(evidences) == 1, "variants of one signature grade together"
+    assert evidences[0].step_consistency < memory.trajectories.cfg.maturity_min_step_consistency
+    assert "step_consistency" in evidences[0].failed_checks
+
+
 def test_mature_trajectory_becomes_candidate(memory: MemorySystem, project: str):
     capture_runs(memory, project, n=4, sessions=2)
     results = memory.trajectories.mature(project)

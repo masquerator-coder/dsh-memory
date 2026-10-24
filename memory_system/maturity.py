@@ -271,20 +271,28 @@ class TrajectoryStore:
             "SELECT * FROM l4_trajectories WHERE project_id = ? AND derived_skill IS NULL",
             (project_id,),
         )
-        groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        groups: dict[str, list[Any]] = defaultdict(list)
         for row in rows:
-            groups[(row["signature"], row["variant"])].append(row)
+            # Grade *per signature*: steps can drift (read-only detours, arg
+            # shuffles) while the mutating sequence stays identifiable. The
+            # variant is the hash of one exact trace, so grouping by it would
+            # compare every group with itself — consistency trivially 1.0 and
+            # the maturity_min_step_consistency gate dead.
+            groups[row["signature"]].append(row)
         out: list[MaturityEvidence] = []
-        for (signature, variant), group in groups.items():
-            evidence = self._grade(signature, variant, group)
+        for signature, group in groups.items():
+            evidence = self._grade(signature, group)
             if evidence is not None:
                 out.append(evidence)
         out.sort(key=lambda e: (-int(e.mature), -e.success_rate, -e.runs))
         return out
 
-    def _grade(self, signature: str, variant: str, group: list[Any]) -> MaturityEvidence | None:
+    def _grade(self, signature: str, group: list[Any]) -> MaturityEvidence | None:
         total = len(group)
         successes = [r for r in group if int(r["success"]) == 1]
+        # The representative variant of the graded group: the most common one.
+        # The key stays stable for candidate bookkeeping across evaluations.
+        variant = Counter(r["variant"] for r in group).most_common(1)[0][0]
         sessions: set[str] = set()
         for row in group:
             sessions.update(json_loads(row["sessions"], []) or [])
