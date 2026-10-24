@@ -163,20 +163,35 @@ class VectorIndex:
             table = VEC_TABLES[kind]
             payload = self._sqlite_vec.serialize_float32(list(query))
             if allowed_rowids is None:
-                fetch = k
+                rows = self.conn.execute(
+                    f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (payload, k),
+                ).fetchall()
+                filtered = rows
             else:
                 if not allowed_rowids:
                     return []
-                # vec0 cannot constrain by an arbitrary rowid set; over-fetch and filter.
+                # vec0 cannot constrain by an arbitrary rowid set; over-fetch
+                # and filter. A starved window must not quietly return fewer
+                # than k while allowed candidates still exist deeper in the
+                # ranking (scope-restricted recall would otherwise depend on
+                # how well-scoped rows rank globally), so double the window
+                # until the fetch is satisfied or the table is exhausted.
+                total = self.count(kind)
                 fetch = max(k * 8, 64)
-            rows = self.conn.execute(
-                f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                (payload, fetch),
-            ).fetchall()
-            if allowed_rowids is not None:
-                rows = [r for r in rows if r["rowid"] in allowed_rowids][:k]
+                filtered = []
+                while True:
+                    rows = self.conn.execute(
+                        f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (payload, fetch),
+                    ).fetchall()
+                    filtered = [r for r in rows if r["rowid"] in allowed_rowids]
+                    if len(filtered) >= k or len(rows) < fetch:
+                        break
+                    fetch *= 2
+                filtered = filtered[:k]
             out: list[tuple[int, float]] = []
-            for r in rows:
+            for r in filtered:
                 # vec0's default metric is Euclidean. For unit vectors the two
                 # are the same ordering — ||a-b||² = 2 - 2·cos — so converting
                 # here (cos_dist = ||a-b||²/2) honours the cosine-distance

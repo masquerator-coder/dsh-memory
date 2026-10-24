@@ -76,6 +76,37 @@ def test_vec0_and_exact_agree_on_cosine_distance():
     assert by_rowid[30] == pytest.approx(1.0, abs=1e-3)  # orthogonal
 
 
+def test_knn_window_grows_when_scope_rows_rank_beyond_the_fetch():
+    """Scoping must not depend on how well the scoped rows rank globally:
+    with allowed rowids clustered deep in the ranking, the fixed 64-row
+    over-fetch window filtered to nothing and served recall starvation."""
+    import sqlite3
+
+    from memory_system.embedding import _l2_normalize
+    from memory_system.vectors import VectorIndex
+
+    pytest.importorskip("sqlite_vec")
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    index = VectorIndex(conn, dim=3, enabled=True)
+    try:
+        query = _l2_normalize([1.0, 0.0, 0.0])
+        # Distance from the query grows monotonically with the second
+        # component, so rowids rank in ascending order.
+        for j in range(1, 201):
+            index.upsert("l2", j, _l2_normalize([1.0, j * 0.001, 0.0]))
+
+        allowed = set(range(150, 201))  # only ever ranks below the first window
+        hits = index.knn("l2", query, k=5, allowed_rowids=allowed)
+        rowids = [rid for rid, _ in hits]
+        assert set(rowids) <= allowed
+        assert rowids == [150, 151, 152, 153, 154]  # nearest allowed, in order
+    finally:
+        conn.close()
+
+
 def test_exact_scan_fallback(monkeypatch):
     from memory_system.vectors import VectorIndex
 
