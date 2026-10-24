@@ -181,3 +181,55 @@ def test_fact_with_one_live_source_outlives_a_forgotten_one(memory: MemorySystem
     MemoryNotepad(memory).forget(first["memory_id"])
     result = memory.recall("billing-service postgres", project_id=project, mode="fast")
     assert "billing-service uses postgres" in edge_names(result)
+
+
+def test_adjacency_cache_invalidates_on_edge_updates(memory: MemorySystem, project: str):
+    """The adjacency stamp must see UPDATE-shaped graph mutations.
+
+    Row count does not move on strengthen (confidence/meta UPDATE), dispute
+    (meta UPDATE) or close (valid_to UPDATE) — a count-based stamp kept
+    serving stale edges for all three.
+    """
+    build_graph(memory, project)
+    memory.retriever._adjacency([project])  # prime the cache
+
+    row = memory.store.query_one(
+        "SELECT edge_id, head_id FROM l3_edges "
+        "WHERE relation = 'uses' AND head_id = "
+        "(SELECT entity_id FROM l3_entities WHERE name = 'billing-service') "
+        "AND valid_to IS NULL"
+    )
+    edge_id, head_id = row["edge_id"], row["head_id"]
+
+    def cached_edge():
+        adj = memory.retriever._adjacency([project])
+        return next(e for e in adj[head_id] if e.edge_id == edge_id)
+
+    # ── strengthen: same claim with new supporting evidence ──
+    episode = memory.remember(project_id=project, summary="postgres is the datastore")
+    before = cached_edge().confidence
+    memory.l3.add_fact(
+        project,
+        FactInput(head="billing-service", relation="uses", tail="postgres",
+                  confidence=0.8, episode_ids=[episode["memory_id"]]),
+    )
+    assert cached_edge().confidence > before
+
+    # ── dispute: pure meta UPDATE ──
+    memory.store.execute(
+        "UPDATE l3_edges SET meta = json_set(meta, '$.disputed', 1) WHERE edge_id = ?",
+        (edge_id,),
+    )
+    assert cached_edge().disputed is True
+
+    # ── close: the row leaves the current set entirely ──
+    memory.l3.close_edge(edge_id)
+    adj = memory.retriever._adjacency([project])
+    assert edge_id not in [e.edge_id for e in adj[head_id]]
+
+    # ── another project with identical aggregates must not alias ──
+    memory.ensure_project("proj-b")
+    memory.l3.add_fact("proj-b", FactInput(head="alpha", relation="uses", tail="beta", confidence=0.8))
+    other = memory.retriever._adjacency(["proj-b"])
+    assert all(e.project_id == "proj-b" for edges in other.values() for e in edges)
+    assert len(other) == 2

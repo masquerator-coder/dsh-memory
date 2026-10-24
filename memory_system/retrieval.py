@@ -226,7 +226,7 @@ class Retriever:
         self.semantic = semantic
         self._cache = embedding_cache
         self._tokenizer = config.lexical.tokenizer
-        self._adjacency_cache: tuple[int, str, dict[str, list[Edge]]] | None = None
+        self._adjacency_cache: tuple[tuple, str, dict[str, list[Edge]]] | None = None
 
     # ══ public ═════════════════════════════════════════════════════════
     def search(self, query: str, options: SearchOptions | None = None) -> SearchResult:
@@ -408,20 +408,36 @@ class Retriever:
         whose every source was ``forget()``-ed must stop surfacing here too, or
         the graph would keep serving content L2 already refuses to return.
         """
+        if not project_ids:
+            return {}
         signature = ",".join(sorted(project_ids))
-        stamp = int(self.store.scalar("SELECT count(*) FROM l3_edges", default=0))
-        stamp = stamp * 1_000_003 + hash(signature) % 1_000_003
+        # Content-derived, not rowcount-derived: the graph mutates mostly by
+        # UPDATE, not INSERT. close/retract flip valid_to (the row leaves the
+        # current set), strengthen raises confidence and grows meta, dispute
+        # grows meta ($ .disputed) — none change the row count. count, the
+        # confidence total and the meta-lineage length together cover all of
+        # those; a meta edit of identical length on a confidence-saturated
+        # edge is the only blind spot left, and it is accepted (documented
+        # residual).
+        marks = ",".join("?" * len(project_ids))
+        agg = self.store.query_one(
+            f"SELECT count(*) AS n, coalesce(total(confidence), 0) AS conf, "
+            f"coalesce(sum(length(meta)), 0) AS meta_len "
+            f"FROM l3_edges WHERE project_id IN ({marks}) AND valid_to IS NULL",
+            list(project_ids),
+        )
+        stamp = (agg["n"], agg["conf"], agg["meta_len"])
         # A forget/restore flips a source's visibility without adding an edge,
-        # so the edge count alone cannot invalidate the cache.
+        # so edge content alone cannot invalidate the cache.
         forgotten_at_stamp = int(
             self.store.scalar(
                 "SELECT count(*) FROM l2_episodes WHERE json_extract(meta, '$.forgotten_at') IS NOT NULL",
                 default=0,
             )
         )
-        stamp = stamp * 1_000_003 + forgotten_at_stamp
+        stamp = (*stamp, forgotten_at_stamp)
         cache = self._adjacency_cache
-        if cache is not None and cache[0] == stamp:
+        if cache is not None and cache[0] == stamp and cache[1] == signature:
             return cache[2]
         _, edges = self.semantic.load_subgraph(project_ids, current_only=True)
         forgotten = set(self.episodic._forgotten_ids(itertools.chain.from_iterable(
