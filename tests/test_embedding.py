@@ -307,6 +307,34 @@ def test_provider_error_on_bad_payload():
         provider.embed_one("hello")
 
 
+def test_nonfinite_vectors_rejected_on_write_and_neutral_on_read():
+    """A NaN vector from a broken endpoint must fail the write path loudly and
+    never rank as a perfect match: NaN clamps to 1.0 similarity (the worst
+    lie a memory system can tell)."""
+    import math
+
+    from memory_system.embedding import EmbeddingProvider, cosine_similarity
+    from memory_system.errors import ProviderError
+
+    class _NanProvider(EmbeddingProvider):
+        name = "nan"
+
+        def _embed_batch(self, texts):
+            return [[float("nan")] * self.dim for _ in texts]
+
+    # Write path: the provider contract stays "fail loudly".
+    provider = _NanProvider(8)
+    with pytest.raises(ProviderError, match="non-finite"):
+        provider.embed("anything")
+    probe = probe_provider(provider)
+    assert probe.ok is False
+    assert "non-finite" in (probe.error or "")
+
+    # Read-path defence: garbage components can no longer score 1.0.
+    assert cosine_similarity([float("nan")] * 8, [float("nan")] * 8) == 0.0
+    assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0  # real data unchanged
+
+
 # ── open-path latency ───────────────────────────────────────────────────
 
 

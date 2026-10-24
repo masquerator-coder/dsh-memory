@@ -61,7 +61,12 @@ def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
         nb += y * y
     if na <= 0.0 or nb <= 0.0:
         return 0.0
-    return max(-1.0, min(1.0, dot / math.sqrt(na * nb)))
+    cos = dot / math.sqrt(na * nb)
+    if not math.isfinite(cos):
+        # A NaN would clamp to 1.0 (min(1.0, nan) keeps the first argument),
+        # reporting a perfect match for garbage. Zero is the honest neutral.
+        return 0.0
+    return max(-1.0, min(1.0, cos))
 
 
 class EmbeddingProvider(ABC):
@@ -92,6 +97,11 @@ class EmbeddingProvider(ABC):
         for vec in vectors:
             if len(vec) != self.dim:
                 raise ProviderError(f"{self.name} returned dim {len(vec)}, expected {self.dim}")
+            if not all(math.isfinite(x) for x in vec):
+                # NaN/inf from a broken endpoint would otherwise poison every
+                # similarity it touches — and NaN clamps to 1.0, a *perfect*
+                # match. A non-finite vector is a provider failure, not data.
+                raise ProviderError(f"{self.name} returned a non-finite vector component")
             out.append(_l2_normalize(vec) if self.normalize else vec)
         return out
 
@@ -336,9 +346,12 @@ def probe_provider(provider: EmbeddingProvider, *, timeout_s: float = 2.0) -> Pr
             dim=len(vector),
             error=f"server returned dim {len(vector)}, configured {provider.dim}",
         )
-    if not any(vector):
+    if not any(vector) or not all(math.isfinite(x) for x in vector):
+        # Zero means the server conceded instead of embedding; NaN/inf mean it
+        # garbled the numbers. Both are equally useless as a possibly-fake
+        # "perfect match" downstream.
         return ProbeResult(ok=False, provider=provider.name, dim=len(vector),
-                           error="server returned an all-zero vector")
+                           error="server returned a degenerate (zero or non-finite) vector")
     return ProbeResult(ok=True, provider=provider.name, dim=len(vector), latency_ms=elapsed)
 
 

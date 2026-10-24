@@ -15,6 +15,7 @@ callers do not branch on backend.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import struct
 from typing import Iterable, Sequence
@@ -195,9 +196,12 @@ class VectorIndex:
             for x, y in zip(q, vec):
                 dot += x * y
                 vn += y * y
-            if vn == 0.0:
+            if vn == 0.0 or not (qn > 0.0):
                 continue
             cos = dot / (qn * (vn**0.5))
+            if not math.isfinite(cos):
+                # NaN would clamp to 1.0 below — do not rank garbage first.
+                continue
             scored.append((rowid, 1.0 - max(-1.0, min(1.0, cos))))
         scored.sort(key=lambda pair: pair[1])
         return scored[:k]
