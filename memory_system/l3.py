@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Literal, Sequence
 
 from .config import L3Config, MemoryConfig, RelationTypeSpec
@@ -58,6 +58,29 @@ def new_edge_id() -> str:
 
 def new_change_id() -> str:
     return "ch_" + uuid.uuid4().hex[:12]
+
+
+def coerce_confidence(confidence: Any) -> float:
+    """Sanitize one confidence value against real math (M7).
+
+    A model can emit ``NaN`` — json.loads accepts the JSON5 literal — which
+    binds to SQLite as NULL and detonates the edges table's NOT NULL
+    constraint *after* both endpoints were materialized; ``inf`` poisons
+    conflict comparisons and serializes as ``Infinity``, invalid strict
+    JSON. Same policy as L2's ``_coerce_importance``: unparseable /
+    non-finite values become the schema default, everything else is clamped
+    to [0, 1] so the existing ``low_confidence`` gate still sees an honest
+    number.
+    """
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return 0.8
+    if value != value:  # NaN
+        return 0.8
+    # Upper clamp only: a value below the floor must stay below it so the
+    # existing `low_confidence` rejection keeps seeing the honest number.
+    return min(1.0, value)
 
 
 @dataclass(slots=True)
@@ -490,11 +513,16 @@ class SemanticMemory:
                 reason="unknown_relation",
                 conflict={"relation": relation, "known": self.relation_names},
             )
+        # Sanitize before any decision depends on the number (M7): NaN must
+        # not reach the NOT NULL constraint, inf must not reach comparisons
+        # or JSON. Rebinding keeps the caller's FactInput untouched.
+        coerced = coerce_confidence(fact.confidence)
+        if coerced != fact.confidence:
+            fact = replace(fact, confidence=coerced)
         if fact.confidence < self.cfg.min_confidence:
             return EdgeDecision(status="rejected", reason="low_confidence")
         if not (fact.head or "").strip() or not (fact.tail or "").strip():
             return EdgeDecision(status="rejected", reason="empty_endpoint")
-
         # Provenance validation (DESIGN §3.3). Supplied episode ids must exist
         # in L2: a dangling id silently weakens the evidence chain. A fact with
         # *no* provenance stays allowed by default (hand-written / imported

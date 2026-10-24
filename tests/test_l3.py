@@ -18,6 +18,33 @@ def test_unknown_relation_rejected(memory: MemorySystem, project: str):
     assert decision.reason == "unknown_relation"
 
 
+def test_nonfinite_or_unbounded_confidence_is_sanitized(memory: MemorySystem, project: str):
+    """Model output can carry NaN (json.loads accepts the JSON5 literal),
+    which binds to SQLite as NULL and detonates the NOT NULL constraint
+    after both endpoints were materialized; inf poisons comparisons and
+    serializes as `Infinity`. Same boundary policy as L2's importance."""
+    import math
+
+    nan = memory.l3.add_fact(project, fact("a", "uses", "b", confidence=float("nan")))
+    assert nan.status == "accepted"
+    assert nan.edge.confidence == 0.8
+
+    inf = memory.l3.add_fact(project, fact("c", "uses", "d", confidence=float("inf")))
+    assert inf.status == "accepted"
+    assert inf.edge.confidence == 1.0
+
+    huge = memory.l3.add_fact(project, fact("e", "uses", "f", confidence=42.0))
+    assert huge.edge.confidence == 1.0
+
+    negative = memory.l3.add_fact(project, fact("g", "uses", "h", confidence=-0.2))
+    assert negative.status == "rejected"
+    assert negative.reason == "low_confidence"
+
+    # Every stored edge confidence is finite (no NaN/inf reached the table).
+    rows = memory.store.query("SELECT confidence FROM l3_edges")
+    assert all(math.isfinite(float(r["confidence"])) for r in rows)
+
+
 def test_dangling_episode_ids_rejected(memory: MemorySystem, project: str):
     """A provenance chain must point at real episodes (DESIGN §3.3): a
     dangling episode id silently weakens every evidence comparison it joins."""
