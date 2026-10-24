@@ -15,7 +15,7 @@ from typing import Callable
 
 from .embedding import EmbeddingProvider
 from .errors import MemoryError, ProviderError
-from .storage import Store, VEC_TABLES
+from .storage import Store, VEC_TABLES, json_loads
 
 
 @dataclass(slots=True)
@@ -52,12 +52,60 @@ class ReembedReport:
         }
 
 
-# (kind, source table, text expression, rowid column)
+def _l2_text(row: sqlite3.Row) -> str:
+    return row["summary"]
+
+
+def _l3_entity_text(row: sqlite3.Row) -> str:
+    from .l3 import SemanticMemory
+
+    aliases = json_loads(row["aliases"], []) or []
+    return SemanticMemory._entity_text(row["name"], row["entity_type"], aliases)
+
+
+def _l4_skill_text(row: sqlite3.Row) -> str:
+    from .l4 import SkillDefinition
+
+    definition = json_loads(row["definition"], None)
+    if definition is None:  # corrupt slot — keep the raw dump rather than skip
+        return _text_of(row["definition"])
+    return SkillDefinition.from_dict(definition).search_text()
+
+
+def _l4_archive_text(row: sqlite3.Row) -> str:
+    text = row["search_text"]
+    if text:
+        return text
+    # Legacy rows predating the search_text column: rebuild it from the
+    # structured definition, exactly what snapshot() did at write time.
+    from .l4 import SkillDefinition
+
+    definition = json_loads(row["definition"], None)
+    if definition is None:
+        return ""
+    return SkillDefinition.from_dict(definition).search_text()
+
+
+# (kind, source table, text source columns, rowid column, text builder).
+#
+# The builders above must produce EXACTLY the text the layer's write path
+# embeds, so a re-embedded vector is indistinguishable from a freshly
+# written one — otherwise recall compares a query against a different text
+# than the row actually represents. These were SQL expressions once, which
+# could not honor the writers: l3's write path folds entity_type and the
+# *parsed* alias list into the text (`SemanticMemory._entity_text`), not
+# the raw JSON-dumped aliases column; l4_skill's is
+# `SkillDefinition.search_text()` over the structured definition, not the
+# dumped JSON; and l4_archive rows already carry the exact embedded text
+# in their own `search_text` column.
+#
+# l3/l4 imports stay inside the builders to avoid an import cycle
+# (system -> migrate lazily too).
 _SOURCES = [
-    ("l2", "l2_episodes", "summary", "ord"),
-    ("l3_entity", "l3_entities", "name || ' ' || aliases", "ord"),
-    ("l4_skill", "l4_skills", "definition", "ord"),
-    ("l4_archive", "l4_archive", "definition", "ord"),
+    ("l2", "l2_episodes", "summary", "ord", _l2_text),
+    ("l3_entity", "l3_entities", "name, type AS entity_type, aliases", "ord", _l3_entity_text),
+    ("l4_skill", "l4_skills", "definition", "ord", _l4_skill_text),
+    ("l4_archive", "l4_archive", "search_text, definition", "ord", _l4_archive_text),
 ]
 
 
@@ -99,12 +147,14 @@ def reembed(
         _rebuild_vector_tables(store, provider.dim)
         report.redimensioned = True
 
-    for kind, table, text_expr, rowid_col in _SOURCES:
-        rows = store.query(f"SELECT {rowid_col} AS rid, {text_expr} AS txt FROM {table}")
+    for kind, table, cols, rowid_col, build_text in _SOURCES:
+        rows = store.query(
+            f"SELECT {rowid_col} AS rid, {cols} FROM {table}"
+        )
         done = 0
         for start in range(0, len(rows), batch):
             chunk = rows[start : start + batch]
-            texts = [_text_of(r["txt"]) for r in chunk]
+            texts = [_text_of(build_text(r)) for r in chunk]
             try:
                 vectors = provider.embed(texts)
             except ProviderError as exc:

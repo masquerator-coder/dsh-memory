@@ -222,6 +222,77 @@ def test_change_embedding_reembeds_in_place(live):
         system.close()
 
 
+def test_reembed_uses_the_write_path_text_sources():
+    """After a re-embed, every stored vector must equal the layer's write-path
+    embedding of the row — otherwise recall scores a query against text that
+    is not the text the row represents (vec table one way, rows another).
+
+    The texts here are spelled out literally from the write paths
+    (l2.summary; ``"name type aliases"*`` via _entity_text;
+    ``SkillDefinition.search_text()``; the archive's own search_text column)
+    rather than imported from migrate, so a regression in _SOURCES shows up
+    as a distance the test never encouraged.
+    """
+    from memory_system.l4 import SkillDefinition, Step
+    from memory_system.migrate import reembed
+    from memory_system.storage import VEC_TABLES
+    from memory_system.vectors import unpack_vector
+
+    system = MemorySystem(MemoryConfig(db_path=":memory:"))
+    try:
+        project = "rj"
+        system.ensure_project(project)
+        system.remember(project_id=project, summary="cluster secret rotation runbook")
+        system.l3.resolve_entity(
+            project, "vault", entity_type="service", aliases=["hv", "broker-vault"]
+        )
+        definition = SkillDefinition(
+            title="rotate vault secrets",
+            description="driven rotation procedure",
+            when_to_use="when leases expire",
+            intent_labels=["secrets"],
+            triggers=["rotation"],
+            steps=[Step(action="lease new root token", tool="vault")],
+            success_criteria="old token revoked",
+        )
+        system.add_skill(project_id=project, definition=definition, name="rotate-vault")
+
+        provider = HashEmbedding(dim=system.config.embedding.dim)
+        report = reembed(system.store, provider)
+        assert report.errors == []
+        assert report.reembedded["l3_entity"] == 1
+        assert report.reembedded["l4_skill"] == 1
+        assert report.reembedded["l4_archive"] == 1
+
+        def stored(kind: str, ordinal: int) -> list[float]:
+            blob = system.store.scalar(
+                f"SELECT embedding FROM {VEC_TABLES[kind]} WHERE rowid = ?", (ordinal,)
+            )
+            return unpack_vector(blob)
+
+        l2_row = system.store.query_one("SELECT ord, summary FROM l2_episodes")
+        assert l2_row is not None and stored("l2", l2_row["ord"]) == pytest.approx(
+            provider.embed([l2_row["summary"]])[0]
+        )
+
+        en_row = system.store.query_one("SELECT ord, name, type, aliases FROM l3_entities")
+        expected = " ".join([en_row["name"], en_row["type"], "hv", "broker-vault"])
+        assert stored("l3_entity", en_row["ord"]) == pytest.approx(provider.embed([expected])[0])
+
+        skill_row = system.store.query_one("SELECT ord, definition FROM l4_skills")
+        parsed = SkillDefinition.from_dict(json.loads(skill_row["definition"]))
+        assert stored("l4_skill", skill_row["ord"]) == pytest.approx(
+            provider.embed([parsed.search_text()])[0]
+        )
+
+        archive_row = system.store.query_one("SELECT ord FROM l4_archive")
+        assert stored("l4_archive", archive_row["ord"]) == pytest.approx(
+            provider.embed([parsed.search_text()])[0]
+        )
+    finally:
+        system.close()
+
+
 class _TripWireEmbedding(HttpEmbedding):
     """Delegate to a working provider but fail the first N embed calls."""
 
