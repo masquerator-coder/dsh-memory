@@ -80,6 +80,31 @@ export function formatRecall(recall) {
 }
 
 /**
+ * Render the per-fact write decisions from a `memory.remember` result.
+ *
+ * The store answers every fact with a decision instead of raising, so a caller
+ * that ignores them cannot tell "written to the graph" from "quietly refused".
+ * @param {any[]} decisions - `remembered.facts` entries.
+ * @returns {string} one line per refused or downgraded fact; empty when all landed.
+ */
+export function formatFactDecisions(decisions) {
+  const items = Array.isArray(decisions) ? decisions : []
+  const refused = items.filter((item) => item && item.status === 'rejected')
+  if (refused.length === 0) return ''
+  const merged = items.filter((item) => item && item.status === 'duplicate')
+  const lines = refused.map((item) => {
+    const reason = item.reason || 'rejected'
+    const hint =
+      reason === 'unknown_relation'
+        ? '；relation 只接受内置词表（causes / contradicts / depends_on / is_a / located_in / owns / part_of / related_to / uses / works_at）'
+        : ''
+    return `- 事实未写入图谱：${reason}${hint}`
+  })
+  if (merged.length > 0) lines.push(`- 另有 ${merged.length} 条已存在（duplicate），未重复写入`)
+  return `事实写入结果（${refused.length}/${items.length} 条被拒绝）：\n${lines.join('\n')}`
+}
+
+/**
  * Render a listing result as model-facing text.
  * @param {any} result - bridge `memory.list` result.
  * @returns {string} formatted text.
@@ -93,6 +118,53 @@ export function formatListing(result) {
   })
   const total = result?.total ?? items.length
   return `共 ${total} 条，显示 ${items.length} 条：\n${lines.join('\n')}`
+}
+
+/**
+ * Compile one author-DSL property into a JSON Schema node.
+ *
+ * The DSL marks requiredness with `required: true` on the property itself; a
+ * JSON Schema states it as a root-level name list, so the flag is stripped
+ * here and collected by {@link compileParameters}.
+ * @param {any} spec - author property spec.
+ * @returns {object} a JSON Schema node.
+ */
+function compileProperty(spec) {
+  if (!spec || typeof spec !== 'object') return {}
+  const { required: _required, properties, items, ...rest } = spec
+  const out = { ...rest }
+  if (properties && typeof properties === 'object') {
+    const compiled = compileParameters(properties)
+    if (compiled.required) out.required = compiled.required
+    out.properties = compiled.properties
+  }
+  if (items && typeof items === 'object') out.items = compileProperty(items)
+  return out
+}
+
+/**
+ * Compile an author parameter map into an object-rooted JSON Schema.
+ *
+ * Hosts pass `tool.parameters` straight to the provider API as `input_schema`
+ * (`dsh-llm-deepseek` / `dsh-llm-pi-ai`), and only `defineTool` compiles the
+ * DSL — `tools.register()` takes the definition as given. A raw DSL object has
+ * no `type: "object"`, so the request is rejected before the model ever sees
+ * the tool. Compiling here keeps the authoring shape while shipping a schema
+ * the API accepts.
+ * @param {object} spec - per-property parameter definitions.
+ * @returns {{type: string, properties: object, required?: string[]}} JSON Schema.
+ */
+export function compileParameters(spec) {
+  const source = spec && typeof spec === 'object' ? spec : {}
+  const properties = {}
+  const required = []
+  for (const [name, prop] of Object.entries(source)) {
+    properties[name] = compileProperty(prop)
+    if (prop && prop.required === true) required.push(name)
+  }
+  const schema = { type: 'object', properties }
+  if (required.length > 0) schema.required = required
+  return schema
 }
 
 /**
@@ -111,7 +183,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
     return projectId
   }
 
-  return [
+  const definitions = [
     {
       name: 'memory_recall',
       description:
@@ -182,7 +254,11 @@ export function buildTools({ call, projectFor, generateDigest }) {
             additionalProperties: false,
             properties: {
               head: { type: 'string' },
-              relation: { type: 'string' },
+              relation: {
+                type: 'string',
+                description:
+                  '关系名，必须用内置词表之一：causes / contradicts / depends_on / is_a / located_in / owns / part_of / related_to / uses / works_at。中文原词（如“任职机构与职称”）会被拒绝。',
+              },
               tail: { type: 'string' },
             },
           },
@@ -204,7 +280,9 @@ export function buildTools({ call, projectFor, generateDigest }) {
           },
           exec?.signal,
         )
-        return textOutput(`已写入记忆 \`${result?.remembered?.memory_id ?? '?'}\`。`)
+        const mentioned = formatFactDecisions(result?.remembered?.facts)
+        const wrote = `已写入记忆 \`${result?.remembered?.memory_id ?? '?'}\`。`
+        return textOutput(mentioned ? `${wrote}\n${mentioned}` : wrote)
       },
     },
     {
@@ -280,4 +358,11 @@ export function buildTools({ call, projectFor, generateDigest }) {
       },
     },
   ]
+
+  // Compiled once at the boundary so every definition leaves with a schema the
+  // provider accepts; the authoring DSL above stays readable.
+  return definitions.map((definition) => ({
+    ...definition,
+    parameters: compileParameters(definition.parameters),
+  }))
 }

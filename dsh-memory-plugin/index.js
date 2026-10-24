@@ -82,7 +82,19 @@ function resolveConfig(input) {
 }
 
 /** Host services this plugin cannot work without. */
-export const inject = ['tools', 'systemPrompt', 'agents', 'connection']
+export const HOST_SERVICES = ['tools', 'systemPrompt', 'agents']
+
+/**
+ * Services that enable extra surface when present, never gate the plugin.
+ *
+ * `connection` is mounted only by the Web profile. Declaring it in `inject`
+ * made a headless run skip `apply` entirely — no tools, no prompt anchor —
+ * even though the tool surface needs nothing from it.
+ */
+export const OPTIONAL_SERVICES = ['connection']
+
+/** @deprecated Use {@link HOST_SERVICES}; kept so existing imports still work. */
+export const inject = HOST_SERVICES
 
 /** Working directory of the agent behind a tool or assembly context. */
 function cwdOf(context) {
@@ -174,10 +186,17 @@ function parseMemories(reply) {
  */
 export function apply(ctx, rawConfig) {
   const config = resolveConfig(rawConfig)
-  for (const service of inject) {
+  for (const service of HOST_SERVICES) {
     if (!ctx.get(service)) {
       ctx.logger?.warn?.(`[dsh-memory] service "${service}" is missing; the memory plugin stays inactive`)
       return
+    }
+  }
+  for (const service of OPTIONAL_SERVICES) {
+    if (!ctx.get(service)) {
+      ctx.logger?.info?.(
+        `[dsh-memory] optional service "${service}" is absent; the memory tools stay available`,
+      )
     }
   }
   const logger = ctx.logger ?? console
@@ -732,12 +751,12 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
    * — and a browser-supplied `Origin` must name that same authority.
    *
    * Two checks the DSH `/api` fence also performs are dead ends here rather
-   * than omissions. `ctx.connection` is only readable on a Context that
-   * injected it, and `connection` is not among this plugin's injected
-   * services; a second `ctx.inject(['connection'], …)` scope would re-run the
-   * whole `apply` body and register every route twice. Cookie identity is
-   * unavailable for the same reason, so loopback reachability carries the
-   * trust exactly as it does for any other loopback-only local service.
+   * than omissions. `connection` is optional (see `HOST_SERVICES`): it is only
+   * mounted by the Web profile, and a second `ctx.inject(['connection'], …)`
+   * scope would re-run the whole `apply` body and register every route twice.
+   * Cookie identity is unavailable for the same reason, so loopback
+   * reachability carries the trust exactly as it does for any other
+   * loopback-only local service.
    *
    * @param {import('node:http').IncomingMessage} req - the incoming request.
    * @param {any} webCtx - the context that injected `webServer`.
