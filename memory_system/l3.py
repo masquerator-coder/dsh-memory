@@ -495,6 +495,22 @@ class SemanticMemory:
         if not (fact.head or "").strip() or not (fact.tail or "").strip():
             return EdgeDecision(status="rejected", reason="empty_endpoint")
 
+        # Provenance validation (DESIGN §3.3). Supplied episode ids must exist
+        # in L2: a dangling id silently weakens the evidence chain. A fact with
+        # *no* provenance stays allowed by default (hand-written / imported
+        # edges), strict hosts set ``require_evidence``.
+        if fact.episode_ids:
+            known = self.episodic.by_ids(fact.episode_ids) if self.episodic is not None else {}
+            missing = [mid for mid in fact.episode_ids if mid and mid not in known]
+            if missing:
+                return EdgeDecision(
+                    status="rejected",
+                    reason="needs_evidence",
+                    conflict={"missing_episode_ids": missing},
+                )
+        elif self.cfg.require_evidence:
+            return EdgeDecision(status="rejected", reason="needs_evidence")
+
         # Resolve both endpoints *without persisting*: every rejection below
         # returns before any write, so a refused fact must not leave the two
         # nodes it mentioned behind as orphans in the graph.

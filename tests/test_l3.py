@@ -18,6 +18,28 @@ def test_unknown_relation_rejected(memory: MemorySystem, project: str):
     assert decision.reason == "unknown_relation"
 
 
+def test_dangling_episode_ids_rejected(memory: MemorySystem, project: str):
+    """A provenance chain must point at real episodes (DESIGN §3.3): a
+    dangling episode id silently weakens every evidence comparison it joins."""
+    decision = memory.l3.add_fact(project, fact("a", "uses", "b", episode_ids=["mem_dangling"]))
+    assert decision.status == "rejected"
+    assert decision.reason == "needs_evidence"
+    assert decision.conflict == {"missing_episode_ids": ["mem_dangling"]}
+
+
+def test_require_evidence_flags_rejects_unproven_assertions(memory: MemorySystem, project: str):
+    """Strict hosts can demand provenance: no episode ids at all -> rejected.
+    Default stays permissive (hand-written / imported edges carry none)."""
+    assert memory.l3.add_fact(project, fact("a", "uses", "b")).status == "accepted"  # default: allowed
+    memory.l3.cfg.require_evidence = True
+    try:
+        decision = memory.l3.add_fact(project, fact("c", "uses", "d"))
+        assert decision.status == "rejected"
+        assert decision.reason == "needs_evidence"
+    finally:
+        memory.l3.cfg.require_evidence = False
+
+
 def test_entity_resolution_is_idempotent(memory: MemorySystem, project: str):
     memory.l3.add_fact(project, fact("API Gateway", "uses", "postgres"))
     memory.l3.add_fact(project, fact("api  gateway", "uses", "redis"))

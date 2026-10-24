@@ -173,6 +173,11 @@ class L3Config:
     )
     # Unknown relation names are rejected unless this is on.
     allow_unknown_relations: bool = False
+    # DESIGN §3.3 lists "no evidence" as a rejection reason, but hand-written
+    # and imported edges legitimately have no provenance (nothing dereferences
+    # their sources — see retrieval.edge_lost_its_sources), so the default
+    # keeps accepting them. Strict hosts opt in here.
+    require_evidence: bool = False
     # Conflict policy used when a write does not specify one.
     #   evidence : resolve by evidence strength (default)
     #   last_write : newest recorded_at wins
