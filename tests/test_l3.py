@@ -68,6 +68,37 @@ def test_dual_temporal_as_of_query(memory: MemorySystem, project: str):
     assert [memory.l3.get_entity(e.tail_id).name for e in now] == ["dc2"]
 
 
+def test_reopening_a_closed_triple_snapshots_the_prior_belief(memory: MemorySystem, project: str):
+    """The unique-triple index forces a reassert to reuse the old row; the
+    closed interval it carried must survive in the `l3_changes` audit."""
+    memory.l3.add_fact(project, fact("svc", "located_in", "dc1", confidence=0.9),
+                       recorded_at="2026-01-01T00:00:00+00:00")
+    closed = memory.l3.add_fact(project, fact("svc", "located_in", "dc2", confidence=0.95),
+                                recorded_at="2026-02-01T00:00:00+00:00")
+    assert closed.status == "closed"
+
+    # Real-world flow: the replacement is itself withdrawn, then the original
+    # fact is re-asserted. No edge between them and the new `at` history must
+    # lose the previous interval — it survives in the `l3_changes` audit.
+    dc2_id = [e.edge_id for e in
+              memory.l3.edges_of(memory.l3.resolve_entity(project, "svc", create=False).entity_id,
+                                 relation="located_in", current_only=True)][0]
+    memory.l3.close_edge(dc2_id)
+
+    reopened = memory.l3.add_fact(project, fact("svc", "located_in", "dc1", confidence=0.9),
+                                  recorded_at="2026-03-01T00:00:00+00:00")
+    assert reopened.status == "accepted"
+    changes = memory.l3.history(target_id=reopened.edge.edge_id, limit=100)
+    arrivals = [
+        c for c in changes
+        if c["kind"] == "edge.created" and c.get("detail", {}).get("reopened") is True
+    ]
+    assert arrivals, "the reopen must be audited"
+    prior = arrivals[-1]["detail"]["prior"]
+    assert prior["valid_to"] is not None  # the closed world-state is preserved
+    assert prior["confidence"] == 0.9
+
+
 def test_cycle_detection_for_acyclic_relations(memory: MemorySystem, project: str):
     assert memory.l3.add_fact(project, fact("a", "depends_on", "b")).status == "accepted"
     assert memory.l3.add_fact(project, fact("b", "depends_on", "c")).status == "accepted"

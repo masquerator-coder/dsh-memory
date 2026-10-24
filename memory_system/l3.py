@@ -583,8 +583,20 @@ class SemanticMemory:
     ) -> EdgeDecision:
         # Reuse a closed triple instead of inserting a second row: keeps the
         # uniqueness constraint honest while preserving the full history in
-        # l3_changes.
+        # l3_changes. "Preserving" means snapshotting the prior belief row:
+        # without this snapshot the UPDATE below would erase the previous
+        # valid_from/valid_to interval and its evidence — the only place the
+        # closed world-state could still be reconstructed is right here.
         prior = self._edge_by_triple(head.entity_id, relation, tail.entity_id)
+        prior_snapshot: dict[str, Any] | None = None
+        if prior is not None:
+            prior_snapshot = {
+                "edge_id": prior.edge_id,
+                "valid_from": prior.valid_from,
+                "valid_to": prior.valid_to,
+                "confidence": prior.confidence,
+                "episode_ids": list(prior.meta.get("episode_ids") or []),
+            }
         episode_ids = list(fact.episode_ids or [])
         meta = {
             "episode_ids": episode_ids,
@@ -619,12 +631,20 @@ class SemanticMemory:
                         json_dumps(meta),
                     ),
                 )
+            detail: dict[str, Any] = {
+                "head": head.name,
+                "relation": relation,
+                "tail": tail.name,
+                "reopened": prior is not None,
+            }
+            if prior_snapshot is not None:
+                detail["prior"] = prior_snapshot
             change_id = self._record_change(
                 project_id,
                 kind="edge.created",
                 target_kind="edge",
                 target_id=edge_id,
-                detail={"head": head.name, "relation": relation, "tail": tail.name, "reopened": prior is not None},
+                detail=detail,
                 anchor_id=fact.anchor_id,
                 recorded_at=recorded_at,
             )
