@@ -276,32 +276,37 @@ class MemorySystem:
             latest = self.anchors.latest(session_key)
             anchor_id = latest.anchor_id if latest else None
         before = self.l2.find_duplicate(project_id, summary, content_key) if report is not None else None
-        episode = self.l2.add(
-            project_id=project_id,
-            summary=summary,
-            importance=importance,
-            event_type=event_type,
-            participants=participants,
-            outcome=outcome,
-            session_key=session_key,
-            anchor_id=anchor_id,
-            content_key=content_key,
-            meta=meta,
-        )
-        decisions: list[dict[str, Any]] = []
-        for raw in facts or []:
-            fact = raw if isinstance(raw, FactInput) else FactInput(**raw)
-            if not fact.episode_ids:
-                fact.episode_ids = [episode.memory_id]
-            decision = self.l3.add_fact(project_id, fact)
-            decisions.append(
-                {
-                    "status": decision.status,
-                    "reason": decision.reason,
-                    "edge_id": decision.edge.edge_id if decision.edge else None,
-                    "conflict": decision.conflict,
-                }
+        # The episode and every fact it justifies commit together or not at
+        # all (DESIGN §2): a provider failure on fact k must not leave an
+        # episode whose remaining citations were lost. Inner transactions in
+        # L2/L3 fold into savepoints here, so this is one atomic write.
+        with self.store.transaction():
+            episode = self.l2.add(
+                project_id=project_id,
+                summary=summary,
+                importance=importance,
+                event_type=event_type,
+                participants=participants,
+                outcome=outcome,
+                session_key=session_key,
+                anchor_id=anchor_id,
+                content_key=content_key,
+                meta=meta,
             )
+            decisions: list[dict[str, Any]] = []
+            for raw in facts or []:
+                fact = raw if isinstance(raw, FactInput) else FactInput(**raw)
+                if not fact.episode_ids:
+                    fact.episode_ids = [episode.memory_id]
+                decision = self.l3.add_fact(project_id, fact)
+                decisions.append(
+                    {
+                        "status": decision.status,
+                        "reason": decision.reason,
+                        "edge_id": decision.edge.edge_id if decision.edge else None,
+                        "conflict": decision.conflict,
+                    }
+                )
         if report is not None:
             # An existing row was reused when the write did not create a new
             # id — either the pre-check or ``l2.add``'s own dedup found it.

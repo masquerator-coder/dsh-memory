@@ -29,7 +29,32 @@ def test_remember_persists_episode_and_facts(memory: MemorySystem, project: str)
 def test_remember_links_session_anchor(memory: MemorySystem, project: str):
     anchor = memory.anchors.capture(session_id="s1", seq=3, event_type="user/message", quote="use sqlite")
     result = memory.remember(project_id=project, summary="chose sqlite for storage", session_key="s1")
-    assert result["anchor_id"] in (anchor.anchor_id, None)
+    assert result["anchor_id"] == anchor.anchor_id
+
+
+def test_remember_rolls_back_episode_when_a_fact_fails(memory: MemorySystem, project):
+    """One memory = one transaction: a failing fact must not leave the
+    episode behind (DESIGN §2)."""
+    from unittest.mock import Mock
+
+    fact_a = {"head": "svc", "relation": "located_in", "tail": "eu-west-1"}
+    fact_b = {"head": "svc", "relation": "depends_on", "tail": "queue"}
+    add_fact = memory.l3.add_fact
+    calls = [0]
+
+    def flaky(project_id, fact):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise RuntimeError("boom")
+        return add_fact(project_id, fact)
+
+    memory.l3.add_fact = flaky  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="boom"):
+        memory.remember(project_id=project, summary="migration decided", facts=[fact_a, fact_b])
+    # The episode must never survive a failed fact batch.
+    assert memory.store.query("SELECT count(*) AS n FROM l2_episodes")[0]["n"] == 0
+    assert memory.store.query("SELECT count(*) AS n FROM l3_edges")[0]["n"] == 0
+
 
 
 def test_project_registration_and_view(memory: MemorySystem):
