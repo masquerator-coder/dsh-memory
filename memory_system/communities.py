@@ -26,11 +26,14 @@ post-process ``Community.summary`` through its own model.
 from __future__ import annotations
 
 import hashlib
+import itertools
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from .l2 import EpisodicMemory
 from .l3 import Edge, Entity, SemanticMemory
+from .retrieval import edge_lost_its_sources
 from .storage import Store, json_dumps, to_iso, utcnow
 from .text import clip_words
 
@@ -151,14 +154,33 @@ def summarize_communities(
 class CommunityIndex:
     """Persists communities and skips recomputation when the graph is unchanged."""
 
-    def __init__(self, store: Store, semantic: SemanticMemory, *, min_size: int = 3) -> None:
+    def __init__(self, store: Store, semantic: SemanticMemory, *, min_size: int = 3,
+                 episodic: EpisodicMemory | None = None) -> None:
         self.store = store
         self.semantic = semantic
         self.min_size = min_size
+        self.episodic = episodic
 
     def rebuild(self, project_id: str) -> list[Community]:
         entities, edges = self.semantic.load_subgraph([project_id], current_only=True)
         if not entities:
+            with self.store.transaction():
+                self.store.execute("DELETE FROM l3_communities WHERE project_id = ?", (project_id,))
+            return []
+        # Same visibility rules the rest of the system serves by: a disputed
+        # conflict must not define community structure, and a claim whose
+        # every cited episode was user-forgotten must not keep binding its
+        # endpoints into a cluster — L2 already refuses to return those
+        # sources, and the adjacency cache already refuses to traverse them;
+        # communities were the one path left reading the raw table.
+        edges = [edge for edge in edges if not edge.disputed]
+        if self.episodic is not None and edges:
+            forgotten = set(self.episodic._forgotten_ids(itertools.chain.from_iterable(
+                edge.meta.get("episode_ids") or () for edge in edges
+            )))
+            if forgotten:
+                edges = [edge for edge in edges if not edge_lost_its_sources(edge, forgotten)]
+        if not edges:
             with self.store.transaction():
                 self.store.execute("DELETE FROM l3_communities WHERE project_id = ?", (project_id,))
             return []

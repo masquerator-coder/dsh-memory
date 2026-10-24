@@ -119,7 +119,7 @@ class MemorySystem:
             embedding_cache=self.embeddings,
         )
         self.communities = CommunityIndex(
-            self.store, self.l3, min_size=self.config.l3.community_min_size
+            self.store, self.l3, min_size=self.config.l3.community_min_size, episodic=self.l2
         )
         self.skills = SkillRegistry(
             self.store, self.config.l4, self.embeddings, embedding_cache=self.embeddings

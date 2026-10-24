@@ -233,3 +233,63 @@ def test_adjacency_cache_invalidates_on_edge_updates(memory: MemorySystem, proje
     other = memory.retriever._adjacency(["proj-b"])
     assert all(e.project_id == "proj-b" for edges in other.values() for e in edges)
     assert len(other) == 2
+
+
+def test_communities_ignore_disputed_and_forgotten_source_edges(memory: MemorySystem, project: str):
+    """Communities must be built from the graph the rest of the system serves.
+
+    Disputed edges were competing in label propagation and their facts were
+    quoted in the cluster summary; claims whose every source was forgotten
+    kept binding their endpoints together — while L2 recall and the adjacency
+    cache both refuse those rows.
+    """
+    from memory_system.communities import CommunityIndex
+    from memory_system.summary import MemoryNotepad
+
+    index = CommunityIndex(memory.store, memory.l3, min_size=2, episodic=memory.l2)
+
+    def communities_by_name(project_id):
+        """{entity name: community id} — members are entity ids."""
+        names = {
+            row["entity_id"]: row["name"]
+            for row in memory.store.query("SELECT entity_id, name FROM l3_entities")
+        }
+        labels = {}
+        for community in index.rebuild(project_id):
+            for member in community.members:
+                labels[names[member]] = community.community_id
+        return labels
+
+    # Two clusters: alpha/beta tight, gamma/delta tight. The disputed edge
+    # must not glue them together.
+    memory.l3.add_fact(project, FactInput(head="alpha", relation="uses", tail="beta", confidence=0.9))
+    memory.l3.add_fact(project, FactInput(head="beta", relation="uses", tail="alpha2", confidence=0.9))
+    memory.l3.add_fact(project, FactInput(head="gamma", relation="uses", tail="delta", confidence=0.9))
+    memory.l3.add_fact(project, FactInput(head="delta", relation="uses", tail="gamma2", confidence=0.9))
+    bridged = memory.l3.add_fact(
+        project, FactInput(head="beta", relation="uses", tail="gamma", confidence=0.9)
+    )
+    memory.store.execute(
+        "UPDATE l3_edges SET meta = json_set(meta, '$.disputed', 1) WHERE edge_id = ?",
+        (bridged.edge.edge_id,),
+    )
+
+    labels = communities_by_name(project)
+    assert labels["beta"] != labels["gamma"]
+
+    # A claim whose every source was forgotten must not bind its endpoints.
+    episode = memory.remember(project_id=project, summary="epsilon service runs on zeta")
+    memory.l3.add_fact(
+        project,
+        FactInput(head="epsilon", relation="uses", tail="zeta", confidence=0.9,
+                  episode_ids=[episode["memory_id"]]),
+    )
+    labels = communities_by_name(project)
+    assert labels["epsilon"] == labels["zeta"]  # bound before the forget
+
+    MemoryNotepad(memory).forget(episode["memory_id"])
+    labels = communities_by_name(project)
+    epsilon, zeta = labels.get("epsilon"), labels.get("zeta")
+    # After the forget the pair must not share a cluster: isolated entities
+    # fall under min_size and drop out entirely (None), or land elsewhere.
+    assert epsilon is None or zeta is None or epsilon != zeta

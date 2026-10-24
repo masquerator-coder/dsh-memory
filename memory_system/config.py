@@ -208,9 +208,11 @@ class L3Config:
     rrf_k: int = 60
     # Edge types that are always traversable (precondition for the whitelist).
     traversal_edge_allowlist: tuple[str, ...] | None = None  # None = all
-    # Community detection + summarization thresholds.
+    # Community detection threshold. (``community_max_size`` was removed:
+    # nothing consumed it — label propagation cannot cap a community without
+    # splitting, so exposing the knob was promising behavior that never
+    # existed.)
     community_min_size: int = 3
-    community_max_size: int = 60
 
 
 @dataclass(slots=True)
