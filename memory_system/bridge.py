@@ -173,14 +173,22 @@ class Scope:
         )
 
 
-@contextmanager
-def open_memory(scope: Scope) -> Iterator[MemorySystem]:
-    """Open the database for the duration of one request and close it after.
+# Serving keeps one MemorySystem per scope for the process lifetime.
+# One-shot mode (a request handled outside serve) still opens and closes
+# per call, as before.
+_SERVE_SYSTEMS: dict[tuple[str, str | None, str | None], MemorySystem] | None = None
 
-    ``on_unavailable="warn"`` keeps a broken embedding endpoint from turning
-    every host call into an exception: the digest and the memory list still
-    work, and the degraded probe is reported back with the result.
-    """
+
+def _cache_key(scope: Scope) -> tuple[str, str | None, str | None]:
+    try:
+        home = str(scope.home.resolve())
+    except OSError:
+        home = str(scope.home)
+    db_key = str(Path(scope.db_path).resolve()) if scope.db_path is not None else None
+    return (home, db_key, scope.embedding_preset)
+
+
+def _build_config(scope: Scope) -> MemoryConfig:
     scope.home.mkdir(parents=True, exist_ok=True)
     overrides: dict[str, Any] = {}
     if scope.embedding_preset:
@@ -188,11 +196,44 @@ def open_memory(scope: Scope) -> Iterator[MemorySystem]:
     config = MemoryConfig.for_home(scope.home, **overrides)
     if scope.db_path is not None:
         config = config.with_(db_path=str(scope.db_path))
+    return config
+
+
+@contextmanager
+def open_memory(scope: Scope) -> Iterator[MemorySystem]:
+    """Open the database for the duration of one request and close it after.
+
+    ``on_unavailable="warn"`` keeps a broken embedding endpoint from turning
+    every host call into an exception: the digest and the memory list still
+    work, and the degraded probe is reported back with the result.
+
+    While serving, the system is kept open between requests instead: opening
+    is not free (the startup probe can hit the embedding endpoint — up to
+    seconds on a stalled HTTP host — and sqlite-vec's first-touch warm-up
+    costs real latency), and paying it on every turn was the single largest
+    fixed cost of the bridge. Keyed by {home, db_path, preset}; the host may
+    only change either by sending a different payload scope, which maps to a
+    different key. One-shot mode still closes after the request.
+    """
+    if _SERVE_SYSTEMS is not None:
+        key = _cache_key(scope)
+        cached = _SERVE_SYSTEMS.get(key)
+        if cached is not None:
+            yield cached
+            return
+    config = _build_config(scope)
     memory = MemorySystem(config)
-    try:
-        yield memory
-    finally:
-        memory.close()
+    if _SERVE_SYSTEMS is not None:
+        _SERVE_SYSTEMS[_cache_key(scope)] = memory
+        try:
+            yield memory
+        finally:
+            pass  # stays open for the next request; serve() closes them all
+    else:
+        try:
+            yield memory
+        finally:
+            memory.close()
 
 
 def probe_payload(memory: MemorySystem) -> dict[str, Any]:
@@ -875,9 +916,27 @@ def _write_line(stream: Any, text: str) -> None:
 
 
 def serve(stdin: Any = None, stdout: Any = None) -> int:
-    """Newline-delimited JSON loop. Returns a process exit code."""
+    """Newline-delimited JSON loop. Returns a process exit code.
+
+    Systems opened during the loop are cached per scope and closed when the
+    loop ends, however it ends (EOF, ``__quit__``, fatal error)."""
+    global _SERVE_SYSTEMS
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
+    _SERVE_SYSTEMS = {}
+    try:
+        return _serve_loop(stdin, stdout)
+    finally:
+        systems, _SERVE_SYSTEMS = _SERVE_SYSTEMS, None
+        assert systems is not None
+        for memory in systems.values():
+            try:
+                memory.close()
+            except Exception:  # noqa: BLE001 - teardown must not mask the cause
+                pass
+
+
+def _serve_loop(stdin: Any, stdout: Any) -> int:
     while True:
         line = _read_line(stdin).strip()
         if not line:

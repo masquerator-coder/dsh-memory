@@ -279,6 +279,49 @@ def test_serve_survives_a_failing_command():
     assert replies[1]["ok"] is True
 
 
+def test_serve_caches_systems_per_scope_and_closes_on_exit(tmp_path):
+    """Opening rebuilt MemorySystem + reran the startup probe per request;
+    serve() keeps one per {home, db_path, preset} scope instead, and closes
+    them all when the loop ends."""
+    from memory_system import bridge
+
+    made: list[Any] = []
+
+    class CountingSystem(bridge.MemorySystem):
+        def __init__(self, config):
+            super().__init__(config)
+            made.append(self)
+
+        closed = 0
+
+        def close(self):
+            CountingSystem.closed += 1
+            super().close()
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    monkeypatch_.setattr(bridge, "MemorySystem", CountingSystem)
+    try:
+        replies = _serve(
+            [
+                {"id": "a", "command": "settings.get", "payload": {}},
+                {"id": "b", "command": "settings.get", "payload": {}},
+                {
+                    "id": "c",
+                    "command": "settings.get",
+                    "payload": {"db_path": str(tmp_path / "other.db")},
+                },
+            ]
+        )
+    finally:
+        monkeypatch_.undo()
+
+    assert [r["id"] for r in replies] == ["a", "b", "c"]
+    assert all(r["ok"] for r in replies), replies
+    # a and b share one scope -> one system; c differs -> its own.
+    assert len(made) == 2
+    assert CountingSystem.closed == 2  # teardown closed both
+
+
 def test_serve_survives_an_unusable_scope():
     """A payload that breaks scope resolution must not end the loop either."""
     replies = _serve(
