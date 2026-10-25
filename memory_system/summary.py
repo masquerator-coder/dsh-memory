@@ -289,8 +289,14 @@ class Materials:
         "the memory store is empty", and the digest is then generated from
         nothing. Sections are emitted in priority order (requests, facts,
         events, profile) and each one takes the space it needs until the
-        budget runs out; the profile is reserved first because it is the
-        shortest section and the only one the user wrote by hand.
+        budget runs out; the profile is reserved first because it is the only
+        section the user wrote by hand.
+
+        That reservation is capped at half the budget. The profile is stored
+        verbatim (up to ``PROFILE_MAX_CHARS``), so a long one used to reserve
+        the entire prompt: ``remaining`` became zero, every machine-written
+        section was skipped, and the "digest" was nothing but the profile,
+        cut mid-sentence by the final clip.
         """
         budget = max_chars
         if budget <= 0:
@@ -329,13 +335,16 @@ class Materials:
 
         # Reserve the profile first, then spend what is left in priority order.
         reserve = 0
+        shown_profile = profile
         if profile:
-            reserve = min(len(profile) + len(sections[-1][0]) + 2, budget)
+            title_len = len(sections[-1][0])
+            reserve = min(len(profile) + title_len + 2, budget // 2)
+            shown_profile = _clip_text(profile, max(0, reserve - title_len - 2))
         remaining = budget - reserve
         out: list[str] = []
         for title, lines in sections:
             if title.startswith("## 用户画像"):
-                out.append(f"{title}\n{profile}")
+                out.append(f"{title}\n{shown_profile}")
                 continue
             if remaining <= len(title) + 2:
                 continue
@@ -363,6 +372,15 @@ def _one_line(text: str | None, limit: int) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 1] + "…"
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Hard character clip that never exceeds ``limit`` and says it was cut."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def collect_materials(

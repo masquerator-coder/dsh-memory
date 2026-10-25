@@ -19,6 +19,7 @@ from memory_system.summary import (
     LENGTH_MIN,
     LENGTH_PRESETS,
     DigestService,
+    Materials,
     MemoryNotepad,
     clip_to_budget,
     coerce_length,
@@ -70,6 +71,44 @@ def test_settings_round_trip(service: DigestService):
     assert service.settings().mode == AUTO_MODE == "idle"
     assert service.set_mode("debounced").mode == AUTO_MODE
     assert service.set_mode("off").mode == AUTO_MODE
+
+
+def test_long_profile_does_not_evict_the_rest_of_the_digest():
+    """The profile is user-authored and stored verbatim, so it can be longer
+    than the entire prompt budget. Reserving it first then zeroed everything
+    left: the "digest" was the profile alone, cut mid-sentence, and the model
+    was asked to summarise the memory from no memories at all."""
+    materials = Materials(
+        scope="project",
+        project_ids=["proj-a"],
+        episodes=[
+            {
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "project_id": "proj-a",
+                "event_type": "decision",
+                "importance": 0.8,
+                "summary": "sqlite chosen for the vector index",
+            }
+        ],
+        facts=[
+            {
+                "head": "svc",
+                "relation": "uses",
+                "tail": "sqlite",
+                "project_id": "proj-a",
+                "confidence": 0.9,
+            }
+        ],
+        profile="我是一名后端工程师。" * 400,
+        user_texts=["please remember the migration plan"],
+    )
+    body = materials.render(max_chars=1_000)
+    assert "## 用户最近的请求" in body
+    assert "## 已确认的事实" in body
+    assert "## 事件" in body
+    assert "## 用户画像" in body
+    assert body.endswith("…"), "the long profile is clipped, not dropped"
+    assert len(body) <= 1_000
 
 
 # ── profile ─────────────────────────────────────────────────────────────
