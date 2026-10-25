@@ -714,6 +714,29 @@ class EpisodicMemory:
             ),
         )
 
+    def embed_summary(self, summary: str) -> list[float]:
+        """The vector the write path stores for ``summary``.
+
+        Public so an editor can embed *before* opening the transaction that
+        rewrites the row. A provider call is not cheap and may be a network
+        round trip; holding the store's single write lock across it would stall
+        every other writer. ``add`` embeds before its transaction for the same
+        reason.
+        """
+        return self._embed(summary)
+
+    def reembed(self, memory_id: str, vector: Sequence[float]) -> None:
+        """Replace one row's stored vector (``l2`` vectors are keyed by ``ord``).
+
+        A vanished row is a no-op: the id no longer maps to an ordinal, and the
+        ordinal may already have been reused by a later insert, so writing a
+        vector for it would attach this text to a different memory.
+        """
+        row = self.store.query_one("SELECT ord FROM l2_episodes WHERE memory_id = ?", (memory_id,))
+        if row is None:
+            return
+        self.store.vectors.upsert("l2", int(row["ord"]), vector)
+
     def find_duplicate(self, project_id: str, summary: str, content_key: str | None = None) -> Episode | None:
         """The row a write of ``summary`` would be merged into, or ``None``.
 

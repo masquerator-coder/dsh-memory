@@ -255,6 +255,27 @@ def test_memory_edit_reindexes_every_indexed_field(memory: MemorySystem, project
     assert created["memory_id"] not in lexical("incident")
 
 
+def test_memory_edit_reembeds_the_new_text(memory: MemorySystem, project: str):
+    """The stored vector is a view of the summary, so an edit must re-embed.
+
+    ``update`` rewrote the text and the lexical index but left the vector
+    alone: the memory kept answering semantic queries in its *old* wording,
+    and the database then held a vector that was not the embedding of the
+    summary stored next to it.
+    """
+    created = memory.remember(project_id=project, summary="database index tuning", importance=0.8)
+    MemoryNotepad(memory).update(created["memory_id"], {"summary": "协议超时重试策略"})
+
+    ordinal = memory.l2.get(created["memory_id"]).ordinal
+
+    def distance(text: str) -> float:
+        hits = dict(memory.store.vectors.knn("l2", memory.embeddings.embed_one(text), k=10))
+        return hits[ordinal]
+
+    assert distance("协议超时重试策略") == pytest.approx(0.0, abs=1e-6)
+    assert distance("database index tuning") > 0.05
+
+
 def test_memory_edit_accepts_tags_only(memory: MemorySystem, project: str):
     """Tags live in a meta blob, not a column, so they must not trip the
     empty-patch guard on their own."""

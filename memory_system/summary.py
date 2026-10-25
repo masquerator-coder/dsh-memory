@@ -1191,6 +1191,13 @@ class MemoryNotepad:
             sets.append("updated_at = ?")
             params.append(_iso_now())
             params.append(memory_id)
+        # The vector, like the FTS body, is derived from the text: leaving it
+        # alone after a summary edit means semantic recall keeps matching the
+        # old wording forever, and a duplicate of the *new* text no longer
+        # dedupes against this row on the vector side. Embed before opening the
+        # transaction -- a provider call can be slow or remote and must not hold
+        # the store's write lock (``EpisodicMemory.add`` does the same).
+        vector = self.memory.l2.embed_summary(summary) if "summary" in patch else None
         with self.store.transaction():
             if sets:
                 self.store.execute(f"UPDATE l2_episodes SET {', '.join(sets)} WHERE memory_id = ?", params)
@@ -1202,6 +1209,10 @@ class MemoryNotepad:
             # participant names.
             if "summary" in patch or "event_type" in patch:
                 self.memory.l2.reindex_text(memory_id)
+            # Same transaction, same reason: the row's text and the vector that
+            # stands for it must never disagree.
+            if vector is not None:
+                self.memory.l2.reembed(memory_id, vector)
             # Tags live in a meta blob, so they are written through their own
             # helper. Keep it inside this transaction: otherwise a failure
             # leaves the fields updated but the tags silently stale.
