@@ -54,7 +54,6 @@ const DEFAULTS_INNER = {
   // Ask the model once, at session teardown, for anything still unwritten.
   sessionEndCheck: true,
   requestTimeoutMs: 60000,
-  digestScope: 'project',
   embeddingPreset: '',
 }
 
@@ -91,7 +90,6 @@ function resolveConfig(input) {
     }
     config[key] = String(value)
   }
-  if (config.digestScope !== 'global') config.digestScope = 'project'
   return config
 }
 
@@ -475,39 +473,43 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Digest runs in progress, keyed by scope identity.
+   * Digest run in progress.
    *
    * Automatic generation fires per idle session and the settings page can ask
-   * for one at the same time, so without this guard two runs would write two
-   * digests for the same scope.
+   * for one at the same time. There is only one global digest, so overlapping
+   * runs would each pay for a model call and then commit two copies.
    */
   const digestInFlight = new Map()
 
   /**
- * Plan a digest, ask the model to write it, and commit it.
- * @param {object} options - generation options.
- * @param {string} [options.cwd] - project working directory.
- * @param {AbortSignal} [options.signal] - cancellation.
- * @param {string} [options.reason] - `manual` or `auto`.
- * @param {number} [options.length] - override the stored budget.
- * @param {string} [options.scope] - `project` or `global`.
- * @returns {Promise<any>} `{ digest }` as committed.
- */
-async function generateDigest({ cwd, signal, reason = 'manual', length, scope = config.digestScope } = {}) {
-    const scopeName = scope === 'global' ? 'global' : 'project'
+   * Plan the global digest, ask the model to write it, and commit it.
+   * @param {object} options - generation options.
+   * @param {string} [options.cwd] - project working directory (for root notes).
+   * @param {AbortSignal} [options.signal] - cancellation.
+   * @param {string} [options.reason] - `manual` or `auto`.
+   * @param {number} [options.length] - override the stored budget.
+   * @returns {Promise<any>} `{ digest }` as committed.
+   */
+  async function generateDigest({ cwd, signal, reason = 'manual', length } = {}) {
     cwd = resolveCwd(cwd)
-    const projectId = await projectFor(cwd)
-    if (scopeName === 'project' && !projectId) {
-      throw new BridgeError('无法确定当前项目：会话没有工作目录', 'NO_PROJECT')
+    // Resolving the project also registers its root path, which is what lets
+    // the Python side refresh that project's DSH_MEMORY.md. It is never a
+    // reason to fail a global digest.
+    let projectId
+    if (cwd) {
+      try {
+        projectId = await projectFor(cwd)
+      } catch {
+        // The digest itself is cross-project and can proceed without it.
+      }
     }
     // Several sessions can go idle at once, and the manual button can fire
-    // while an automatic run is mid-flight. Two overlapping runs would each
-    // pay for a model call and then commit two digests for the same scope, so
-    // a second caller joins the first instead of starting its own.
+    // while an automatic run is mid-flight, so a second caller joins the first
+    // instead of starting its own.
     //
     // The joined caller does not forward its own `signal`: aborting one
     // client must not cancel a run that other callers are waiting on.
-    const key = `${scopeName}:${scopeName === 'project' ? projectId : ''}`
+    const key = 'global'
     const running = digestInFlight.get(key)
     if (running) {
       if (reason === 'auto') return { digest: null, skipped: 'in-flight' }
@@ -517,7 +519,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
         // The earlier run failed; fall through and try once more.
       }
     }
-    const task = runDigest({ scopeName, projectId, signal, reason, length })
+    const task = runDigest({ cwd, projectId, signal, reason, length })
     digestInFlight.set(key, task)
     try {
       return await task
@@ -530,19 +532,11 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
 
   /**
    * The body of one digest run, without the in-flight bookkeeping.
-   * @param {object} options - resolved scope identity and generation options.
+   * @param {object} options - generation options.
    * @returns {Promise<any>} `{ digest }` as committed.
    */
-  async function runDigest({ scopeName, projectId, signal, reason, length }) {
-    const plan = await call(
-      'digest.plan',
-      {
-        project_id: scopeName === 'project' ? projectId : undefined,
-        scope: scopeName,
-        length,
-      },
-      signal,
-    )
+  async function runDigest({ cwd, projectId, signal, reason, length }) {
+    const plan = await call('digest.plan', { cwd, project_id: projectId, length }, signal)
     const llm = ctx.get?.('llm')
     let text = ''
     let error
@@ -555,7 +549,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
       generator = 'unavailable'
     } else if (plan.has_materials === false) {
       // Empty memory is a real state, not a failure: record the honest note.
-      text = `## 项目状态\n还没有可总结的记忆（${new Date().toISOString().slice(0, 10)}）。`
+      text = `## 暂无工作记录\n还没有可作为摘要的工作记录（${new Date().toISOString().slice(0, 10)}）。`
       generator = 'host-llm'
     } else {
       try {
@@ -576,8 +570,8 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
     const committed = await call(
       'digest.commit',
       {
-        project_id: scopeName === 'project' ? projectId : undefined,
-        scope: scopeName,
+        cwd,
+        project_id: projectId,
         text,
         target_chars: plan.target_chars,
         sources: plan.sources ?? [],
@@ -589,7 +583,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
       },
       signal,
     )
-    logger.info(`[dsh-memory] digest ${committed?.digest?.status ?? 'unknown'} (${reason}, ${scopeName})`)
+    logger.info(`[dsh-memory] digest ${committed?.digest?.status ?? 'unknown'} (${reason}, global)`)
     return committed
   }
 
@@ -661,16 +655,11 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
       slot.pending = true
       void (async () => {
         try {
-          const projectId = await projectFor(cwd || undefined)
-          if (!projectId) {
-            slot.text = ''
-            return
-          }
+          // The anchor is global: it advertises the one cross-project digest
+          // and the user profile, not a per-project summary.
           const result = await call('digest.anchor', {
-            project_id: projectId,
             include_summary: true,
             include_profile: true,
-            scope: 'project',
           })
           slot.text = typeof result?.text === 'string' ? result.text : ''
         } catch (error) {
@@ -709,7 +698,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
             // body and the heartbeat vary.
-            const body = slot?.text || '（本项目的记忆库还没有内容。）'
+            const body = slot?.text || '（还没有可用的记忆摘要。）'
             return `${ANCHOR_HEADER.replace('{{memory_anchor}}', body)}${heartbeatLine(session?.id)}`
           },
         }),
@@ -941,8 +930,6 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
     })
 
     route('/dsh-memory/digest', async (body) => {
-      const projectId = await routeProject(body)
-      const scope = body?.scope === 'global' ? 'global' : 'project'
       switch (body?.action) {
         case 'generate': {
           const record = await generateDigest({
@@ -950,17 +937,16 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
             signal: undefined,
             reason: 'manual',
             length: body?.length,
-            scope,
           })
-          const view = await call('digest.view', { project_id: scope === 'project' ? projectId : undefined, scope })
+          const view = await call('digest.view', {})
           return { ...view, generated: record?.digest ?? null }
         }
         case 'delete':
           return await call('digest.delete', { digest_id: body?.digest_id })
         case 'history':
-          return await call('digest.history', { project_id: scope === 'project' ? projectId : undefined, scope })
+          return await call('digest.history', {})
         default:
-          return await call('digest.view', { project_id: scope === 'project' ? projectId : undefined, scope })
+          return await call('digest.view', {})
       }
     })
 
@@ -1072,7 +1058,8 @@ const ANCHOR_HEADER = [
   '- 写一条好的记忆 = 一句话说清关键实体与结论，并选对 `event_type`（decision / preference / fix / fact / note）。',
   '',
   '使用方式：',
-  '- 需要具体内容时调用 `memory_digest_read` 读摘要全文，或 `memory_recall` 按问题检索事件与事实。',
+  '- `memory_digest_read` 读取全局摘要全文（所有项目已做过的工作），`memory_recall` 按问题检索事件与事实。',
+  '- 想知道某个项目做过什么时，也可以查看该项目根目录下的 `DSH_MEMORY.md`。',
   '- 用户提到"之前说过""上次""我们的约定"时，先 `memory_recall` 再回答；不要凭印象编造记忆。',
   '- 需要了解用户偏好时调用 `memory_profile_read`；用户画像由用户本人维护。',
   '- 用户明确要求记住某件事时用 `memory_add`；要求忘掉时用 `memory_forget`。',

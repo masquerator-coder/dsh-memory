@@ -306,7 +306,7 @@ memory_system/
   l3.py            L3 图
   retrieval.py     路由 / 快慢路径 / RRF
   communities.py   社区检测与摘要
-  summary.py       记忆摘要 / 用户画像（digest）
+  summary.py       全局工作摘要 / 项目根 Markdown / 用户画像
   migrate.py       嵌入模型迁移（逐层重建向量）
   l4.py            技能结构 / 预算规划 / 渲染
   skills.py        L4 注册表 / 匹配 / 运行记录
@@ -318,10 +318,18 @@ memory_system/
   adapters/
     turns.py       宿主端口（NormalizedEvent / TurnContext / ProjectResolver）
     dsh.py         DSH 接口桩（未实现，仅记录绑定点）
-tests/             169 项
+tests/             204 项
 ```
 
 **digest 的遗忘承诺**：digest 是宿主唯一注入提示词的路径，因此它与检索遵守同一条
-遗忘规则 —— 带 `forgotten_at` 的情节不进入材料；失去全部证据情节的边同样排除
-（复用检索侧 `edge_lost_its_sources`，无来源的手写/导入边照旧保留）。restore 后
-记忆随之回到 digest 候选池。已由 `tests/test_summary.py` 锁定。
+遗忘规则 —— 带 `forgotten_at` 的情节不进入材料。restore 后记忆随之回到 digest 候选池。
+已由 `tests/test_summary.py` 锁定。
+
+**只有一份全局工作摘要**：宿主不再生成“当前项目摘要”。全局摘要覆盖所有项目，只记录
+已经做过的工作（实现、修复、迁移、已落地的决定与结果），不写经验教训、偏好或未来计划。
+预算（300–3000 字）作为**生成指令**写入提示词：预算大时模型展开更多工作项与细节，
+预算小时只写每个项目的结论；`commit` 原样保存模型输出，不做按预算截断。
+
+**项目根摘要文件**：每个项目在 `root_path` 下维护一个 `DSH_MEMORY.md`，由 L2 工作记录
+按日期派生，记录该项目做过的工作，不进入召回或全局摘要。项目首次被解析（`projects`）
+以及每次记忆写入/编辑/遗忘/恢复、全局摘要提交后都会刷新；写失败被隔离，不影响记忆写入。

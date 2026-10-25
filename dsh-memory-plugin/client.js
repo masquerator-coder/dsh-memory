@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
       "status.backend": "检索后端",
       "status.degraded": "（降级）",
       "length.title": "记忆摘要长度",
-      "length.hint": "注入系统提示词的记忆摘要预算上限。摘要由模型生成，实际长度通常远小于预算。",
+      "length.hint": "全局摘要的生成预算：预算越大，模型写出的工作摘要越详细；预算越小，摘要越简洁。摘要不会再被截断。",
       "length.preset": "{n} 字",
       "length.custom": "自定义",
       "length.customPlaceholder": "输入 1000 到 4000000 之间的字符数",
@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
       "digest.chars": "{n} 字 · 约 {tokens} tokens",
       "digest.status": "状态",
       "digest.statusOk": "正常",
-      "digest.statusTruncated": "已按预算截断",
+      "digest.statusTruncated": "旧版按预算截断",
       "digest.statusEmpty": "无内容",
       "digest.statusError": "生成失败",
       "digest.history": "历史摘要",
@@ -105,12 +105,10 @@ window.__ModuleLoader__.load({
       "digest.noContent": "还没有记忆摘要。先点上方按钮生成一次。",
       "digest.needMaterials": "记忆库还没有内容；先和助手聊几轮，或手动添加记忆。",
       "digest.failed": "生成失败：{message}",
-      "digest.scopeProject": "当前项目",
-      "digest.scopeGlobal": "全部项目",
-      "digest.viewerTitle": "记忆摘要 · {scope}",
+      "digest.viewerTitle": "全局记忆摘要",
+      "digest.globalHint": "摘要覆盖所有项目，只记录已经做过的工作（不记录经验教训与偏好）；预算越大越详细，不会被截断。",
       "digest.loadFailed": "读取摘要失败：{message}",
-      "digest.generatingHint": "正在生成记忆摘要…这一步会调用模型，可能需要几十秒。",
-      "digest.scopeLabel": "摘要范围",
+      "digest.generatingHint": "正在生成全局记忆摘要…这一步会调用模型，可能需要几十秒。",
       "digest.generatedLabel": "生成于",
       "digest.size": "规模",
       "digest.budget": "预算",
@@ -236,7 +234,7 @@ window.__ModuleLoader__.load({
       "status.backend": "Retrieval backend",
       "status.degraded": "(degraded)",
       "length.title": "Digest length",
-      "length.hint": "Budget ceiling for the digest injected into the system prompt. A model writes the digest, so the real length is usually far below the budget.",
+      "length.hint": "Generation budget for the global digest: a larger budget yields a more detailed work summary, a smaller one a terser summary. The output is never clipped.",
       "length.preset": "{n} chars",
       "length.custom": "Custom",
       "length.customPlaceholder": "Enter a value between 1000 and 4000000",
@@ -261,7 +259,7 @@ window.__ModuleLoader__.load({
       "digest.chars": "{n} chars · about {tokens} tokens",
       "digest.status": "Status",
       "digest.statusOk": "OK",
-      "digest.statusTruncated": "Clipped to budget",
+      "digest.statusTruncated": "Clipped by an older version",
       "digest.statusEmpty": "Empty",
       "digest.statusError": "Failed",
       "digest.history": "Earlier digests",
@@ -271,12 +269,10 @@ window.__ModuleLoader__.load({
       "digest.noContent": "No digest yet. Use the button above to generate one.",
       "digest.needMaterials": "The memory store is still empty; chat for a few turns or add a memory first.",
       "digest.failed": "Generation failed: {message}",
-      "digest.scopeProject": "This project",
-      "digest.scopeGlobal": "All projects",
-      "digest.viewerTitle": "Memory digest · {scope}",
+      "digest.viewerTitle": "Global memory digest",
+      "digest.globalHint": "The digest spans every project and records only work already done (no lessons or preferences). A larger budget means more detail; it is never clipped.",
       "digest.loadFailed": "Could not read the digest: {message}",
-      "digest.generatingHint": "Generating the digest… this calls the model and can take a few tens of seconds.",
-      "digest.scopeLabel": "Digest scope",
+      "digest.generatingHint": "Generating the global digest… this calls the model and can take a few tens of seconds.",
       "digest.generatedLabel": "Generated",
       "digest.size": "Size",
       "digest.budget": "Budget",
@@ -659,7 +655,6 @@ window.__ModuleLoader__.load({
       const [generating, setGenerating] = useState(false)
       const [digestNote, setDigestNote] = useState(null)
       const [showViewer, setShowViewer] = useState(false)
-      const [digestScope, setDigestScope] = useState('project')
 
       // memories
       const [showMemories, setShowMemories] = useState(false)
@@ -686,7 +681,6 @@ window.__ModuleLoader__.load({
             setLength(settings.length)
             setSavedLength(settings.length)
           }
-          setDigestScope('project')
         } catch (error) {
           setStatusError(error.message)
         } finally {
@@ -694,9 +688,9 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      const loadDigest = React.useCallback(async (scope) => {
+      const loadDigest = React.useCallback(async () => {
         try {
-          const result = await api(ROUTE_DIGEST, { action: 'view', scope })
+          const result = await api(ROUTE_DIGEST, { action: 'view' })
           setDigestState({ digest: result?.digest ?? null, history: result?.history ?? [] })
         } catch (error) {
           setDigestNote({ kind: 'error', text: t('digest.loadFailed', { message: error.message }) })
@@ -717,7 +711,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         void loadStatus()
         void loadProfile()
-        void loadDigest('project')
+        void loadDigest()
       }, [loadStatus, loadProfile, loadDigest])
 
       // Debounced commit: once the slider settles on a new preset for a beat,
@@ -811,7 +805,7 @@ window.__ModuleLoader__.load({
         setGenerating(true)
         setDigestNote({ kind: 'warn', text: t('digest.generatingHint') })
         try {
-          const result = await api(ROUTE_DIGEST, { action: 'generate', scope: digestScope, length })
+          const result = await api(ROUTE_DIGEST, { action: 'generate', length })
           setDigestState({ digest: result?.digest ?? null, history: result?.history ?? [] })
           const generated = result?.generated
           if (generated?.status === 'error') {
@@ -1107,26 +1101,9 @@ window.__ModuleLoader__.load({
               'header',
               null,
               h('h3', { className: 'mem-title' }, t('digest.title')),
-              h(
-                'div',
-                { className: 'mem-row' },
-                h(
-                  'select',
-                  {
-                    className: 'mem-select',
-                    value: digestScope,
-                    onChange: (event) => {
-                      setDigestScope(event.target.value)
-                      void loadDigest(event.target.value)
-                    },
-                    'aria-label': t('digest.scopeLabel'),
-                  },
-                  h('option', { value: 'project' }, t('digest.scopeProject')),
-                  h('option', { value: 'global' }, t('digest.scopeGlobal')),
-                ),
-                h(DigestStatus, { digest: latest }),
-              ),
+              h(DigestStatus, { digest: latest }),
             ),
+            h('p', { className: 'mem-hint' }, t('digest.globalHint')),
             latest
               ? h(
                   'dl',
@@ -1258,7 +1235,7 @@ window.__ModuleLoader__.load({
           ? h(
               Modal,
               {
-                title: t('digest.viewerTitle', { scope: digestScope === 'global' ? t('digest.scopeGlobal') : t('digest.scopeProject') }),
+                title: t('digest.viewerTitle'),
                 onClose: () => setShowViewer(false),
                 footer: [
                   h('span', { key: 'meta', className: 'mem-hint' }, `${formatTime(latest.created_at)} · ${t('length.preset', { n: latest.actual_chars ?? 0 })}`),
@@ -1281,7 +1258,7 @@ window.__ModuleLoader__.load({
           : null,
         showMemories ? h(MemoriesModal, { onClose: () => setShowMemories(false), onChanged: () => {
           void loadStatus()
-          void loadDigest(digestScope)
+          void loadDigest()
         } }) : null,
       )
     }

@@ -49,6 +49,7 @@ from .summary import (
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
+    PROJECT_SUMMARY_FILE,
     PROMPT_VERSION,
     SUMMARY_MAX_CHARS,
     DigestService,
@@ -140,6 +141,28 @@ def resolve_project_id(cwd: str | None) -> str:
             break
         probe = probe.parent
     return ProjectResolver().resolve(str(directory), git_remote=remote)
+
+
+def resolve_project_root(cwd: str | None) -> str | None:
+    """The directory that owns a project's ``DSH_MEMORY.md``.
+
+    A session may start in a subdirectory, so walk up to the git top level
+    when there is one; otherwise the working directory itself is the root.
+    """
+    if not cwd:
+        return None
+    try:
+        directory = Path(cwd).expanduser().resolve()
+    except OSError:
+        directory = Path(cwd).expanduser()
+    probe = directory
+    for _ in range(12):
+        if (probe / ".git").exists():
+            return str(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    return str(directory)
 
 
 # ══ database handle ═════════════════════════════════════════════════════
@@ -275,6 +298,14 @@ def _project(payload: dict[str, Any]) -> str:
     return resolve_project_id(payload.get("cwd"))
 
 
+def _refresh_project_summary(memory: MemorySystem, project_id: str) -> None:
+    """Keep the project's root Markdown in step with a memory edit/write."""
+    try:
+        DigestService(memory).write_project_summaries(project_id=project_id)
+    except Exception:  # noqa: BLE001 - a derived file must never fail a write
+        pass
+
+
 def _bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
@@ -308,8 +339,13 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     service = DigestService(memory)
     settings = service.settings()
     project = _project(payload)
-    memory.ensure_project(project, display_name=payload.get("display_name"))
-    latest = service.latest(scope="project", project_id=project)
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=root
+    )
+    if root:
+        service.write_project_summaries(project_id=project)
+    latest = service.latest(scope="global")
     notepad = MemoryNotepad(memory)
     listing = notepad.list(project_id=project, limit=1)
     stats: dict[str, Any]
@@ -325,6 +361,7 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
         "projects": [p.project_id for p in memory.list_projects()],
         "settings": settings.to_dict(),
         "digest": latest.to_dict() if latest else None,
+        "project_summary": str(Path(root) / PROJECT_SUMMARY_FILE) if root else None,
         "memories": listing["total"],
         "probe": probe_payload(memory),
         "stats": stats,
@@ -335,6 +372,13 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
 @command("projects")
 def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     project = _project(payload)
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=root
+    )
+    # First contact with a project is also what creates its root Markdown file.
+    if root:
+        DigestService(memory).write_project_summaries(project_id=project)
     return {
         "project_id": project,
         "projects": [
@@ -416,13 +460,11 @@ def cmd_profile_write(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 @command("digest.plan")
 def cmd_digest_plan(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     project = _project(payload)
-    memory.ensure_project(project, display_name=payload.get("display_name"))
-    request = DigestService(memory).plan(
-        scope=str(payload.get("scope") or "project"),
-        project_id=project,
-        project_label=payload.get("display_name") or project,
-        length=payload.get("length"),
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=root
     )
+    request = DigestService(memory).plan(length=payload.get("length"))
     result = request.to_dict()
     result["has_materials"] = request.materials.get("episodes", 0) > 0
     return result
@@ -432,9 +474,9 @@ def cmd_digest_plan(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
 def cmd_digest_commit(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     project = _project(payload)
     service = DigestService(memory)
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(project, root_path=root)
     record = service.commit(
-        scope=str(payload.get("scope") or "project"),
-        project_id=project,
         text=str(payload.get("text") or ""),
         length=payload.get("target_chars"),
         reason=str(payload.get("reason") or "manual"),
@@ -450,7 +492,6 @@ def cmd_digest_commit(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 @command("digest.view")
 def cmd_digest_view(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     service = DigestService(memory)
-    scope = str(payload.get("scope") or "project")
     project = _project(payload)
     digest_id = payload.get("digest_id")
     if digest_id:
@@ -458,12 +499,12 @@ def cmd_digest_view(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
         if record is None:
             raise BridgeError("not_found", f"digest {digest_id} not found")
     else:
-        record = service.latest(scope=scope, project_id=project)
-    history = service.history(scope=scope, project_id=project, limit=_limit(payload, "history", 20, 100))
+        record = service.latest(scope="global")
+    history = service.history(scope="global", limit=_limit(payload, "history", 20, 100))
     return {
         "digest": record.to_dict() if record else None,
         "history": [d.to_dict() for d in history],
-        "scope": scope,
+        "scope": "global",
         "project_id": project,
     }
 
@@ -471,10 +512,9 @@ def cmd_digest_view(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
 @command("digest.history")
 def cmd_digest_history(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     service = DigestService(memory)
-    scope = str(payload.get("scope") or "project")
     project = _project(payload)
-    history = service.history(scope=scope, project_id=project, limit=_limit(payload, "limit", 30, 200))
-    return {"items": [d.to_dict() for d in history], "scope": scope, "project_id": project}
+    history = service.history(scope="global", limit=_limit(payload, "limit", 30, 200))
+    return {"items": [d.to_dict() for d in history], "scope": "global", "project_id": project}
 
 
 @command("digest.delete")
@@ -488,10 +528,7 @@ def cmd_digest_delete(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 
 @command("digest.anchor")
 def cmd_digest_anchor(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    project = _project(payload)
     anchors = DigestService(memory).anchors(
-        project_id=project,
-        scope=str(payload.get("scope") or "project"),
         include_summary=payload.get("include_summary"),
         include_profile=_bool(payload.get("include_profile", True)),
     )
@@ -529,19 +566,25 @@ def cmd_memory_update(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
     patch = payload.get("patch") or {}
     if not isinstance(patch, dict):
         raise BridgeError("bad_request", "patch must be an object")
-    return {"memory": MemoryNotepad(memory).update(memory_id, patch)}
+    updated = MemoryNotepad(memory).update(memory_id, patch)
+    _refresh_project_summary(memory, str(updated.get("project_id") or ""))
+    return {"memory": updated}
 
 
 @command("memory.forget")
 def cmd_memory_forget(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     memory_id = str(payload.get("memory_id") or "")
-    return {"memory": MemoryNotepad(memory).forget(memory_id)}
+    forgotten = MemoryNotepad(memory).forget(memory_id)
+    _refresh_project_summary(memory, str(forgotten.get("project_id") or ""))
+    return {"memory": forgotten}
 
 
 @command("memory.restore")
 def cmd_memory_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     memory_id = str(payload.get("memory_id") or "")
-    return {"memory": MemoryNotepad(memory).restore(memory_id)}
+    restored = MemoryNotepad(memory).restore(memory_id)
+    _refresh_project_summary(memory, str(restored.get("project_id") or ""))
+    return {"memory": restored}
 
 
 @command("memory.remember")
@@ -577,6 +620,7 @@ def cmd_memory_remember(memory: MemorySystem, payload: dict[str, Any]) -> dict[s
         meta={"source": payload.get("source") or "manual"},
         facts=facts,
     )
+    _refresh_project_summary(memory, project)
     return {"remembered": _jsonable(result), "project_id": project}
 
 
@@ -633,7 +677,11 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
             "dedupe_key": dedupe_key,
             "project_id": project,
         }
-    memory.ensure_project(project, display_name=payload.get("display_name"))
+    memory.ensure_project(
+        project,
+        display_name=payload.get("display_name"),
+        root_path=resolve_project_root(payload.get("cwd")),
+    )
     report: dict[str, Any] = {}
     result = memory.remember(
         project_id=project,
@@ -654,6 +702,7 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
     # ``duplicate`` is the honest signal: it is True when no new row appeared,
     # whether that came from the dedupe key or from the write path merging the
     # text into an existing episode.
+    _refresh_project_summary(memory, project)
     return {
         "captured": _jsonable(result),
         "deduped": False,

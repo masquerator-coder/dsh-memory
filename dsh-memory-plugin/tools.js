@@ -319,21 +319,15 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'memory_digest_read',
       description:
-        '读取当前项目（或全局）最新的记忆摘要全文。系统提示词里只有摘要的规模与时间，需要细节时调用本工具。',
-      parameters: {
-        scope: { type: 'string', description: 'project 或 global，默认 project。' },
-      },
+        '读取全局记忆摘要全文：它记录所有项目已经做过的工作。系统提示词里只有摘要的规模与时间，需要细节时调用本工具。',
+      parameters: {},
       output: TEXT_OUTPUT,
       isConcurrencySafe: () => true,
-      async execute(args, exec) {
-        const scope = args.scope === 'global' ? 'global' : 'project'
-        const projectId = scope === 'project' ? await requireProject(exec) : undefined
-        const result = await call('digest.view', { project_id: projectId, scope }, exec?.signal)
+      async execute(_args, exec) {
+        const result = await call('digest.view', {}, exec?.signal)
         const content = result?.digest?.content?.trim()
         if (!content) {
-          return textOutput(
-            `还没有 ${scope === 'global' ? '全局' : '项目'} 记忆摘要。可调用 memory_digest_generate 生成。`,
-          )
+          return textOutput('还没有全局记忆摘要。可调用 memory_digest_generate 生成。')
         }
         return textOutput(content)
       },
@@ -341,19 +335,16 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'memory_digest_generate',
       description:
-        '根据最新记忆重新生成记忆摘要（会调用一次模型，可能耗时数十秒）。仅在用户要求刷新摘要、或记忆明显过时时调用。',
-      parameters: {
-        scope: { type: 'string', description: 'project 或 global，默认 project。' },
-      },
+        '根据所有项目的最新工作记录重新生成全局记忆摘要（会调用一次模型，可能耗时数十秒）。仅在用户要求刷新摘要、或摘要明显过时时调用。',
+      parameters: {},
       output: TEXT_OUTPUT,
-      async execute(args, exec) {
-        const scope = args.scope === 'global' ? 'global' : 'project'
-        const record = await generateDigest({ cwd: cwdOf(exec), signal: exec?.signal, reason: 'manual', scope })
+      async execute(_args, exec) {
+        const record = await generateDigest({ cwd: cwdOf(exec), signal: exec?.signal, reason: 'manual' })
         const digest = record?.digest
         if (!digest) return textOutput('摘要生成未返回结果。')
         if (digest.status === 'error') return textOutput(`摘要生成失败：${digest.error ?? '未知错误'}`)
         return textOutput(
-          `摘要已更新（\`${digest.digest_id}\`，${digest.actual_chars} 字，约 ${digest.estimated_tokens} tokens）。`,
+          `全局摘要已更新（\`${digest.digest_id}\`，${digest.actual_chars} 字，约 ${digest.estimated_tokens} tokens）。`,
         )
       },
     },

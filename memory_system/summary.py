@@ -1,20 +1,22 @@
 """Memory digest and user profile — the text a host injects into a system prompt.
 
-The digest is the *only* thing a host reads on the prompt path, so it has to be
-short, bounded and stable between generations. Three ideas make that work:
+The digest is a **single global work log across every project**. Its job is to
+tell a later model what has already been done, so it deliberately excludes
+lessons, preferences, speculation and future plans. Each project also gets a
+Markdown summary file at its repository root (``DSH_MEMORY.md``) so the project
+itself carries a readable record of its work.
 
-**Generation is a pure function of the prompt.** :class:`DigestPlanner` turns a
+**Generation is a pure function of the prompt.** :class:`DigestService` turns a
 selection of memories into a *request* (system + user message, prompt version,
 hash). The host runs that request with whatever model it owns and hands the
 text back to :meth:`DigestService.commit`. Nothing here calls a model, imports a
 host SDK, or schedules work; that keeps this module testable with a fake
 generator and keeps the model choice where it belongs (the host).
 
-**Length is a budget, not a guess.** The slider values (100k / 300k / 500k /
-800k, or a custom number) are *characters* of digest. Materials are selected
-newest-first, bounded per project, and committed output is clipped to the
-budget line-by-line rather than mid-codepoint. ``estimated_tokens`` is reported
-alongside so a host can decide whether the block is affordable.
+**Length is a budget, not a clip.** The slider value is a *character* target
+that is passed to the model, together with explicit instructions for how much
+detail each band should carry. The committed text is stored exactly as the
+model wrote it: a budget is a generation instruction, not a pair of scissors.
 
 **Context anchors stay small.** A context anchor is an eight-line block
 (``@@dsh-memory ... @@``) that tells the model the digest exists, how to refresh
@@ -24,9 +26,8 @@ profile body; it only contains counts and commands. It is rendered from the
 
 Everything persistent lives in ``meta`` (small key/value post-its) and one
 append-only ``memory_digests`` table whose schema is created lazily by
-:func:`ensure_schema`. That keeps :class:`~memory_system.storage.Store`'s own
-schema untouched: the core does not grow a table because a host wanted a
-notepad.
+:func:`ensure_schema`. Project Markdown files are derived artifacts: they are
+rewritten from L2 episodes and never read back as the source of truth.
 
 Prompt versions: bump :data:`PROMPT_VERSION` whenever the instructions change,
 because a digest generated under different instructions is not a valid cache of
@@ -37,23 +38,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
 
 from .errors import NotFoundError, ValidationError
-from .retrieval import edge_lost_its_sources
-from .storage import Store, json_loads, to_iso, utcnow
+from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens
 
 # ══ constants ═══════════════════════════════════════════════════════════
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 LENGTH_PRESETS: tuple[int, ...] = (300, 500, 800, 1_000, 1_500, 2_000, 3_000)
 LENGTH_MIN = LENGTH_PRESETS[0]
 LENGTH_MAX = LENGTH_PRESETS[-1]
@@ -69,7 +69,20 @@ LENGTH_APPEND = "append"
 # Automatic summary generation always runs when the host is idle; there is no
 # user-facing switch, so the stored mode is a single fixed value.
 AUTO_MODE = "idle"
-SCOPES: tuple[str, ...] = ("project", "global")
+# Only one digest is generated: a cross-project work log. "project" survives
+# solely as a legacy storage value so old rows/backups can still be read; it is
+# never generated again.
+SCOPES: tuple[str, ...] = ("global",)
+LEGACY_SCOPES: tuple[str, ...] = ("project",)
+
+# Each project owns a human-readable work summary at its repository root.
+PROJECT_SUMMARY_FILE = "DSH_MEMORY.md"
+PROJECT_SUMMARY_MARKER = "<!-- dsh-memory:project-summary -->"
+PROJECT_SUMMARY_MAX_ITEMS = 300
+# Preferences and raw user messages are not "work done"; the user profile and
+# recall already cover them. Keeping them out of the work log also keeps the
+# model from turning the global digest into a list of lessons.
+NON_WORK_EVENT_TYPES = ("preference", "user_message")
 
 _TABLE = """
 CREATE TABLE IF NOT EXISTS memory_digests (
@@ -169,37 +182,12 @@ def coerce_mode(value: Any) -> str:
     return AUTO_MODE
 
 
-def coerce_scope(value: Any) -> str:
-    scope = str(value or "project").strip().lower()
-    if scope not in SCOPES:
-        raise ValidationError(f"unknown scope {value!r}; expected one of {SCOPES}")
+def coerce_scope(value: Any, *, allow_legacy: bool = False) -> str:
+    scope = str(value or "global").strip().lower()
+    allowed = SCOPES + (LEGACY_SCOPES if allow_legacy else ())
+    if scope not in allowed:
+        raise ValidationError(f"unknown scope {value!r}; expected one of {allowed}")
     return scope
-
-
-def clip_to_budget(text: str, limit: int) -> tuple[str, bool]:
-    """Trim ``text`` to at most ``limit`` characters on line boundaries.
-
-    Returns ``(text, truncated)``. A single overlong line is clipped at the
-    character boundary as a last resort, never in the middle of a surrogate
-    pair (Python strings do not split there, but U+2028/LF handling still
-    matters to Markdown consumers).
-    """
-    text = text or ""
-    if limit <= 0:
-        return "", bool(text.strip())
-    if len(text) <= limit:
-        return text, False
-    window = text[:limit]
-    cut = window.rfind("\n")
-    if cut >= max(0, limit // 2):
-        window = window[:cut]
-    marker = "\n\n…（已按预算截断）"
-    if len(window) + len(marker) <= limit:
-        window += marker
-    # The marker itself may not fit (a very small custom budget): hard-trim.
-    # The trailing newline is part of the result, so reserve room for it.
-    body = window.rstrip()
-    return body[: max(1, limit - 1)].rstrip() + "\n", True
 
 
 def normalize_summary(text: str) -> str:
@@ -271,100 +259,65 @@ def load_settings(store: Store) -> SummarySettings:
 
 @dataclass(slots=True)
 class Materials:
-    """What the model is allowed to read when writing one digest."""
+    """The work records the model may read when writing the global digest.
 
-    scope: str
+    Only L2 episodes are collected: the global digest is a work log, so facts,
+    the user profile and recent requests would only tempt the model to write
+    lessons or preferences the digest must not contain.
+    """
+
     project_ids: list[str]
     episodes: list[dict[str, Any]]
-    facts: list[dict[str, Any]]
-    profile: str
-    user_texts: list[str]
+    project_names: dict[str, str] = field(default_factory=dict)
     chars: int = 0
 
     def render(self, *, max_chars: int) -> str:
-        """One Markdown block, trimmed *within* sections to fit ``max_chars``.
+        """Render episodes grouped by project, fairly sharing ``max_chars``.
 
-        Trimming happens per line, not per section: dropping a whole section
-        when the total overshoots by one character turns "34 memories" into
-        "the memory store is empty", and the digest is then generated from
-        nothing. Sections are emitted in priority order (requests, facts,
-        events, profile) and each one takes the space it needs until the
-        budget runs out; the profile is reserved first because it is the only
-        section the user wrote by hand.
-
-        That reservation is capped at half the budget. The profile is stored
-        verbatim (up to ``PROFILE_MAX_CHARS``), so a long one used to reserve
-        the entire prompt: ``remaining`` became zero, every machine-written
-        section was skipped, and the "digest" was nothing but the profile,
-        cut mid-sentence by the final clip.
+        One project must not eat the whole prompt: each project gets an equal
+        share of what remains, and unused space rolls over to the projects
+        after it. Lines (never projects) are dropped when a share is exhausted.
         """
         budget = max_chars
-        if budget <= 0:
+        if budget <= 0 or not self.episodes:
             return ""
-        sections: list[tuple[str, list[str]]] = []
-        if self.user_texts:
-            sections.append(
-                ("## 用户最近的请求", [f"- {_one_line(t, 240)}" for t in self.user_texts[:10]])
-            )
-        if self.facts:
-            sections.append(
-                (
-                    "## 已确认的事实",
-                    [
-                        f"- {f['head']} --{f['relation']}--> {f['tail']}"
-                        f"（{f['project_id']}，置信度 {f['confidence']:.2f}）"
-                        for f in self.facts
-                    ],
-                )
-            )
-        if self.episodes:
-            sections.append(
-                (
-                    "## 事件（由新到旧）",
-                    [
-                        f"- [{e['created_at'][:16]}]（{e['project_id']}，"
-                        f"{e.get('event_type') or 'event'}，重要度 {e['importance']:.2f}）"
-                        f"{_one_line(e['summary'], 400)}"
-                        for e in self.episodes
-                    ],
-                )
-            )
-        profile = self.profile.strip()
-        if profile:
-            sections.append(("## 用户画像（已由用户确认）", [profile]))
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for episode in self.episodes:
+            groups.setdefault(episode["project_id"], []).append(episode)
+        order = [pid for pid in self.project_ids if pid in groups]
+        order += [pid for pid in groups if pid not in order]
 
-        # Reserve the profile first, then spend what is left in priority order.
-        reserve = 0
-        shown_profile = profile
-        if profile:
-            title_len = len(sections[-1][0])
-            reserve = min(len(profile) + title_len + 2, budget // 2)
-            shown_profile = _clip_text(profile, max(0, reserve - title_len - 2))
-        remaining = budget - reserve
         out: list[str] = []
-        for title, lines in sections:
-            if title.startswith("## 用户画像"):
-                out.append(f"{title}\n{shown_profile}")
-                continue
-            if remaining <= len(title) + 2:
-                continue
+        remaining = budget
+        left = len(order)
+        for pid in order:
+            if left <= 0 or remaining <= 0:
+                break
+            label = self.project_names.get(pid) or pid
+            title = f"## 项目：{label}（`{pid}`）"
+            share = remaining // left
             keep: list[str] = []
             used = len(title) + 1
-            for line in lines:
+            for episode in groups[pid]:
+                line = _work_line(episode)
                 cost = len(line) + 1
-                if used + cost > remaining:
+                if used + cost > share:
                     break
                 keep.append(line)
                 used += cost
             if keep:
                 out.append(f"{title}\n" + "\n".join(keep))
                 remaining -= used
-            if remaining <= 0:
-                break
-        text = "\n\n".join(out)
-        if len(text) > budget:
-            text = text[:budget]
-        return text
+            left -= 1
+        return "\n\n".join(out)
+
+
+def _work_line(episode: dict[str, Any]) -> str:
+    stamp = episode["created_at"][:16].replace("T", " ")
+    kind = episode.get("event_type") or "work"
+    outcome = episode.get("outcome")
+    suffix = f" · 结果：{_one_line(outcome, 80)}" if outcome else ""
+    return f"- [{stamp}]（{kind}{suffix}）{_one_line(episode['summary'], 500)}"
 
 
 def _one_line(text: str | None, limit: int) -> str:
@@ -374,43 +327,28 @@ def _one_line(text: str | None, limit: int) -> str:
     return collapsed[: limit - 1] + "…"
 
 
-def _clip_text(text: str, limit: int) -> str:
-    """Hard character clip that never exceeds ``limit`` and says it was cut."""
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
 def collect_materials(
     memory: MemorySystem,
     *,
-    scope: str,
-    project_id: str | None,
     material_char_budget: int,
     episodes_per_project: int = 160,
-    facts_per_project: int = 120,
 ) -> Materials:
-    """Gather episodes, current facts and the user profile for one digest."""
-    scope = coerce_scope(scope)
-    project_ids: list[str] = []
-    if scope == "project":
-        if not project_id:
-            raise ValidationError("scope='project' requires project_id")
-        project_ids = [project_id]
-    else:
-        project_ids = [p.project_id for p in memory.list_projects()]
+    """Gather every project's work episodes for the one global digest."""
+    projects = memory.list_projects()
+    project_ids = [p.project_id for p in projects]
+    project_names = {p.project_id: (p.display_name or p.project_id) for p in projects}
 
     store = memory.store
+    excluded = ",".join("?" * len(NON_WORK_EVENT_TYPES))
     episodes: list[dict[str, Any]] = []
     for pid in project_ids:
         rows = store.query(
             "SELECT memory_id, project_id, summary, importance, event_type, outcome, "
             "created_at, state FROM l2_episodes WHERE project_id = ? AND superseded_by IS NULL "
             "AND json_extract(meta, '$.forgotten_at') IS NULL "
+            f"AND COALESCE(event_type, '') NOT IN ({excluded}) "
             "ORDER BY created_at DESC LIMIT ?",
-            (pid, episodes_per_project),
+            (pid, *NON_WORK_EVENT_TYPES, episodes_per_project),
         )
         for row in rows:
             episodes.append(
@@ -427,86 +365,41 @@ def collect_materials(
             )
     episodes.sort(key=lambda e: e["created_at"], reverse=True)
 
-    facts: list[dict[str, Any]] = []
-    for pid in project_ids:
-        rows = store.query(
-            "SELECT e.edge_id, e.relation, e.confidence, e.meta AS edge_meta, "
-            "h.name AS head_name, t.name AS tail_name "
-            "FROM l3_edges e JOIN l3_entities h ON h.entity_id = e.head_id "
-            "JOIN l3_entities t ON t.entity_id = e.tail_id "
-            "WHERE e.project_id = ? AND e.valid_to IS NULL ORDER BY e.confidence DESC, e.rowid DESC "
-            "LIMIT ?",
-            (pid, facts_per_project),
-        )
-        # Same forgetting rule the retrieval path applies (`edge_lost_its_sources`):
-        # an edge whose every citing episode was user-forgotten must not surface
-        # in the digest either. Edges without recorded provenance stay, exactly
-        # as they do in recall.
-        wanted: list[str] = []
-        for row in rows:
-            wanted.extend(json_loads(row["edge_meta"], {}).get("episode_ids") or ())
-        forgotten = set(memory.l2._forgotten_ids(set(wanted))) if wanted else set()
-        for row in rows:
-            if forgotten:
-                meta = json_loads(row["edge_meta"], {}) or {}
-                if edge_lost_its_sources(SimpleNamespace(meta=meta), forgotten):
-                    continue
-            facts.append(
-                {
-                    "edge_id": row["edge_id"],
-                    "project_id": pid,
-                    "head": row["head_name"],
-                    "relation": row["relation"],
-                    "tail": row["tail_name"],
-                    "confidence": float(row["confidence"]),
-                }
-            )
-
-    profile = store.get_meta(META_PROFILE) or ""
-    user_texts: list[str] = []
-    if project_ids:
-        marks = ",".join("?" * len(project_ids))
-        rows = store.query(
-            f"SELECT user_text FROM l4_launches WHERE project_id IN ({marks}) "
-            "AND user_text IS NOT NULL AND user_text != '' ORDER BY created_at DESC LIMIT 12",
-            project_ids,
-        )
-        user_texts = [row["user_text"] for row in rows]
-
     materials = Materials(
-        scope=scope,
         project_ids=project_ids,
         episodes=episodes,
-        facts=facts,
-        profile=profile,
-        user_texts=user_texts,
+        project_names=project_names,
     )
-    materials.chars = sum(len(e["summary"]) for e in episodes) + len(profile)
+    materials.chars = sum(len(e["summary"]) for e in episodes)
     return materials
 
 
 # ══ prompts ═════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """你是「DSH 记忆系统」的记忆摘要生成器。输入是从记忆库中检索出的原始材料：用户最近的请求、已确认的事实、按时间排列的事件，以及用户自己维护的用户画像。
+SYSTEM_PROMPT = """你是「DSH 记忆系统」的全局工作摘要生成器。输入是来自所有项目的工作记录（L2 事件）。
 
-你的任务：把它们写成分层、可快速浏览的记忆摘要，供编码 Agent 注入系统提示词时参考。
+你的任务：写一份跨项目的全局工作摘要，唯一目的是让后来的编码 Agent 快速知道“以前做过什么工作”。
 
 要求：
-1. 直接输出 Markdown，不要任何前言、解释、或代码块围栏。
-2. 先写高层结论，再写细节；信息按"现在仍然成立"优先排列。
-3. 合并同类项：同一主题的多次事件写成一条，保留关键的时间、文件、命令、决策与失败原因。
-4. 明确区分事实、决策与未解决的问题；推测必须标注为推测。
-5. 过时或被取代的信息要写出它被什么取代，不要直接删除历史。
-6. 不要编造材料里没有的信息；材料不足时宁可写短。
-7. 中文材料用中文写，英文材料保留原文关键词（标识符、路径、命令不要翻译）。
-8. 建议结构：## 项目状态 / ## 关键决策与事实 / ## 未完成与遗留问题 / ## 用户偏好。没有内容的小节直接省略。
+1. 直接输出 Markdown，不要任何前言、解释或代码块围栏。
+2. 按项目组织，每个项目一个小节；材料里的 `## 项目：...` 标题原样保留，不要合并项目。
+3. 只记录已经发生的工作：实现了什么、修复了什么、修改了哪些文件/模块、执行了什么命令、完成了什么迁移或部署、做出了什么决定并已落地。
+4. 不要写经验教训、最佳实践、操作规则、用户偏好、风险提醒、未来计划或未完成建议；这些不属于本摘要。
+5. 合并同一主题的多次动作，保留关键时间、文件/模块、命令与结果；按时间从新到旧排列。
+6. 不要编造材料里没有的信息；材料少时宁可写短。
+7. 中文材料用中文写；标识符、路径、命令保留原文，不要翻译。
+8. 建议结构：每个项目下用 `-` 列出工作项；没有工作记录的项目直接省略。
 
-长度：目标不超过约 {target_chars} 个字符（这是预算，不是必须写满的指标）。"""
+长度预算：约 {target_chars} 个字符。按预算决定详细程度：
+- 预算小（≤800 字）：每个项目只写 1-3 条最重要的工作，一句话一条。
+- 预算中等（≤2000 字）：每个项目写 3-8 条，保留关键文件/模块/命令/结果。
+- 预算大（>2000 字）：可以展开到更多工作项和细节。
+不要为了填满预算而编造，也不要超出预算；材料多时按“最近 + 重要”取舍。"""
 
-USER_TEMPLATE = """记忆范围：{scope_label}
+USER_TEMPLATE = """记忆范围：全部项目
 生成时间：{now}
 
-# 原始材料
+# 工作记录
 
 {materials}"""
 
@@ -604,7 +497,7 @@ class DigestRecord:
 
 
 def _scope_predicate(scope: str, project_id: str | None) -> tuple[str, list[Any]]:
-    scope = coerce_scope(scope)
+    scope = coerce_scope(scope, allow_legacy=True)
     if scope == "project":
         if not project_id:
             raise ValidationError("scope='project' requires project_id")
@@ -660,47 +553,26 @@ class DigestService:
         return self.settings()
 
     # ── plans ──────────────────────────────────────────────────────────
-    def plan(
-        self,
-        *,
-        scope: str = "project",
-        project_id: str | None = None,
-        project_label: str | None = None,
-        length: int | None = None,
-        include_profile: bool = True,
-    ) -> DigestRequest:
-        """Build the LLM request; the host runs it and calls :meth:`commit`."""
-        scope = coerce_scope(scope)
+    def plan(self, *, length: int | None = None) -> DigestRequest:
+        """Build the global-digest LLM request; the host runs it and commits."""
         settings = self.settings()
         target = coerce_length(length if length is not None else settings.length)
-        if scope == "project" and not project_id:
-            raise ValidationError("scope='project' requires project_id")
-        # Materials are capped so a 4M-character digest request can never turn
-        # into a 400k-token prompt: the model reads a bounded digest of the
-        # corpus and the budget is a ceiling on its *output*.
-        material_budget = min(120_000, max(8_000, target // 4))
-        materials = self._materials(
-            scope=scope,
-            project_id=project_id,
-            material_char_budget=material_budget,
-            include_profile=include_profile,
-        )
+        # The material window scales with the output budget: a detailed digest
+        # needs more source work than a one-line-per-project summary.
+        material_budget = min(200_000, max(20_000, target * 8))
+        materials = self._materials(material_char_budget=material_budget)
         body = materials.render(max_chars=material_budget)
-        scope_label = (
-            "全局（所有项目）" if scope == "global" else f"项目 {project_label or project_id}"
-        )
         system = SYSTEM_PROMPT.format(target_chars=target)
         user = USER_TEMPLATE.format(
-            scope_label=scope_label,
             now=_iso_now(),
             materials=body or "（记忆库为空：请输出一句说明，不要编造内容）",
         )
         digest_hash = hashlib.sha1(
-            f"{PROMPT_VERSION}\x00{target}\x00{scope}\x00{project_id}\x00{body}".encode("utf-8")
+            f"{PROMPT_VERSION}\x00{target}\x00global\x00{body}".encode("utf-8")
         ).hexdigest()
         return DigestRequest(
-            scope=scope,
-            scope_ref=project_id if scope == "project" else None,
+            scope="global",
+            scope_ref=None,
             target_chars=target,
             system=system,
             user=user,
@@ -710,47 +582,26 @@ class DigestService:
             sources=[e["memory_id"] for e in materials.episodes],
             materials={
                 "episodes": len(materials.episodes),
-                "facts": len(materials.facts),
-                "profile_chars": len(materials.profile),
                 "projects": len(materials.project_ids),
             },
         )
 
-    def _materials(
-        self,
-        *,
-        scope: str,
-        project_id: str | None,
-        material_char_budget: int,
-        include_profile: bool,
-    ) -> Materials:
+    def _materials(self, *, material_char_budget: int) -> Materials:
         if self._memory is not None:
-            materials = collect_materials(
+            return collect_materials(
                 self._memory,
-                scope=scope,
-                project_id=project_id,
                 material_char_budget=material_char_budget,
             )
-        else:  # pragma: no cover - Store-only path is for tests of settings only
-            materials = Materials(
-                scope=scope,
-                project_ids=[project_id] if project_id else [],
-                episodes=[],
-                facts=[],
-                profile=self.get_profile() or "",
-                user_texts=[],
-            )
-        if not include_profile:
-            materials.profile = ""
-        return materials
+        # pragma: no cover - Store-only path is for tests of settings only
+        return Materials(project_ids=[], episodes=[])
 
     # ── commit / read ──────────────────────────────────────────────────
     def commit(
         self,
         *,
-        scope: str,
-        project_id: str | None,
         text: str,
+        scope: str = "global",
+        project_id: str | None = None,
         length: int | None = None,
         reason: str = "manual",
         generator: str | None = None,
@@ -759,22 +610,19 @@ class DigestService:
         materials_chars: int = 0,
         error: str | None = None,
     ) -> DigestRecord:
-        """Store model output, clipped to the configured budget."""
+        """Store model output exactly as written — a budget never clips it."""
         scope = coerce_scope(scope)
-        script = self.settings()
-        target = coerce_length(length if length is not None else script.length)
+        settings = self.settings()
+        target = coerce_length(length if length is not None else settings.length)
         cleaned = normalize_summary(text or "")
         status = "ok"
         if error:
             status = "error"
-            cleaned = cleaned or ""
         elif not cleaned:
             status = "empty"
         if isinstance(sources, (str, bytes)):
             sources = [sources]
-        content, truncated = clip_to_budget(cleaned or "", target)
-        if status == "ok" and truncated:
-            status = "truncated"
+        content = cleaned or ""
         record = DigestRecord(
             digest_id="dg_" + uuid.uuid4().hex[:16],
             scope=scope,
@@ -795,7 +643,16 @@ class DigestService:
         with self.store.transaction():
             self._insert_digest(record)
             self.store.set_meta(META_UPDATED, record.created_at)
+        # Project files are derived from L2, not from the digest text, so they
+        # stay useful even when model generation failed.
+        self.write_project_summaries()
         return record
+
+    def write_project_summaries(self, *, project_id: str | None = None) -> list[str]:
+        """Refresh the Markdown work summary at each project's root."""
+        if self._memory is None:
+            return []
+        return write_project_summaries(self._memory, project_id=project_id)
 
     def import_digest(
         self,
@@ -811,20 +668,20 @@ class DigestService:
         source recorded (history order must survive a restore), and the
         "digest updated" marker is left alone -- re-importing an old summary
         must not make the host believe the current one was just regenerated.
+        Legacy ``project`` scopes are accepted so old backups still restore.
         """
-        scope = coerce_scope(scope)
+        scope = coerce_scope(scope, allow_legacy=True)
         cleaned = normalize_summary(content or "")
-        target = min(LENGTH_MAX, max(LENGTH_MIN, len(cleaned)))
-        text, truncated = clip_to_budget(cleaned, target)
+        target = max(LENGTH_MIN, len(cleaned))
         record = DigestRecord(
             digest_id="dg_" + uuid.uuid4().hex[:16],
             scope=scope,
             scope_ref=project_id if scope == "project" else None,
-            status="truncated" if truncated else ("ok" if text else "empty"),
-            content=text,
+            status="ok" if cleaned else "empty",
+            content=cleaned,
             requested_chars=target,
-            actual_chars=len(text),
-            estimated_tokens=estimate_tokens(text),
+            actual_chars=len(cleaned),
+            estimated_tokens=estimate_tokens(cleaned),
             sources=[],
             materials_chars=0,
             prompt_version=PROMPT_VERSION,
@@ -864,7 +721,7 @@ class DigestService:
         )
 
     def latest(
-        self, *, scope: str = "project", project_id: str | None = None
+        self, *, scope: str = "global", project_id: str | None = None
     ) -> DigestRecord | None:
         clause, params = _scope_predicate(scope, project_id)
         row = self.store.query_one(
@@ -875,7 +732,7 @@ class DigestService:
         return DigestRecord.from_row(row) if row else None
 
     def history(
-        self, *, scope: str = "project", project_id: str | None = None, limit: int = 20
+        self, *, scope: str = "global", project_id: str | None = None, limit: int = 20
     ) -> list[DigestRecord]:
         clause, params = _scope_predicate(scope, project_id)
         rows = self.store.query(
@@ -904,33 +761,24 @@ class DigestService:
     def anchors(
         self,
         *,
-        project_id: str | None = None,
         include_summary: bool | None = None,
         include_profile: bool = True,
-        scope: str = "project",
     ) -> dict[str, Any]:
         """What the host should tell the model about memory, this turn.
 
-        Returns ``{"summary": {...}|None, "profile": {...}|None, "text": "..."}``.
-        The rendered ``text`` is the context anchor block; it is empty when
-        there is nothing worth saying.
+        Only the one global digest is advertised. Legacy project digests are
+        deliberately ignored: project-level detail now lives in that project's
+        ``DSH_MEMORY.md`` file instead of the prompt path.
         """
         # Nothing ever persisted this flag, so it was always the default: an
         # anchor carries the digest unless the caller says otherwise.
         want_summary = True if include_summary is None else include_summary
-        blocks: list[str] = []
         summary_line = None
         profile_line = None
 
         if want_summary:
-            latest = self.latest(scope=scope, project_id=project_id)
-            # A global anchor with no global digest yet must not hide the
-            # project digest: the model would lose the memory context it had
-            # before anyone asked for a global one.
-            if latest is None and scope == "global" and project_id:
-                latest = self.latest(scope="project", project_id=project_id)
+            latest = self.latest(scope="global")
             if latest is not None and latest.content.strip():
-                updated = latest.created_at[:16].replace("T", " ")
                 stale = _age_days(latest.created_at) >= 7
                 summary_line = {
                     "digest_id": latest.digest_id,
@@ -952,18 +800,18 @@ class DigestService:
         lines = ["@@dsh-memory 1", "记忆系统已启用。"]
         if summary_line is not None:
             lines.append(
-                f"- 记忆摘要：{summary_line['chars']} 字（约 {summary_line['estimated_tokens']} tokens），"
+                f"- 全局记忆摘要：{summary_line['chars']} 字（约 {summary_line['estimated_tokens']} tokens），"
                 f"生成于 {summary_line['created_at'][:16].replace('T', ' ')}"
                 + ("，可能已过时" if summary_line["stale"] else "")
             )
-            lines.append("- 需要摘要全文时调用 memory_digest_read（source=\"summary\"）；需要最新内容时调用 memory_digest_generate。")
+            lines.append("- 需要摘要全文时调用 memory_digest_read；需要最新内容时调用 memory_digest_generate。")
         if profile_line is not None:
             lines.append(
                 f"- 用户画像：{profile_line['chars']} 字，用户自行维护"
                 + (f"，更新于 {profile_line['updated_at']}" if profile_line["updated_at"] else "")
             )
             lines.append("- 涉及用户偏好、习惯、技术栈或协作方式时，调用 memory_profile_read 读取完整画像。")
-        lines.append("提示：记忆是与当前工作目录对应的项目记忆，引用它时请说明来源。")
+        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目根目录另有 DSH_MEMORY.md 记录该项目的工作摘要。")
         lines.append("@@")
         return {"summary": summary_line, "profile": profile_line, "text": "\n".join(lines)}
 
@@ -973,6 +821,93 @@ def _age_days(raw: str) -> float:
     if ts is None:
         return 0.0
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0)
+
+
+# ══ per-project Markdown summary ════════════════════════════════════════
+
+
+def write_project_summaries(
+    memory: MemorySystem, *, project_id: str | None = None
+) -> list[str]:
+    """Write a readable work summary into every project's root directory.
+
+    The file is a *derived* view of L2: it never feeds back into recall or the
+    global digest. A project without a registered ``root_path`` is skipped, as
+    is a root that no longer exists. Failures are contained per project so a
+    read-only checkout cannot break digest generation.
+    """
+    if project_id:
+        try:
+            projects = [memory.get_project(project_id)]
+        except NotFoundError:
+            return []
+    else:
+        projects = memory.list_projects()
+
+    written: list[str] = []
+    for project in projects:
+        if not project.root_path:
+            continue
+        root = Path(project.root_path).expanduser()
+        if not root.is_dir():
+            continue
+        text = _project_summary_markdown(memory, project)
+        target = root / PROJECT_SUMMARY_FILE
+        try:
+            if target.is_file() and target.read_text(encoding="utf-8") == text:
+                continue
+            temporary = target.with_name(target.name + ".tmp")
+            with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+            os.replace(temporary, target)
+        except OSError:
+            # A read-only or vanished checkout must not fail the digest call.
+            continue
+        written.append(str(target))
+    return written
+
+
+def _project_summary_markdown(memory: MemorySystem, project: Any) -> str:
+    excluded = ",".join("?" * len(NON_WORK_EVENT_TYPES))
+    rows = memory.store.query(
+        "SELECT summary, event_type, outcome, created_at FROM l2_episodes "
+        "WHERE project_id = ? AND superseded_by IS NULL "
+        "AND json_extract(meta, '$.forgotten_at') IS NULL "
+        f"AND COALESCE(event_type, '') NOT IN ({excluded}) "
+        "ORDER BY created_at DESC LIMIT ?",
+        (project.project_id, *NON_WORK_EVENT_TYPES, PROJECT_SUMMARY_MAX_ITEMS),
+    )
+    display = project.display_name or project.project_id
+    updated = _iso_now()[:19].replace("T", " ")
+    lines = [
+        PROJECT_SUMMARY_MARKER,
+        f"# 项目摘要：{display}",
+        "",
+        f"> 项目 ID：`{project.project_id}` · 由 dsh-memory 自动维护 · 更新于 {updated}",
+        "> 只记录已做过的工作；经验教训与偏好不在此文件中。",
+        "",
+    ]
+    if not rows:
+        lines += ["（还没有记录任何工作。）", ""]
+        return "\n".join(lines).rstrip() + "\n"
+
+    current_day = ""
+    for row in rows:
+        created = _normalize_iso(str(row["created_at"]))
+        day = created[:10]
+        if day != current_day:
+            lines += [f"## {day}", ""]
+            current_day = day
+        stamp = created[11:16]
+        kind = row["event_type"] or "work"
+        outcome = row["outcome"]
+        detail = f"（{kind}"
+        if outcome:
+            detail += f" · 结果：{_one_line(outcome, 80)}"
+        detail += "）"
+        lines.append(f"- `{stamp}` {detail} {_one_line(row['summary'], 500)}")
+    lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ══ Markdown export (digest + profile + memories) ═══════════════════════

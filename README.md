@@ -101,7 +101,7 @@ conditions, and still need a human to approve them.
 ## Tests
 
 ```bash
-pytest            # 202 tests
+pytest            # 204 tests
 ```
 
 ## Docs

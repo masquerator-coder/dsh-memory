@@ -18,10 +18,11 @@ from memory_system.summary import (
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
+    PROJECT_SUMMARY_FILE,
+    PROJECT_SUMMARY_MARKER,
     DigestService,
     Materials,
     MemoryNotepad,
-    clip_to_budget,
     coerce_length,
     export_markdown,
     nearest_preset,
@@ -54,16 +55,6 @@ def test_legacy_large_length_migrates_to_nearest_preset():
     assert nearest_preset(1_200) == 1_000
 
 
-def test_clip_to_budget_keeps_whole_lines():
-    text = "\n".join(f"line {i} " + "x" * 40 for i in range(100))
-    clipped, truncated = clip_to_budget(text, 120)
-    assert truncated is True
-    assert len(clipped) <= 120
-    assert "…（已按预算截断）" in clipped
-    kept, truncated_short = clip_to_budget("short", 120)
-    assert (kept, truncated_short) == ("short", False)
-
-
 def test_settings_round_trip(service: DigestService):
     assert service.settings().length == DEFAULT_LENGTH == 1_000
     assert service.set_length(500).length == 500
@@ -73,50 +64,46 @@ def test_settings_round_trip(service: DigestService):
     assert service.set_mode("off").mode == AUTO_MODE
 
 
-def test_long_profile_does_not_evict_the_rest_of_the_digest():
-    """The profile is user-authored and stored verbatim, so it can be longer
-    than the entire prompt budget. Reserving it first then zeroed everything
-    left: the "digest" was the profile alone, cut mid-sentence, and the model
-    was asked to summarise the memory from no memories at all."""
+def test_materials_share_the_budget_across_projects():
+    """One busy project must not starve the others out of the prompt."""
+    episodes = [
+        {
+            "created_at": f"2026-01-0{day}T0{hour}:00:00+00:00",
+            "project_id": pid,
+            "event_type": "fix",
+            "importance": 0.8,
+            "summary": f"{pid} work item {day}-{hour}",
+            "outcome": "success",
+        }
+        for pid in ("proj-a", "proj-b")
+        for day in (1, 2)
+        for hour in (1, 2, 3, 4, 5, 6)
+    ]
     materials = Materials(
-        scope="project",
-        project_ids=["proj-a"],
-        episodes=[
-            {
-                "created_at": "2026-01-01T00:00:00+00:00",
-                "project_id": "proj-a",
-                "event_type": "decision",
-                "importance": 0.8,
-                "summary": "sqlite chosen for the vector index",
-            }
-        ],
-        facts=[
-            {
-                "head": "svc",
-                "relation": "uses",
-                "tail": "sqlite",
-                "project_id": "proj-a",
-                "confidence": 0.9,
-            }
-        ],
-        profile="我是一名后端工程师。" * 400,
-        user_texts=["please remember the migration plan"],
+        project_ids=["proj-a", "proj-b"],
+        episodes=episodes,
+        project_names={"proj-a": "Project A", "proj-b": "Project B"},
     )
-    body = materials.render(max_chars=1_000)
-    assert "## 用户最近的请求" in body
-    assert "## 已确认的事实" in body
-    assert "## 事件" in body
-    assert "## 用户画像" in body
-    assert body.endswith("…"), "the long profile is clipped, not dropped"
-    assert len(body) <= 1_000
+    body = materials.render(max_chars=600)
+    assert "## 项目：Project A（`proj-a`）" in body
+    assert "## 项目：Project B（`proj-b`）" in body
+    assert len(body) <= 600
+
+
+def test_materials_only_contain_work_episodes():
+    """The global digest is a work log, so its materials carry no profile,
+    user requests or semantic facts that would invite lessons/preferences."""
+    fields = set(Materials.__dataclass_fields__)
+    assert "episodes" in fields
+    assert not fields & {"profile", "user_texts", "facts"}
 
 
 # ── profile ─────────────────────────────────────────────────────────────
 
 
-def test_profile_is_stored_and_anchored(service: DigestService, project: str):
+def test_profile_is_stored_and_anchored(service: DigestService):
     service.set_profile("# 用户画像\n- 偏好中文回答")
-    anchors = service.anchors(project_id=project)
+    anchors = service.anchors()
     assert anchors["profile"]["chars"] > 0
     assert "memory_profile_read" in anchors["text"]
     # The anchor carries counts only, never the profile body.
@@ -132,53 +119,70 @@ def test_profile_too_long_is_refused(service: DigestService):
 # ── digest ──────────────────────────────────────────────────────────────
 
 
-def test_plan_uses_memory_and_never_calls_a_model(service: DigestService, memory: MemorySystem, project: str):
+def test_plan_uses_all_projects_and_never_calls_a_model(
+    service: DigestService, memory: MemorySystem, project: str
+):
     memory.remember(project_id=project, summary="chose sqlite for storage", importance=0.9, event_type="decision")
-    request = service.plan(scope="project", project_id=project, length=1_500)
+    request = service.plan(length=1_500)
+    assert request.scope == "global" and request.scope_ref is None
     assert request.target_chars == 1_500
     assert "chose sqlite for storage" in request.user
     assert request.materials["episodes"] == 1
+    assert request.materials["projects"] == 1
     assert request.sources
-    assert request.prompt_version >= 1
+    assert request.prompt_version >= 2
     # Same inputs, same prompt: the hash is the cache key a host can trust.
-    again = service.plan(scope="project", project_id=project, length=1_500)
+    again = service.plan(length=1_500)
     assert again.prompt_hash == request.prompt_hash
 
 
-def test_commit_clips_to_budget_and_keeps_the_newest(service: DigestService, project: str):
+def test_budget_guides_generation_instead_of_clipping(service: DigestService):
+    """A budget is an instruction to the model, not scissors on its output."""
     service.set_length(2_000)
-    record = service.commit(
-        scope="project", project_id=project, text="A" * 5_000, reason="manual", generator="test"
-    )
-    assert record.status == "truncated"
-    assert record.actual_chars <= 2_000
+    record = service.commit(text="A" * 5_000, reason="manual", generator="test")
+    assert record.status == "ok"
+    assert record.actual_chars == 5_000
+    assert record.requested_chars == 2_000
     assert record.estimated_tokens > 0
-    assert service.latest(scope="project", project_id=project).digest_id == record.digest_id
+    assert service.latest().digest_id == record.digest_id
 
 
-def test_commit_rejects_empty_and_records_errors(service: DigestService, project: str):
-    empty = service.commit(scope="project", project_id=project, text="   ")
+def test_prompt_scales_detail_with_the_budget(service: DigestService):
+    concise = service.plan(length=300)
+    detailed = service.plan(length=3_000)
+    assert "约 300 个字符" in concise.system
+    assert "约 3000 个字符" in detailed.system
+    assert "≤800" in detailed.system and ">2000" in detailed.system
+
+
+def test_commit_rejects_empty_and_records_errors(service: DigestService):
+    empty = service.commit(text="   ")
     assert empty.status == "empty"
-    broken = service.commit(scope="project", project_id=project, text="", error="boom")
+    broken = service.commit(text="", error="boom")
     assert broken.status == "error"
     assert broken.error == "boom"
     # Failed generations are not offered as "the latest digest".
-    latest = service.latest(scope="project", project_id=project)
-    assert latest is None
+    assert service.latest() is None
 
 
-def test_scopes_do_not_leak(service: DigestService, project: str):
-    service.commit(scope="project", project_id=project, text="project only")
-    assert service.latest(scope="project", project_id="other") is None
-    assert service.latest(scope="global") is None
-    service.commit(scope="global", project_id=None, text="global digest")
-    assert service.latest(scope="global").content == "global digest"
-    assert service.latest(scope="project", project_id=project).content == "project only"
+def test_only_global_digests_are_generated_but_legacy_project_rows_read(service: DigestService, project: str):
+    with pytest.raises(Exception):
+        service.commit(scope="project", project_id=project, text="no longer generated")
+
+    # Old backups may still carry project rows; they stay readable, but the
+    # prompt anchor never surfaces them.
+    legacy = service.import_digest(scope="project", project_id=project, content="legacy project")
+    assert service.latest(scope="project", project_id=project).digest_id == legacy.digest_id
+    assert service.anchors()["text"] == ""
+
+    record = service.commit(text="global digest")
+    assert service.latest().content == "global digest"
+    assert service.anchors()["summary"]["digest_id"] == record.digest_id
 
 
-def test_summary_anchor_reports_staleness(service: DigestService, project: str):
-    record = service.commit(scope="project", project_id=project, text="## state\ndone")
-    anchors = service.anchors(project_id=project)
+def test_summary_anchor_reports_staleness(service: DigestService):
+    record = service.commit(text="## state\ndone")
+    anchors = service.anchors()
     assert anchors["summary"]["digest_id"] == record.digest_id
     assert "memory_digest_read" in anchors["text"]
     # Force the age past the staleness threshold.
@@ -186,27 +190,56 @@ def test_summary_anchor_reports_staleness(service: DigestService, project: str):
         "UPDATE memory_digests SET created_at = '2000-01-01T00:00:00+00:00' WHERE digest_id = ?",
         (record.digest_id,),
     )
-    assert service.anchors(project_id=project)["summary"]["stale"] is True
+    assert service.anchors()["summary"]["stale"] is True
 
 
-def test_anchor_is_empty_without_memory(service: DigestService, project: str):
-    assert service.anchors(project_id=project)["text"] == ""
+def test_anchor_is_empty_without_memory(service: DigestService):
+    assert service.anchors()["text"] == ""
 
 
-def test_global_anchor_falls_back_to_project_digest(service: DigestService, project: str):
-    """A global anchor must not blank out the project digest."""
-    record = service.commit(scope="project", project_id=project, text="## project\nkeep me")
-    assert service.latest(scope="global") is None
+def test_commit_writes_each_project_root_markdown(service: DigestService, memory: MemorySystem, tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    memory.ensure_project("proj-md", display_name="Markdown Project", root_path=str(root))
+    kept = memory.remember(
+        project_id="proj-md",
+        summary="实现了 DSH_MEMORY.md 导出",
+        event_type="fix",
+        outcome="success",
+    )
+    gone = memory.remember(project_id="proj-md", summary="临时调试记录")
+    MemoryNotepad(memory).forget(gone["memory_id"])
+    memory.remember(
+        project_id="proj-md",
+        summary="用户偏好 dark mode",
+        event_type="preference",
+    )
 
-    anchors = service.anchors(project_id=project, scope="global")
-    assert anchors["summary"] is not None
-    assert anchors["summary"]["digest_id"] == record.digest_id
-    assert "memory_digest_read" in anchors["text"]
+    service.commit(text="## 全局\n工作记录")
 
-    # Once a global digest exists, it takes over.
-    global_record = service.commit(scope="global", project_id=None, text="## global\nall projects")
-    anchors = service.anchors(project_id=project, scope="global")
-    assert anchors["summary"]["digest_id"] == global_record.digest_id
+    path = root / PROJECT_SUMMARY_FILE
+    content = path.read_text(encoding="utf-8")
+    assert content.startswith(PROJECT_SUMMARY_MARKER)
+    assert "Markdown Project" in content
+    assert "实现了 DSH_MEMORY.md 导出" in content
+    assert "临时调试记录" not in content
+    assert "用户偏好 dark mode" not in content
+    assert kept["memory_id"] != gone["memory_id"]
+
+
+def test_bridge_project_registration_creates_the_markdown_file(tmp_path: Path):
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    nested = repo / "src"
+    nested.mkdir()
+    home = str(tmp_path / "mem")
+    project = handle(
+        {"id": "1", "command": "projects", "payload": {"home": home, "cwd": str(nested)}}
+    )
+    assert project["ok"], project
+    summary = repo / PROJECT_SUMMARY_FILE
+    assert summary.is_file()
+    assert "还没有记录任何工作" in summary.read_text(encoding="utf-8")
 
 
 # ── notepad ─────────────────────────────────────────────────────────────
@@ -357,16 +390,14 @@ def test_forget_keeps_memory_out_of_digest_materials(memory: MemorySystem, proje
     )
     notepad = MemoryNotepad(memory)
     notepad.forget(gone["memory_id"])
-    materials = collect_materials(memory, scope="project", project_id=project, material_char_budget=20_000)
+    materials = collect_materials(memory, material_char_budget=20_000)
     summaries = " ".join(e["summary"] for e in materials.episodes)
     assert "keep-me:" in summaries
     assert "gone-me:" not in summaries
     assert all(e["memory_id"] != gone["memory_id"] for e in materials.episodes)
-    # The edge justifying the forgotten episode must not surface either.
-    assert not any(f["head"] == "debug-token" for f in materials.facts)
     # Restoring brings everything back.
     notepad.restore(gone["memory_id"])
-    materials = collect_materials(memory, scope="project", project_id=project, material_char_budget=20_000)
+    materials = collect_materials(memory, material_char_budget=20_000)
     assert any(e["memory_id"] == gone["memory_id"] for e in materials.episodes)
 
 
@@ -383,7 +414,7 @@ def test_memory_update_validates(memory: MemorySystem, project: str):
 
 def test_export_markdown_round_trips(memory: MemorySystem, project: str):
     DigestService(memory).set_profile("# 画像\n- 中文用户")
-    DigestService(memory).commit(scope="project", project_id=project, text="## 摘要\n内容")
+    DigestService(memory).commit(text="## 摘要\n内容")
     memory.remember(project_id=project, summary="使用 sqlite-vec 做向量检索", event_type="decision")
     memory.remember(project_id=project, summary="修复了 auth.ts 的登录 bug", event_type="fix", outcome="success")
 
@@ -404,8 +435,8 @@ def test_export_markdown_round_trips(memory: MemorySystem, project: str):
     # readable as data: a restore used to see only profile + memory bullets and
     # silently drop both sections, losing the summaries and every belief.
     assert [d["content"] for d in parsed["digests"]] == ["## 摘要\n内容"]
-    assert parsed["digests"][0]["scope"] == "project"
-    assert parsed["digests"][0]["scope_ref"] == project
+    assert parsed["digests"][0]["scope"] == "global"
+    assert parsed["digests"][0]["scope_ref"] is None
     assert len(parsed["facts"]) == 0
 
 
@@ -473,7 +504,7 @@ def test_restore_imports_digest_history_and_facts(memory: MemorySystem, project:
     without a single summary or belief.
     """
     service = DigestService(memory)
-    digest = service.commit(scope="project", project_id=project, text="## 摘要\n索引选型已定")
+    digest = service.commit(text="## 摘要\n索引选型已定")
     memory.l3.add_fact(project, FactInput(head="billing", relation="uses", tail="sqlite", confidence=0.9))
     markdown = export_markdown(memory)
 
