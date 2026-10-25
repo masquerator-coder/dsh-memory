@@ -57,6 +57,39 @@ def test_remember_rolls_back_episode_when_a_fact_fails(memory: MemorySystem, pro
 
 
 
+def test_remember_only_reinforces_a_duplicate_if_the_write_lands(memory: MemorySystem, project):
+    """A merged write reinforces the old row -- as part of the same transaction.
+
+    ``remember(report=...)`` asks ``find_duplicate`` first, to report ``reused``.
+    That question used to reinforce its near-duplicate match in a transaction
+    of its own, so a write that subsequently failed still bumped the existing
+    memory's ``access_count``: the dry run had already committed.
+    """
+    summary = (
+        "quasar zephyr nimbus vortex tungsten pelican obsidian lantern "
+        "marmalade thimble abacus marrow fiddler"
+    )
+    existing = memory.remember(project_id=project, summary=summary)
+    before = memory.l2.get(existing["memory_id"])
+
+    def boom(project_id, fact):
+        raise RuntimeError("boom")
+
+    memory.l3.add_fact = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="boom"):
+        memory.remember(
+            project_id=project,
+            summary=summary + " x",
+            facts=[{"head": "svc", "relation": "located_in", "tail": "eu-west-1"}],
+            report={},
+        )
+
+    after = memory.l2.get(existing["memory_id"])
+    assert after.access_count == before.access_count
+    assert after.last_access == before.last_access
+
+
+
 def test_project_registration_and_view(memory: MemorySystem):
     memory.ensure_project("p1", display_name="P1", org_id="acme")
     assert memory.view("p1").org_id == "acme"

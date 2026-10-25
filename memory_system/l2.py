@@ -236,6 +236,15 @@ class EpisodicMemory:
         if dedup:
             existing = self._find_duplicate(project_id, summary, h, content_key)
             if existing is not None:
+                # The recurrence is the signal, not the lookup: a merge is an
+                # access, so it reinforces -- but the *write* path owns that
+                # effect. ``find_duplicate`` asks the same question without
+                # touching the row (it is documented as read-only and callers
+                # use it to decide), and reinforcement inside ``_find_duplicate``
+                # used to run in its own transaction. Here it folds into the
+                # caller's transaction (``remember`` opens one), so a failed
+                # write cannot leave the existing row bumped.
+                self.reinforce([existing.memory_id])
                 return existing
         memory_id = new_memory_id()
         now = to_iso(utcnow())
@@ -740,9 +749,10 @@ class EpisodicMemory:
     def find_duplicate(self, project_id: str, summary: str, content_key: str | None = None) -> Episode | None:
         """The row a write of ``summary`` would be merged into, or ``None``.
 
-        Read-only twin of :meth:`_find_duplicate`: this one never reinforces
-        the match, so a caller may ask "would this be a new row?" *before*
-        writing without side effects.
+        Strictly read-only: a caller may ask "would this be a new row?" before
+        writing without side effects. The reinforcement that a real merge
+        implies belongs to the write path (:meth:`add`), which is also where it
+        can join the caller's transaction.
         """
         summary = (summary or "").strip()
         if not summary:
@@ -752,6 +762,7 @@ class EpisodicMemory:
     def _find_duplicate(
         self, project_id: str, summary: str, h: str, content_key: str | None
     ) -> Episode | None:
+        """Lookup only -- never writes. ``add`` reinforces the hit it merges."""
         if content_key:
             row = self.store.query_one(
                 "SELECT * FROM l2_episodes WHERE project_id = ? AND content_key = ? LIMIT 1",
@@ -792,6 +803,5 @@ class EpisodicMemory:
             if similarity >= self.cfg.dedup_similarity:
                 memory_id = self._ids_by_ordinal([rowid]).get(int(rowid))
                 if memory_id:
-                    self.reinforce([memory_id])
                     return self.get(memory_id)
         return None

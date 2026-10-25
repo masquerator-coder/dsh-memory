@@ -156,6 +156,32 @@ def test_near_duplicate_pool_prefers_newest_episodes(memory: MemorySystem, proje
     assert rephrased_oldest.memory_id != oldest.memory_id
 
 
+def test_find_duplicate_does_not_count_as_an_access(memory: MemorySystem, project: str):
+    """Asking "would this merge?" must not bump the row it asks about.
+
+    ``find_duplicate`` is the pre-write query behind ``remember(report=...)``.
+    It delegated to the lookup ``add`` uses, and that one reinforced its
+    near-duplicate hit -- so a caller that only wanted to know the answer
+    rewrote ``access_count``/``last_access`` of an existing memory, and could
+    revive an archived one. The reinforcement belongs to the write path.
+    """
+    original = memory.l2.add(
+        project_id=project,
+        summary=(
+            "quasar zephyr nimbus vortex tungsten pelican obsidian lantern "
+            "marmalade thimble abacus marrow fiddler"
+        ),
+    )
+    before = memory.l2.get(original.memory_id)
+
+    found = memory.l2.find_duplicate(project, original.summary + " x")
+
+    assert found is not None and found.memory_id == original.memory_id
+    after = memory.l2.get(original.memory_id)
+    assert after.access_count == before.access_count
+    assert after.last_access == before.last_access
+
+
 def test_search_is_project_scoped(memory: MemorySystem, project: str):
     memory.ensure_project("proj-b")
     memory.l2.add(project_id=project, summary="alpha beta gamma login failure")
