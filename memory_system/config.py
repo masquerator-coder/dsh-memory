@@ -194,6 +194,10 @@ class L3Config:
     fast_max_hops: int = 2
     fast_hop_decay: float = 0.55
     fast_max_nodes: int = 400
+    # Wall-clock budget for graph *expansion*. Seeding (knn + FTS + one cached
+    # adjacency read) runs first because it is bounded by config, not by the
+    # graph: a slow seed read would otherwise turn the budget into "return
+    # nothing" on machines that are merely cold.
     fast_timeout_ms: int = 200
     # --- deep path ---
     deep_max_hops: int = 3  # hard ceiling from the design document
@@ -201,6 +205,8 @@ class L3Config:
     deep_ppr_iterations: int = 24
     deep_ppr_max_nodes: int = 400
     deep_top_k: int = 20
+    # Enforced across PPR iterations, rewrite probes and community scoring;
+    # whatever finished in budget is returned (see Retriever._deep_path).
     deep_timeout_ms: int = 2000
     deep_max_rewrites: int = 2  # design allows <=4; 2 keeps the budget honest
     deep_token_budget: int = 2400

@@ -1202,13 +1202,17 @@ class SemanticMemory:
         return retracted
 
     # ══ bulk read helpers used by retrieval/communities ═════════════════
-    def load_subgraph(
-        self, project_ids: Sequence[str], *, current_only: bool = True, at: str | None = None
-    ) -> tuple[dict[str, Entity], list[Edge]]:
+    def load_entities(self, project_ids: Sequence[str]) -> dict[str, Entity]:
+        """Entities of the given projects, without reading their edges.
+
+        Retrieval needs names and types for the nodes it ranks; fetching the
+        whole edge set (as :meth:`load_subgraph` must, its callers need both)
+        only to discard it doubles the graph scan for one answer.
+        """
         if not project_ids:
-            return {}, []
+            return {}
         marks = ",".join("?" * len(project_ids))
-        entities = {
+        return {
             e.entity_id: e
             for e in (
                 self._entity_from_row(r)
@@ -1217,6 +1221,14 @@ class SemanticMemory:
                 )
             )
         }
+
+    def load_subgraph(
+        self, project_ids: Sequence[str], *, current_only: bool = True, at: str | None = None
+    ) -> tuple[dict[str, Entity], list[Edge]]:
+        if not project_ids:
+            return {}, []
+        marks = ",".join("?" * len(project_ids))
+        entities = self.load_entities(project_ids)
         extra, extra_params = self._validity_clause(current_only, at)
         edges = [
             Edge.from_row(r)

@@ -323,7 +323,7 @@ class Retriever:
 
         max_hops = min(options.max_hops or self.cfg.fast_max_hops, self.cfg.fast_max_hops)
         adjacency = self._adjacency(project_ids, as_of=options.as_of)
-        entities, _ = self.semantic.load_subgraph(project_ids)
+        entities = self.semantic.load_entities(project_ids)
         deadline = time.perf_counter() + self.cfg.fast_timeout_ms / 1000.0
 
         # Precision half: edges incident to the seeds themselves. An edge is
@@ -525,25 +525,46 @@ class Retriever:
     def _deep_path(
         self, query: str, project_ids: Sequence[str], options: SearchOptions
     ) -> tuple[list[list[FactHit]], list[CommunityHit], list[str]]:
+        """PPR + rewrites + communities, all inside ``deep_timeout_ms``.
+
+        The deep path is the one stage whose cost grows with the graph rather
+        than with the request (PPR touches every node, communities embed every
+        stored summary), so it carries a wall-clock budget. Stages check it and
+        return what they have; a truncated answer is still a ranked answer, and
+        the elapsed time stays in ``timings_ms`` for the caller to see.
+        """
+        deadline = time.perf_counter() + self.cfg.deep_timeout_ms / 1000.0
         seeds = self._vector_seeds(query, project_ids, k=self.cfg.fast_seed_k)
         if not seeds:
             lexical = self._lexical_facts(query, project_ids, limit=self.cfg.fast_seed_k)
             seeds = lexical
         if not seeds:
-            return [], self._communities_for(query, project_ids), []
+            return [], self._communities_for(query, project_ids, deadline=deadline), []
 
-        list_ppr = self._ppr_facts(query, project_ids, seeds, as_of=options.as_of)
-        rewrites, list_rewrite = self._iterative_rewrites(query, project_ids, seeds, as_of=options.as_of)
-        communities = self._communities_for(query, project_ids)
+        list_ppr = self._ppr_facts(
+            query, project_ids, seeds, as_of=options.as_of, deadline=deadline
+        )
+        rewrites, list_rewrite = self._iterative_rewrites(
+            query, project_ids, seeds, as_of=options.as_of, deadline=deadline
+        )
+        communities = self._communities_for(query, project_ids, deadline=deadline)
         return [list_ppr, list_rewrite], communities, rewrites
 
     def _ppr_facts(
         self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]],
-        *, as_of: str | None = None,
+        *, as_of: str | None = None, deadline: float = float("inf"),
     ) -> list[FactHit]:
-        """Personalized PageRank from the seeds; edges are ranked by endpoint mass."""
+        """Personalized PageRank from the seeds; edges are ranked by endpoint mass.
+
+        A budget hit stops iterating on the current rank vector: PPR converges
+        monotonically enough that a partial sweep still ranks the neighbourhood
+        of the seeds above the rest of the graph, which is the ordering this
+        stage is asked for.
+        """
+        if time.perf_counter() > deadline:
+            return []
         adjacency = self._adjacency(project_ids, as_of=as_of)
-        entities, _ = self.semantic.load_subgraph(project_ids, current_only=True)
+        entities = self.semantic.load_entities(project_ids)
         restart: dict[str, float] = {}
         total = sum(max(sim, 1e-6) for _, sim in seeds) or 1.0
         for entity, sim in seeds:
@@ -551,6 +572,8 @@ class Retriever:
         alpha = self.cfg.deep_ppr_alpha
         rank = dict(restart)
         for _ in range(self.cfg.deep_ppr_iterations):
+            if time.perf_counter() > deadline:
+                break
             nxt: dict[str, float] = {k: (1 - alpha) * v * 0 for k, v in restart.items()}
             for node, edges in adjacency.items():
                 out_sum = 0.0
@@ -597,13 +620,16 @@ class Retriever:
 
     def _iterative_rewrites(
         self, query: str, project_ids: Sequence[str], seeds: list[tuple[Entity, float]],
-        *, as_of: str | None = None,
+        *, as_of: str | None = None, deadline: float = float("inf"),
     ) -> tuple[list[str], list[FactHit]]:
         """Detect an evidence gap, run structured sub-queries, merge results.
 
         A *gap* is "the top seeds are weakly connected to each other". The
         rewrite for that gap is to ask for edges among the seed set and one hop
         out — which is exactly the query an entity-linking failure would need.
+
+        Each probe is a separate graph query, so each one checks the deep-path
+        budget first and the stage returns the probes it managed to run.
         """
         rewrites: list[str] = []
         if len(seeds) < 2:
@@ -618,9 +644,9 @@ class Retriever:
                 if other in seed_set and other != entity_id:
                     connected = True
                     break
-        if connected:
+        if connected or time.perf_counter() > deadline:
             return rewrites, []
-        entities, _ = self.semantic.load_subgraph(project_ids, current_only=True)
+        entities = self.semantic.load_entities(project_ids)
         hits: list[FactHit] = []
         rewrites.append("connect_seeds:" + "+".join(sorted(seed_set))[:80])
         for edge in self._visible_edges(self.semantic.neighbors(seed_ids, current_only=True, at=as_of)):
@@ -641,7 +667,7 @@ class Retriever:
             )
         # Second gap probe: the most connected seed's own neighbourhood, which
         # answers "what do we actually know about this thing".
-        if not hits and seed_ids:
+        if not hits and seed_ids and time.perf_counter() <= deadline:
             hub = seed_ids[0]
             rewrites.append(f"neighborhood:{hub}")
             for edge in adjacency.get(hub, ())[: self.cfg.deep_top_k]:
@@ -663,7 +689,15 @@ class Retriever:
         hits.sort(key=lambda h: -h.score)
         return rewrites[: self.cfg.deep_max_rewrites], hits
 
-    def _communities_for(self, query: str, project_ids: Sequence[str]) -> list[CommunityHit]:
+    def _communities_for(
+        self, query: str, project_ids: Sequence[str], *, deadline: float = float("inf")
+    ) -> list[CommunityHit]:
+        """Stored community summaries scored against the query.
+
+        Scoring embeds one text per community, the only per-row provider call
+        in retrieval, so the loop stops at the deep-path budget and returns the
+        communities it already scored.
+        """
         marks = ",".join("?" * len(project_ids))
         rows = self.store.query(
             f"SELECT * FROM l3_communities WHERE project_id IN ({marks})", list(project_ids)
@@ -674,6 +708,8 @@ class Retriever:
         qvec = self._embed(query)
         out: list[CommunityHit] = []
         for row in rows:
+            if time.perf_counter() > deadline:
+                break
             text = f"{row['label'] or ''} {row['summary'] or ''}"
             overlap = len(qterms & set(keywords(text, limit=24, tokenizer=self._tokenizer)))
             sim = _cosine(qvec, self._embed(text)) if text.strip() else 0.0

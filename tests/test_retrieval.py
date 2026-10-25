@@ -77,6 +77,56 @@ def test_multi_hop_reaches_distant_node(memory: MemorySystem, project: str):
     assert "tls-certificate" in all_heads_or_tails
 
 
+def test_fast_path_scans_the_edge_table_once(memory: MemorySystem, project: str):
+    """One answer must not read the whole graph twice.
+
+    The fast path needs every entity (names for the rendered fact) and every
+    current edge (adjacency), and it used to get the entities by calling
+    ``load_subgraph`` -- which also selects the full edge table -- only to
+    discard the edge list it paid for. With the adjacency build that was two
+    complete ``l3_edges`` scans per cold search.
+    """
+    build_graph(memory, project)
+    edge_reads: list[str] = []
+
+    original = memory.store.query
+
+    def counting(sql, params=()):
+        if "FROM l3_edges" in sql:
+            edge_reads.append(sql)
+        return original(sql, params)
+
+    memory.store.query = counting
+    try:
+        result = memory.recall("billing-service", project_id=project, mode="fast")
+    finally:
+        del memory.store.query  # restore the class method
+    assert result.facts, "fixture graph should answer this query"
+    assert "fast_path_thin" not in result.route.reasons, "deep path would add its own reads"
+    assert len(edge_reads) == 1
+
+
+def test_deep_timeout_budget_is_enforced(memory: MemorySystem, project: str):
+    """``deep_timeout_ms`` is the ceiling for PPR + rewrites + communities.
+
+    It used to be declared and never read: a large graph could spend unbounded
+    time in the deep path no matter what the config said. An exhausted budget
+    skips the deep stages (the fast path answer still stands) instead of
+    running them anyway.
+    """
+    build_graph(memory, project)
+    CommunityIndex(memory.store, memory.l3, min_size=2).rebuild(project)
+    query = "how are billing service and tls certificate connected"
+    baseline = memory.recall(query, project_id=project, mode="deep")
+    assert baseline.communities  # the deep path scored stored communities
+
+    memory.config.l3.deep_timeout_ms = 0
+    starved = memory.recall(query, project_id=project, mode="deep")
+    assert starved.communities == []
+    assert starved.facts  # the fast path is not under this budget
+    assert starved.degraded is None  # a budget is not a failure
+
+
 def test_rrf_fusion_prefers_agreement():
     class Item:
         def __init__(self, key):
