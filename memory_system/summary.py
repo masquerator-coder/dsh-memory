@@ -793,32 +793,75 @@ class DigestService:
             created_at=_iso_now(),
         )
         with self.store.transaction():
-            self.store.execute(
-                """INSERT INTO memory_digests
-                   (digest_id, scope, scope_ref, status, content, requested_chars, actual_chars,
-                    estimated_tokens, sources, materials_chars, prompt_version, generator, reason,
-                    error, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    record.digest_id,
-                    record.scope,
-                    record.scope_ref,
-                    record.status,
-                    record.content,
-                    record.requested_chars,
-                    record.actual_chars,
-                    record.estimated_tokens,
-                    json.dumps(record.sources, ensure_ascii=False),
-                    record.materials_chars,
-                    record.prompt_version,
-                    record.generator,
-                    record.reason,
-                    record.error,
-                    record.created_at,
-                ),
-            )
+            self._insert_digest(record)
             self.store.set_meta(META_UPDATED, record.created_at)
         return record
+
+    def import_digest(
+        self,
+        *,
+        scope: str,
+        project_id: str | None,
+        content: str,
+        created_at: str | None = None,
+    ) -> DigestRecord:
+        """Store a digest produced elsewhere (a Markdown backup).
+
+        Two things differ from :meth:`commit`: the timestamp is the one the
+        source recorded (history order must survive a restore), and the
+        "digest updated" marker is left alone -- re-importing an old summary
+        must not make the host believe the current one was just regenerated.
+        """
+        scope = coerce_scope(scope)
+        cleaned = normalize_summary(content or "")
+        target = min(LENGTH_MAX, max(LENGTH_MIN, len(cleaned)))
+        text, truncated = clip_to_budget(cleaned, target)
+        record = DigestRecord(
+            digest_id="dg_" + uuid.uuid4().hex[:16],
+            scope=scope,
+            scope_ref=project_id if scope == "project" else None,
+            status="truncated" if truncated else ("ok" if text else "empty"),
+            content=text,
+            requested_chars=target,
+            actual_chars=len(text),
+            estimated_tokens=estimate_tokens(text),
+            sources=[],
+            materials_chars=0,
+            prompt_version=PROMPT_VERSION,
+            generator=None,
+            reason="backup-restore",
+            error=None,
+            created_at=_normalize_iso(created_at) if created_at else _iso_now(),
+        )
+        with self.store.transaction():
+            self._insert_digest(record)
+        return record
+
+    def _insert_digest(self, record: DigestRecord) -> None:
+        self.store.execute(
+            """INSERT INTO memory_digests
+               (digest_id, scope, scope_ref, status, content, requested_chars, actual_chars,
+                estimated_tokens, sources, materials_chars, prompt_version, generator, reason,
+                error, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                record.digest_id,
+                record.scope,
+                record.scope_ref,
+                record.status,
+                record.content,
+                record.requested_chars,
+                record.actual_chars,
+                record.estimated_tokens,
+                json.dumps(record.sources, ensure_ascii=False),
+                record.materials_chars,
+                record.prompt_version,
+                record.generator,
+                record.reason,
+                record.error,
+                record.created_at,
+            ),
+        )
 
     def latest(
         self, *, scope: str = "project", project_id: str | None = None
@@ -1268,22 +1311,36 @@ def export_markdown(
 
     out += ["## 记忆条目", ""]
     exported = 0
+    # ``notepad.list`` clamps one page at 500 rows, so asking for ``max_episodes``
+    # in one call silently capped a backup at 500 per project. Page instead.
+    page_size = 500
     for pid in selected:
         if exported >= max_episodes:
             break
-        # Explicit state so the cap is honoured and archived rows stay out of
-        # the default backup; without ``state`` the listing would fall back to
-        # its "everything still in play" default.
-        listing = notepad.list(
-            project_id=pid,
-            limit=max(1, max_episodes - exported),
-            include_superseded=True,
-            state="active",
-        )
-        if not listing["items"]:
+        # ``state=None`` is the notepad's "still in play" set: active and dormant
+        # rows, archived ones excluded. Exporting only ``active`` dropped every
+        # memory that had merely decayed below the recall threshold -- still real
+        # data, and unrecoverable if the backup was the only copy.
+        items: list[dict[str, Any]] = []
+        offset = 0
+        while exported + len(items) < max_episodes:
+            request = min(page_size, max_episodes - exported - len(items))
+            listing = notepad.list(
+                project_id=pid,
+                limit=request,
+                offset=offset,
+                include_superseded=True,
+                state=None,
+            )
+            page = listing["items"]
+            items.extend(page)
+            offset += len(page)
+            if len(page) < request or offset >= listing["total"]:
+                break
+        if not items:
             continue
         out += [f"### 项目 {pid}", ""]
-        for item in listing["items"]:
+        for item in items:
             if exported >= max_episodes:
                 break
             exported += 1

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_system import MemoryConfig, MemorySystem
+from memory_system import FactInput, MemoryConfig, MemorySystem
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
 from memory_system.summary import (
     AUTO_MODE,
@@ -351,6 +351,38 @@ def test_export_markdown_round_trips(memory: MemorySystem, project: str):
     summaries = [m["summary"] for m in parsed["memories"]]
     assert "使用 sqlite-vec 做向量检索" in summaries
     assert len(parsed["memories"]) == 2
+    # The digest and fact sections are part of the document, so they must be
+    # readable as data: a restore used to see only profile + memory bullets and
+    # silently drop both sections, losing the summaries and every belief.
+    assert [d["content"] for d in parsed["digests"]] == ["## 摘要\n内容"]
+    assert parsed["digests"][0]["scope"] == "project"
+    assert parsed["digests"][0]["scope_ref"] == project
+    assert len(parsed["facts"]) == 0
+
+
+def test_export_pages_past_the_list_limit_and_keeps_dormant_rows(
+    memory: MemorySystem, project: str
+):
+    """A backup is the fallback copy, so it must contain the whole corpus.
+
+    Two silent caps used to shrink it: ``notepad.list`` returns at most 500
+    rows per call and the export never paged, and it asked for ``state="active"``
+    only -- so everything that had merely decayed below the recall threshold
+    (dormant, still revivable) was left out of the file as well.
+    """
+    for i in range(600):
+        memory.l2.add(project_id=project, summary=f"bulk note {i}", importance=0.5)
+    rows = memory.store.query("SELECT memory_id FROM l2_episodes ORDER BY ord")
+    oldest, dormant = rows[0]["memory_id"], rows[300]["memory_id"]
+    memory.store.execute(
+        "UPDATE l2_episodes SET state = 'dormant' WHERE memory_id = ?", (dormant,)
+    )
+
+    parsed = parse_backup_markdown(export_markdown(memory))
+    exported = {item["memory_id"] for item in parsed["memories"]}
+    assert len(exported) == 600  # not the first 500 the listing returned
+    assert oldest in exported
+    assert dormant in exported
 
 
 def test_restore_imports_into_a_fresh_database(memory: MemorySystem, project: str, tmp_path: Path):
@@ -382,6 +414,49 @@ def test_restore_imports_into_a_fresh_database(memory: MemorySystem, project: st
     with MemorySystem(MemoryConfig.for_home(home)) as restored:
         assert restored.store.scalar("SELECT count(*) FROM l2_episodes") == 1
         assert restored.store.scalar("SELECT summary FROM l2_episodes") == "第一个事实"
+
+
+def test_restore_imports_digest_history_and_facts(memory: MemorySystem, project: str, tmp_path: Path):
+    """A round trip must carry the whole document, not only memory bullets.
+
+    ``export_markdown`` writes digest history and the fact graph; the restore
+    parser ignored both sections, so a backup that looked complete came back
+    without a single summary or belief.
+    """
+    service = DigestService(memory)
+    digest = service.commit(scope="project", project_id=project, text="## 摘要\n索引选型已定")
+    memory.l3.add_fact(project, FactInput(head="billing", relation="uses", tail="sqlite", confidence=0.9))
+    markdown = export_markdown(memory)
+
+    home = str(tmp_path / "restore-sections")
+    done = handle(
+        {
+            "id": "1",
+            "command": "backup.restore",
+            "payload": {"home": home, "markdown": markdown, "project_id": project},
+        }
+    )
+    assert done["ok"], done
+    assert done["result"]["facts"] == {"planned": 1, "imported": 1}
+    assert done["result"]["digests"] == {"planned": 1, "imported": 1}
+    assert done["result"]["failed"] == []
+
+    with MemorySystem(MemoryConfig.for_home(home)) as restored:
+        assert restored.store.scalar("SELECT count(*) FROM memory_digests") == 1
+        assert "索引选型已定" in restored.store.scalar("SELECT content FROM memory_digests")
+        # The restored digest keeps its source timestamp instead of claiming to
+        # be the newest one (which would suppress regeneration in the host).
+        stored_at = restored.store.scalar("SELECT created_at FROM memory_digests")
+        assert stored_at[:10] == digest.created_at[:10]
+        assert restored.store.scalar("SELECT count(*) FROM l3_edges") == 1
+        row = restored.store.query_one("SELECT confidence FROM l3_edges")
+        assert row["confidence"] == pytest.approx(0.9)
+        # Facts-only projects never pass through ``remember``, so the restore
+        # registers them itself; otherwise the graph exists but the project
+        # list (which the UI is built from) never shows it.
+        assert restored.store.scalar(
+            "SELECT count(*) FROM projects WHERE project_id = ?", (project,)
+        ) == 1
 
 
 # ── bridge ──────────────────────────────────────────────────────────────

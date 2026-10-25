@@ -31,15 +31,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .config import MemoryConfig
 from .errors import MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
+from .l3 import FactInput
 from .summary import (
     AUTO_MODE,
     DEFAULT_LENGTH,
@@ -687,11 +690,14 @@ def cmd_backup_export(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 def parse_backup_markdown(text: str) -> dict[str, Any]:
     """Read what :func:`export_markdown` wrote, tolerantly.
 
+    All four sections are read: profile, digest history, memories and facts.
     Foreign Markdown is accepted too: bullets with ``- <text>`` and no ids are
     imported into the project named in ``default_project``.
     """
     profile_section: list[str] = []
     memories: list[dict[str, Any]] = []
+    digests: list[dict[str, Any]] = []
+    facts: list[dict[str, Any]] = []
     header: dict[str, Any] = {}
     section = ""
     current: dict[str, Any] | None = None
@@ -709,18 +715,65 @@ def parse_backup_markdown(text: str) -> dict[str, Any]:
                     header = {}
             continue
         if stripped.startswith("## "):
-            section = stripped[3:].strip()
+            title = stripped[3:].strip()
+            if section.startswith("记忆摘要") and current is not None and not _is_backup_section(title):
+                # Digest bodies are written verbatim, so a summary with its own
+                # "## ..." sub-heading must not be mistaken for the next
+                # section. Only the exporter's own four titles end a section.
+                current["lines"].append(line)
+                continue
+            section = title
             current = None
             continue
         if stripped.startswith("### "):
+            heading = stripped[4:].strip()
+            if section.startswith("记忆摘要"):
+                match = _DIGEST_HEADING.match(heading)
+                if match:
+                    digest_id, where, status, chars, created = match.groups()
+                    scope = "global" if where == "全局" else "project"
+                    current = {
+                        "digest_id": digest_id,
+                        "scope": scope,
+                        "scope_ref": None if scope == "global" else where,
+                        "status": status,
+                        "chars": int(chars),
+                        "created_at": _backup_time(created),
+                        "lines": [],
+                    }
+                    digests.append(current)
+                elif current is not None:
+                    # A digest body may contain its own "### ..." sub-headings;
+                    # only the "摘要 <id>（...）" form starts a new record.
+                    current["lines"].append(line)
+                continue
             current = None
             if section.startswith("记忆条目"):
-                project = stripped[3:].strip()
-                if project.startswith("项目"):
-                    project = project[2:].strip()
+                project = _strip_project_heading(heading)
+            elif section.startswith("事实"):
+                project = _strip_project_heading(heading)
             continue
         if section.startswith("用户画像"):
             profile_section.append(line)
+            continue
+        if section.startswith("记忆摘要"):
+            if current is not None:
+                current["lines"].append(line)
+            continue
+        if section.startswith("事实"):
+            match = _FACT_LINE.match(stripped)
+            if match:
+                edge_id, head, relation, tail, confidence = match.groups()
+                facts.append(
+                    {
+                        "edge_id": edge_id,
+                        "project_id": project,
+                        "head": head,
+                        "relation": relation,
+                        "tail": tail,
+                        "confidence": float(confidence),
+                    }
+                )
             continue
         if section.startswith("记忆条目"):
             if stripped.startswith("- [ ] `") or stripped.startswith("- [x] `"):
@@ -743,8 +796,47 @@ def parse_backup_markdown(text: str) -> dict[str, Any]:
                 elif not current.get("summary"):
                     current["summary"] = body
                 continue
+    for digest in digests:
+        content = "\n".join(digest.pop("lines")).strip()
+        # The exporter writes a placeholder for an empty digest; importing the
+        # placeholder as content would turn "no summary" into a fake one.
+        digest["content"] = "" if content == "（空）" else content
     profile = "\n".join(profile_section).strip()
-    return {"header": header, "profile": profile, "memories": memories}
+    if profile == "（空）":
+        profile = ""
+    return {"header": header, "profile": profile, "memories": memories, "digests": digests, "facts": facts}
+
+
+def _backup_time(text: str) -> str | None:
+    """Undo the exporter's display timestamp (``YYYY-MM-DD HH:MM:SS``, UTC).
+
+    Storing the display form verbatim would sort every restored digest before
+    same-day native ones (``" "`` < ``"T"`` in string order), so history order
+    would drift on every restore.
+    """
+    try:
+        ts = datetime.fromisoformat(text.strip().replace(" ", "T"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.isoformat()
+
+
+def _strip_project_heading(heading: str) -> str:
+    if heading.startswith("项目"):
+        return heading[2:].strip()
+    return heading
+
+
+def _is_backup_section(title: str) -> bool:
+    return title.startswith(("用户画像", "记忆摘要", "记忆条目", "事实"))
+
+
+# ``### 摘要 dg_xxx（全局 · ok · 123 字 · 2026-01-02 03:04:05）``
+_DIGEST_HEADING = re.compile(r"^摘要\s+(\S+)（(.+?) · (.+?) · (\d+) 字 · (.+)）$")
+# ``- `ed_xxx` head --rel--> tail （置信度 0.82）``
+_FACT_LINE = re.compile(r"^- `([^`]*)` (.+?) --(.+?)--> (.+?) （置信度 ([\d.]+)）$")
 
 
 def _strip_label(body: str, label: str) -> str:
@@ -829,6 +921,69 @@ def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
             except (ValidationError, BridgeError):
                 pass
         imported.append(project)
+
+    # Digest history and the fact graph are part of the same document; a
+    # restore that read only the memory bullets silently dropped both, so an
+    # export -> restore round trip lost the summaries and every belief.
+    digests_planned = 0
+    digests_imported = 0
+    for item in parsed["digests"]:
+        if not item.get("content"):
+            continue
+        digests_planned += 1
+        if dry_run:
+            continue
+        try:
+            service.import_digest(
+                scope=item["scope"],
+                # A foreign document may have a digest section but no project
+                # heading; a project-scoped row without a ref would never be
+                # returned by ``latest(scope="project", project_id=...)``.
+                project_id=item.get("scope_ref") or default_project,
+                content=item["content"],
+                created_at=item.get("created_at"),
+            )
+        except (ValidationError, MemoryError, BridgeError) as exc:
+            failed.append({"digest_id": item.get("digest_id"), "error": str(exc)[:200]})
+            continue
+        digests_imported += 1
+
+    facts_planned = 0
+    facts_imported = 0
+    for item in parsed["facts"]:
+        facts_planned += 1
+        if dry_run:
+            continue
+        project = item.get("project_id") or default_project
+        try:
+            # ``remember`` registers the project, but a backup can hold facts
+            # for a project with no memory bullets at all; without this the
+            # graph is restored but the project list never shows it.
+            memory.ensure_project(project)
+            decision = memory.l3.add_fact(
+                project,
+                FactInput(
+                    head=item["head"],
+                    relation=item["relation"],
+                    tail=item["tail"],
+                    confidence=item["confidence"],
+                ),
+            )
+        except (ValidationError, MemoryError, BridgeError) as exc:
+            failed.append({"edge_id": item.get("edge_id"), "error": str(exc)[:200]})
+            continue
+        if decision.status == "rejected":
+            # A relation this database does not know, or a confidence floor:
+            # report it instead of counting a fact that never landed.
+            failed.append(
+                {
+                    "edge_id": item.get("edge_id"),
+                    "error": f"fact rejected: {decision.reason}",
+                }
+            )
+            continue
+        facts_imported += 1
+
     return {
         "dry_run": dry_run,
         "imported": 0 if dry_run else len(imported),
@@ -837,6 +992,8 @@ def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
         "skipped": skipped,
         "truncated": too_long,
         "failed": failed,
+        "digests": {"planned": digests_planned, "imported": digests_imported},
+        "facts": {"planned": facts_planned, "imported": facts_imported},
         "profile_restored": bool(parsed["profile"]) and not dry_run,
         "header": parsed["header"],
     }
