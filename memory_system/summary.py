@@ -49,7 +49,7 @@ from .errors import NotFoundError, ValidationError
 from .retrieval import edge_lost_its_sources
 from .storage import Store, json_loads, to_iso, utcnow
 from .system import MemorySystem
-from .text import estimate_tokens, fts_index_text
+from .text import estimate_tokens
 
 # ══ constants ═══════════════════════════════════════════════════════════
 
@@ -1194,24 +1194,14 @@ class MemoryNotepad:
         with self.store.transaction():
             if sets:
                 self.store.execute(f"UPDATE l2_episodes SET {', '.join(sets)} WHERE memory_id = ?", params)
-            # Keep the lexical index in step with the text. The body goes through
-            # the same segmentation the write path uses, or an edited row would
-            # silently drop out of Chinese lexical recall.
-            if "summary" in patch:
-                current = self.store.query_one(
-                    "SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,)
-                )
-                self.store.execute("DELETE FROM l2_fts WHERE memory_id = ?", (memory_id,))
-                self.store.execute(
-                    "INSERT INTO l2_fts(memory_id, body) VALUES (?, ?)",
-                    (
-                        memory_id,
-                        fts_index_text(
-                            f"{current['summary']} {current['event_type'] or ''}",
-                            tokenizer=self.memory.config.lexical.tokenizer,
-                        ),
-                    ),
-                )
+            # Keep the lexical index in step with the text. The body covers
+            # summary, event_type and participants, so *any* of those edits
+            # must rebuild all of it from the stored row -- gating on
+            # ``summary`` left an event_type edit searchable under its old
+            # value, and rebuilding from the summary alone dropped the
+            # participant names.
+            if "summary" in patch or "event_type" in patch:
+                self.memory.l2.reindex_text(memory_id)
             # Tags live in a meta blob, so they are written through their own
             # helper. Keep it inside this transaction: otherwise a failure
             # leaves the fields updated but the tags silently stale.

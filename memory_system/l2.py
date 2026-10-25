@@ -682,6 +682,32 @@ class EpisodicMemory:
             parts.extend(participants)
         return fts_index_text(" ".join(parts), tokenizer=self._tokenizer)
 
+    def reindex_text(self, memory_id: str) -> None:
+        """Rewrite one row's ``l2_fts`` body from its stored columns.
+
+        The body is a derived view of ``summary``, ``event_type`` *and*
+        ``participants`` (see :meth:`_fts_body`), so a rebuild after an edit
+        has to read all three from the database. Rebuilding from whichever
+        field the caller happened to change silently drops the rest out of
+        lexical recall: editing a summary used to forget the participants,
+        and an ``event_type``-only edit left the FTS row untouched under the
+        old type.
+        """
+        row = self.store.query_one(
+            "SELECT * FROM l2_episodes WHERE memory_id = ?", (memory_id,)
+        )
+        if row is None:
+            return
+        episode = Episode.from_row(row)
+        self.store.execute("DELETE FROM l2_fts WHERE memory_id = ?", (memory_id,))
+        self.store.execute(
+            "INSERT INTO l2_fts(memory_id, body) VALUES (?, ?)",
+            (
+                memory_id,
+                self._fts_body(episode.summary, episode.event_type, episode.participants),
+            ),
+        )
+
     def find_duplicate(self, project_id: str, summary: str, content_key: str | None = None) -> Episode | None:
         """The row a write of ``summary`` would be merged into, or ``None``.
 

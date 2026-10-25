@@ -227,6 +227,34 @@ def test_memory_edit_updates_text_importance_and_index(memory: MemorySystem, pro
     assert created["memory_id"] in {h.episode.memory_id for h in hits}
 
 
+def test_memory_edit_reindexes_every_indexed_field(memory: MemorySystem, project: str):
+    """The FTS body is a view of summary + event_type + participants.
+
+    Rebuilding it from only the field that changed drops the other two out of
+    lexical recall: editing a summary used to make the participants
+    unsearchable, and an event_type-only edit never rebuilt the row at all, so
+    the old type kept matching.
+    """
+    created = memory.remember(
+        project_id=project,
+        summary="checkout latency spiked",
+        event_type="incident",
+        participants=["stripe-webhook"],
+    )
+    notepad = MemoryNotepad(memory)
+
+    def lexical(term: str) -> set[str]:
+        return {mid for mid, _ in memory.l2._lexical_hits(term, [project], limit=10)}
+
+    notepad.update(created["memory_id"], {"summary": "checkout latency spiked again"})
+    assert created["memory_id"] in lexical("stripe-webhook")
+    assert created["memory_id"] in lexical("incident")
+
+    notepad.update(created["memory_id"], {"event_type": "postmortem"})
+    assert created["memory_id"] in lexical("postmortem")
+    assert created["memory_id"] not in lexical("incident")
+
+
 def test_memory_edit_accepts_tags_only(memory: MemorySystem, project: str):
     """Tags live in a meta blob, not a column, so they must not trip the
     empty-patch guard on their own."""
