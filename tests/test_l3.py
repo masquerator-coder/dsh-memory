@@ -305,3 +305,30 @@ def test_stats_count_deferred_disputes_as_conflicts(memory: MemorySystem, projec
     assert stats["edges_disputed"] >= 1
     assert stats["conflicts"] >= 1
     assert stats["conflict_rate"] > 0.0
+
+
+def test_alias_lookup_treats_percent_as_a_literal(memory: MemorySystem, project: str):
+    """``%`` and ``_`` are LIKE wildcards, so an alias lookup was a substring
+    query over every JSON array element that happened to start with the name.
+
+    "100%off" matched a node whose alias was "100 percent off": resolving the
+    name returned an unrelated entity instead of minting (or finding) the real
+    one, which then absorbed its edges.
+    """
+    decoy = memory.l3.resolve_entity(project, "discount", entity_type="term", aliases=["100 percent off"])
+
+    resolved = memory.l3.resolve_entity(project, "100%off", entity_type="term")
+    assert resolved.entity_id != decoy.entity_id
+    assert resolved.name == "100%off"
+
+
+def test_alias_lookup_handles_quotes(memory: MemorySystem, project: str):
+    """The stored column is a JSON array; the pattern was built by wrapping the
+    raw name in quotes, so an alias containing ``"`` produced a pattern that
+    could never match its own stored (escaped) form and every resolution
+    minted another duplicate node."""
+    target = memory.l3.resolve_entity(project, "nightly batch", entity_type="job", aliases=['he said "hi"'])
+
+    by_alias = memory.l3.resolve_entity(project, 'he said "hi"', entity_type="job")
+    assert by_alias.entity_id == target.entity_id
+    assert by_alias.name == "nightly batch"

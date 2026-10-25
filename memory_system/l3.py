@@ -281,9 +281,14 @@ class SemanticMemory:
                 return entity
             return entity
         # Alias hit: an alternate form already registered for another node.
+        # The stored column is a JSON array, so the alias is matched as its
+        # JSON literal (quotes escaped the way json_dumps writes them) and
+        # LIKE wildcards are neutralised -- a name containing ``%`` must match
+        # that name, not every row that happens to have the surrounding text.
+        alias_pattern = f"%{_like_literal(json_dumps(norm))}%"
         for candidate in self.store.query(
-            "SELECT * FROM l3_entities WHERE project_id = ? AND aliases LIKE ? LIMIT 5",
-            (project_id, f'%"{norm}"%'),
+            "SELECT * FROM l3_entities WHERE project_id = ? AND aliases LIKE ? ESCAPE '\\' LIMIT 5",
+            (project_id, alias_pattern),
         ):
             return self._entity_from_row(candidate)
         if not create:
@@ -1321,6 +1326,17 @@ def _dedupe_aliases(name: str, aliases: Iterable[str]) -> list[str]:
         norms.add(norm)
         out.append(norm)
     return out[:20]
+
+
+def _like_literal(text: str) -> str:
+    """Escape LIKE metacharacters so ``text`` matches itself.
+
+    ``%`` and ``_`` are wildcards in ``LIKE``; without escaping, looking up an
+    alias called "100%off" matches "100 percent off" (and a bare ``%`` matches
+    every row). The backslash is escaped first because it is the escape
+    character the query declares via ``ESCAPE '\\'``.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def edge_signature(head: str, relation: str, tail: str) -> str:
