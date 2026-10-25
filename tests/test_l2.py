@@ -96,6 +96,42 @@ def test_content_key_dedup(memory: MemorySystem, project: str):
     assert a.memory_id == b.memory_id
 
 
+def test_near_duplicate_pool_prefers_newest_episodes(memory: MemorySystem, project: str):
+    """Near-duplicate detection only scans a bounded slice of history.
+
+    That slice has to be the *newest* one: a rephrase worth merging is written
+    shortly after the row it paraphrases, so hitting the cap must never mean
+    "stop considering recent writes". Asking SQLite for the slice without an
+    ORDER BY returned whichever rows the b-tree handed back first — in a
+    steady-state project that is the oldest block, so every write past the cap
+    silently escaped dedup while old material kept being merged.
+    """
+    oldest = memory.l2.add(
+        project_id=project,
+        summary=(
+            "quasar zephyr nimbus vortex tungsten pelican obsidian lantern "
+            "marmalade thimble abacus marrow fiddler"
+        ),
+    )
+    for i in range(2000):
+        # Short: below the near-duplicate probe length, so these only serve to
+        # push ``oldest`` out of the newest-2000 window.
+        memory.l2.add(project_id=project, summary=f"filler {i}")
+    newest = memory.l2.add(
+        project_id=project,
+        summary=(
+            "fjord harpoon kelp tundra cobalt rivet saffron granite trellis "
+            "bramble wicket cistern mallow"
+        ),
+    )
+
+    rephrased_newest = memory.l2.add(project_id=project, summary=newest.summary + " x")
+    assert rephrased_newest.memory_id == newest.memory_id
+
+    rephrased_oldest = memory.l2.add(project_id=project, summary=oldest.summary + " x")
+    assert rephrased_oldest.memory_id != oldest.memory_id
+
+
 def test_search_is_project_scoped(memory: MemorySystem, project: str):
     memory.ensure_project("proj-b")
     memory.l2.add(project_id=project, summary="alpha beta gamma login failure")

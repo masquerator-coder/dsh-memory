@@ -703,7 +703,15 @@ class EpisodicMemory:
         allowed = {
             int(r["ord"])
             for r in self.store.query(
-                "SELECT ord FROM l2_episodes WHERE project_id = ? AND state != 'archived' LIMIT 2000",
+                # Most recent 2000 live rows: a hash miss that still smells same
+                # was written *just now* (the model rephrased its last sentence),
+                # so dedup must compare against the newest material, not the
+                # oldest slice. Without ORDER BY the query silently returned
+                # whichever rows SQLite visited first — for a steady-state
+                # project that was the oldest block, so everything past the
+                # cap escaped dedup and duplicated under different hashes.
+                "SELECT ord FROM l2_episodes WHERE project_id = ? AND state != 'archived' "
+                "ORDER BY ord DESC LIMIT 2000",
                 (project_id,),
             )
         }
