@@ -8,6 +8,7 @@ agree with what the exporter actually writes.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -84,6 +85,106 @@ def test_export_round_trips_through_the_parser():
     assert parsed["header"]["format"] == "dsh-memory-backup"
     assert [item["summary"] for item in parsed["memories"]] == ["a durable fact"]
     assert parsed["memories"][0]["project_id"] == "proj-a"
+
+
+def _seeded_home(tmp_path) -> Path:
+    """A real database under ``tmp_path`` with one memory in it.
+
+    Seeded with the *default* config: ``handle`` re-opens the file with its own
+    config, and a mismatched embedding dim is refused rather than migrated.
+    """
+    home = tmp_path / "home"
+    memory = MemorySystem(MemoryConfig.for_home(home))
+    try:
+        memory.ensure_project("proj-a", display_name="Project A")
+        memory.remember(project_id="proj-a", summary="a durable fact", event_type="note")
+    finally:
+        memory.close()
+    return home
+
+
+def test_backup_export_stays_inline_when_it_fits(tmp_path):
+    home = _seeded_home(tmp_path)
+    response = handle(
+        {"id": 1, "command": "backup.export", "payload": {"home": str(home), "project_id": "proj-a"}}
+    )
+
+    assert response["ok"] is True, response
+    result = response["result"]
+    assert result["inline"] is True
+    assert "a durable fact" in result["markdown"]
+    assert "path" not in result
+
+
+def test_backup_export_spills_to_a_file_instead_of_exceeding_the_wire_cap(tmp_path, monkeypatch):
+    """A big backup must not fail just because one envelope cannot carry it.
+
+    ``_serve_loop`` replaces an oversized response with
+    ``response_too_large``; the export then failed with "narrow the request",
+    which is impossible for a backup (it is the whole store by definition).
+    The command already knew how to write a file, so it now falls back to that
+    instead of handing back markdown the wire will drop.
+    """
+    from memory_system import bridge
+
+    home = _seeded_home(tmp_path)
+    monkeypatch.setattr(bridge, "MAX_RESPONSE_CHARS", 512)
+
+    response = handle(
+        {"id": 1, "command": "backup.export", "payload": {"home": str(home), "project_id": "proj-a"}}
+    )
+
+    assert response["ok"] is True, response
+    result = response["result"]
+    assert result["inline"] is False
+    assert "markdown" not in result
+    target = Path(result["path"])
+    assert target.parent == home / "exports"
+    assert target.exists()
+    # The spilled file is a real backup, not just a transport detail.
+    parsed = parse_backup_markdown(target.read_text(encoding="utf-8"))
+    assert [item["summary"] for item in parsed["memories"]] == ["a durable fact"]
+    # And the envelope that reports it fits the cap it had to respect.
+    assert len(json.dumps(response, ensure_ascii=False)) <= 512
+
+
+def test_backup_restore_reports_a_missing_file_as_a_client_error(tmp_path):
+    """A path the caller chose is a bad request, not an internal failure.
+
+    ``backup.restore`` read the file directly, so a missing one surfaced as
+    ``FileNotFoundError`` -> code ``internal``: a typo in a path looked like a
+    bug in the memory store, and the plugin answered it with HTTP 200.
+    """
+    missing = tmp_path / "missing.md"
+    response = handle(
+        {
+            "id": 1,
+            "command": "backup.restore",
+            "payload": {"home": str(tmp_path), "path": str(missing), "project_id": "p"},
+        }
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+    assert "missing.md" in response["error"]["message"]
+
+
+def test_backup_export_reports_an_unwritable_target_as_a_client_error(tmp_path):
+    home = _seeded_home(tmp_path)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    response = handle(
+        {
+            "id": 1,
+            "command": "backup.export",
+            "payload": {"home": str(home), "path": str(blocker / "backup.md")},
+        }
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+    assert "blocker" in response["error"]["message"]
 
 
 # ── git remote resolution ───────────────────────────────────────────────

@@ -666,6 +666,49 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
 # ── backup / restore ────────────────────────────────────────────────────
 
 
+def _backup_target(memory: MemorySystem, payload: dict[str, Any]) -> Path:
+    """Where an export that cannot travel inline is written.
+
+    Next to the database it was read from, under ``exports/``: a file the user
+    can keep, find again, and hand to ``backup.restore``. A store that is not a
+    file (the in-memory database tests use) falls back to the requested home.
+    """
+    store = Path(str(memory.config.db_path))
+    base = Scope.from_payload(payload).home if str(store) == ":memory:" else store.parent
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    return base / "exports" / f"dsh-memory-backup-{stamp}.md"
+
+
+def _write_backup(markdown: str, target: Path) -> Path:
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(markdown, encoding="utf-8")
+    except OSError as exc:
+        # A path the caller chose is caller input, not a bug in the store:
+        # report it as one instead of an ``internal`` failure.
+        raise BridgeError("bad_request", f"cannot write the backup to {target}: {exc}") from exc
+    return target
+
+
+def _read_backup(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError("bad_request", f"cannot read the backup at {path}: {exc}") from exc
+
+
+def _fits_one_envelope(result: dict[str, Any]) -> bool:
+    """Whether ``result`` still fits the serve loop's response cap.
+
+    ``_serve_loop`` replaces an oversized envelope with an error, so the size
+    has to be checked here, where the markdown still exists and a fallback can
+    take over. The request id is not known at this depth; the placeholder id
+    only makes the estimate a few bytes pessimistic.
+    """
+    probe = {"id": "0" * 64, "ok": True, "result": result}
+    return len(json.dumps(probe, ensure_ascii=False)) <= MAX_RESPONSE_CHARS
+
+
 @command("backup.export")
 def cmd_backup_export(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     projects = payload.get("projects")
@@ -678,13 +721,21 @@ def cmd_backup_export(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
         include_profile=_bool(payload.get("include_profile", True)),
         max_episodes=_limit(payload, "max_episodes", 2000, 20000),
     )
+    counts = {"chars": len(markdown), "lines": markdown.count("\n")}
     path = payload.get("path")
     if path:
-        target = Path(str(path)).expanduser()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(markdown, encoding="utf-8")
-        return {"path": str(target), "chars": len(markdown), "lines": markdown.count("\n")}
-    return {"markdown": markdown, "chars": len(markdown), "lines": markdown.count("\n")}
+        target = _write_backup(markdown, Path(str(path)).expanduser())
+        return {"path": str(target), "inline": False, **counts}
+    result = {"markdown": markdown, "inline": True, **counts}
+    if _fits_one_envelope(result):
+        return result
+    # A backup of a large store (up to 20k episodes) can exceed one response
+    # envelope, and an oversized envelope is replaced wholesale with an error:
+    # the export would fail with "narrow the request" and no way to narrow it.
+    # The command already knows how to write a file, so spill it there and let
+    # the caller read it back (the plugin does, outside the pipe cap).
+    target = _write_backup(markdown, _backup_target(memory, payload))
+    return {"path": str(target), "inline": False, **counts}
 
 
 def parse_backup_markdown(text: str) -> dict[str, Any]:
@@ -859,7 +910,7 @@ BACKUP_MARKER_HINT = "dsh-memory-backup"
 def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     source = payload.get("path")
     if source:
-        text = Path(str(source)).expanduser().read_text(encoding="utf-8", errors="replace")
+        text = _read_backup(Path(str(source)).expanduser())
     else:
         text = str(payload.get("markdown") or "")
     if not text.strip():

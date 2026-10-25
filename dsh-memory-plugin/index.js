@@ -12,6 +12,8 @@
  * @module dsh-memory
  */
 
+import { readFile } from 'node:fs/promises'
+
 import { BridgeClient, BridgeError, defaultMemoryHome, defaultMemorySystemRoot } from './bridge.js'
 import { buildTools } from './tools.js'
 
@@ -57,6 +59,17 @@ const DEFAULTS_INNER = {
 }
 
 /**
+ * Numeric settings for which zero is a meaningful value rather than a typo.
+ *
+ * `heartbeatSteps: 0` is documented as "no reminder at all", but the generic
+ * `> 0` guard below rejected it and silently kept the default, so the switch
+ * could not actually be turned off. Every other number is a duration or a
+ * count where zero would mean "no timeout" or "run on every step", so zero
+ * stays invalid for those.
+ */
+const ZERO_IS_MEANINGFUL = new Set(['heartbeatSteps'])
+
+/**
  * Normalize raw row configuration.
  * @param {Record<string, unknown>} input - loader-provided config.
  * @returns {typeof DEFAULTS_INNER} resolved configuration.
@@ -68,7 +81,8 @@ function resolveConfig(input) {
     if (value === undefined || value === null) continue
     if (typeof DEFAULTS_INNER[key] === 'number') {
       const parsed = Number(value)
-      if (Number.isFinite(parsed) && parsed > 0) config[key] = parsed
+      const zero = parsed === 0 && ZERO_IS_MEANINGFUL.has(key)
+      if (Number.isFinite(parsed) && (parsed > 0 || zero)) config[key] = parsed
       continue
     }
     if (typeof DEFAULTS_INNER[key] === 'boolean') {
@@ -776,6 +790,22 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
   }
 
   /**
+   * HTTP status for a bridge failure code.
+   *
+   * A code that describes the *request* — a path the caller chose, a payload
+   * the bridge refused — is a client error and must not come back as `200`,
+   * which reads as success to anything inspecting the status line. Codes that
+   * describe the server (a crashed child, an unexpected bug) keep the old
+   * status: the body already carries `ok: false`.
+   */
+  const CLIENT_ERROR_STATUS = {
+    NO_PROJECT: 400,
+    validation: 400,
+    bad_request: 400,
+    not_found: 404,
+  }
+
+  /**
    * Answer one JSON route.
    * @param {any} webCtx - the context that injected `webServer`.
    * @param {import('node:http').IncomingMessage} req - request.
@@ -844,7 +874,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
         })
         .catch((error) => {
           const code = typeof error?.code === 'string' ? error.code : 'INTERNAL'
-          const status = code === 'NO_PROJECT' || code === 'validation' ? 400 : 200
+          const status = CLIENT_ERROR_STATUS[code] ?? 200
           logger.warn(`[dsh-memory] route failed (${code}): ${error?.message ?? error}`)
           if (res.headersSent) {
             res.end()
@@ -979,7 +1009,17 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
         max_episodes: Math.min(Math.max(Number(body?.max_episodes) || 2000, 1), 20000),
         markdown: true,
       })
-      const markdown = exported?.markdown ?? ''
+      // A backup too large for one bridge response arrives as a file path
+      // instead of inline markdown: the pipe frame cannot carry it, and an
+      // oversized envelope is replaced by an error wholesale. Read the file
+      // here — an HTTP response has no such cap — so the browser still gets
+      // the whole document, and the copy on disk stays as a real backup.
+      const markdown =
+        typeof exported?.markdown === 'string'
+          ? exported.markdown
+          : exported?.path
+            ? await readFile(String(exported.path), 'utf8')
+            : ''
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
       return {
         filename: `dsh-memory-${stamp}.md`,
@@ -987,6 +1027,7 @@ async function generateDigest({ cwd, signal, reason = 'manual', length, scope = 
         chars: markdown.length,
         lines: markdown.split('\n').length,
         counts: exported?.counts ?? null,
+        path: exported?.path ?? null,
       }
     })
 
