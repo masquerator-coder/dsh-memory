@@ -212,3 +212,24 @@ def test_recent_never_resurfaces_user_forgotten_episodes(memory: MemorySystem, p
 
     notepad.restore(gone["memory_id"])
     assert gone["memory_id"] in {ep.memory_id for ep in memory.recent_episodes(project, limit=10)}
+
+
+def test_forgotten_id_lookup_chunks_its_in_list(memory: MemorySystem, project: str):
+    """``_forgotten_ids`` is asked about every episode id cited by a whole
+    subgraph (communities and retrieval chain the sources of each edge), so the
+    list is thousands long. A single ``IN (...)`` blows past SQLite's cap on
+    host parameters per statement and the helper raised instead of answering --
+    an explicit "forget this" would stop being honoured exactly on the large
+    projects where it matters. Chunking must not change the answer.
+    """
+    from memory_system.summary import MemoryNotepad
+
+    gone = memory.remember(project_id=project, summary="cited by a thousand claims")
+    kept = memory.remember(project_id=project, summary="still visible")
+    MemoryNotepad(memory).forget(gone["memory_id"])
+
+    # Past the largest per-statement limit SQLite builds ship with (32766 on
+    # modern builds, 999 on old ones), so no single-statement lookup can work.
+    bulk = [f"ep_{i:032x}" for i in range(40000)]
+    found = memory.l2._forgotten_ids([*bulk, gone["memory_id"], kept["memory_id"]])
+    assert found == [gone["memory_id"]]

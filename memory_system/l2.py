@@ -608,13 +608,27 @@ class EpisodicMemory:
         ids = [m for m in memory_ids if m]
         if not ids:
             return []
-        marks = ",".join("?" * len(ids))
-        rows = self.store.query(
-            f"SELECT memory_id FROM l2_episodes "
-            f"WHERE memory_id IN ({marks}) AND json_extract(meta, '$.forgotten_at') IS NOT NULL",
-            ids,
-        )
-        return [row["memory_id"] for row in rows]
+        # Callers hand over every id cited by a whole subgraph (communities and
+        # retrieval chain the sources of each edge), which runs to thousands.
+        # One ``IN (...)`` would then carry more host parameters than SQLite
+        # accepts per statement, so the lookup has to be chunked like
+        # :meth:`by_ids` -- otherwise an explicit "forget this" stops being
+        # honoured precisely on projects large enough to need it.
+        out: list[str] = []
+        chunk_size = 400
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start : start + chunk_size]
+            marks = ",".join("?" * len(chunk))
+            out.extend(
+                row["memory_id"]
+                for row in self.store.query(
+                    f"SELECT memory_id FROM l2_episodes "
+                    f"WHERE memory_id IN ({marks}) "
+                    "AND json_extract(meta, '$.forgotten_at') IS NOT NULL",
+                    chunk,
+                )
+            )
+        return out
 
     def _ids_by_ordinal(self, ordinals: Iterable[int]) -> dict[int, str]:
         ords = [int(o) for o in ordinals]
