@@ -332,8 +332,14 @@ class EpisodicMemory:
         """
         now = now or utcnow()
         rows = self.store.query(
+            # Stalest first, not freshest. The batch is bounded, and the rows
+            # whose state can actually change are the ones that have gone
+            # longest without access; taking ``last_access DESC`` spent the
+            # whole budget re-confirming fresh rows, so a project past the cap
+            # never decayed its tail at all. ``ord`` breaks ties (bulk writes
+            # share a timestamp) for a stable, resumable scan.
             "SELECT * FROM l2_episodes WHERE state != 'archived' "
-            "ORDER BY last_access DESC LIMIT ?",
+            "ORDER BY last_access ASC, ord ASC LIMIT ?",
             (limit,),
         )
         transitions = {STATE_ACTIVE: 0, STATE_DORMANT: 0, STATE_ARCHIVED: 0}

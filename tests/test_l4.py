@@ -303,6 +303,59 @@ def test_archive_survives_project_removal(memory: MemorySystem, project: str):
     assert memory.archive.stats().get("orphaned", 0) >= 1
 
 
+def test_archive_scan_is_atomic_per_skill(memory: MemorySystem, project: str, monkeypatch):
+    """Snapshot and retire are one act.
+
+    The snapshot used to commit first, so a failing retire left the skill live
+    *and* an archive copy of it; the next scan then snapshotted it again.
+    """
+    from memory_system.storage import iso_ago
+
+    memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
+    skill = memory.skills.find("dep-upgrade", memory.view(project))
+    memory.store.execute(
+        "UPDATE l4_skills SET updated_at = ? WHERE skill_id = ?",
+        (iso_ago(days=365), skill.skill_id),
+    )
+    # Drop the snapshot ``add_skill`` took, so the scan's own archive write is
+    # observable (the dedup below would otherwise hide it).
+    for row in memory.store.query(
+        "SELECT archive_id FROM l4_archive WHERE origin_skill_id = ?", (skill.skill_id,)
+    ):
+        memory.store.execute("DELETE FROM l4_archive WHERE archive_id = ?", (row["archive_id"],))
+        memory.store.execute("DELETE FROM l4_archive_fts WHERE archive_id = ?", (row["archive_id"],))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("retire failed")
+
+    monkeypatch.setattr(memory.maintenance.registry, "retire", boom)
+    reports = memory.run_maintenance(tasks=["archive_scan"], force=True)
+    assert reports[0].error and "retire failed" in reports[0].error
+
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_archive WHERE origin_skill_id = ?", (skill.skill_id,)
+    ) == 0
+    assert memory.skills.get(skill.skill_id).status == "active"
+
+
+def test_snapshot_is_idempotent_for_the_same_archived_version(memory: MemorySystem, project: str):
+    """The pool is append-only per version, not per call.
+
+    A retried archive_scan or a second ``archive_project`` used to add an
+    identical row plus its vector and FTS entry, and ``search`` then returned
+    the same definition several times.
+    """
+    memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
+    skill = memory.skills.find("dep-upgrade", memory.view(project))
+    first = memory.archive.snapshot(skill, status="superseded")
+    second = memory.archive.snapshot(skill, status="superseded")
+    assert first == second
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_archive WHERE origin_skill_id = ? AND status = 'superseded'",
+        (skill.skill_id,),
+    ) == 1
+
+
 # ── promotion ───────────────────────────────────────────────────────────
 
 

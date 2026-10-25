@@ -99,10 +99,25 @@ class SkillArchive:
         self._cache = embedding_cache
 
     def snapshot(self, skill: Skill, *, status: ArchiveStatus = "active") -> str:
-        """Append the skill's current definition to the archive."""
+        """Append the skill's current definition to the archive.
+
+        The pool is append-only *per archived version*, not per call: the same
+        skill with the same definition under the same lifecycle status is one
+        row. Re-snapshotting it used to add another row plus its vector and FTS
+        entry, so a retried scan (or a second ``archive_project``) inflated the
+        pool with identical copies that `search` then surfaced as duplicates.
+        """
         search_text = skill.definition.search_text()
-        archive_id = "ar_" + uuid.uuid4().hex[:12]
         digest = hashlib.sha1(search_text.encode("utf-8")).hexdigest()[:16]
+        existing = self.store.scalar(
+            "SELECT archive_id FROM l4_archive "
+            "WHERE origin_skill_id = ? AND search_hash = ? AND status = ? LIMIT 1",
+            (skill.skill_id, digest, status),
+            0,
+        )
+        if existing:
+            return str(existing)
+        archive_id = "ar_" + uuid.uuid4().hex[:12]
         now = to_iso(utcnow())
         with self.store.transaction():
             cur = self.store.execute(

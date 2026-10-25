@@ -51,6 +51,30 @@ def test_refresh_states_updates_only_what_changed(memory: MemorySystem, project:
     assert memory.l2.get(fresh.memory_id).state == "active"
 
 
+def test_refresh_states_examines_the_stalest_rows_first(memory: MemorySystem, project: str):
+    """The decay batch is bounded, so its order decides which rows ever decay.
+
+    ``ORDER BY last_access DESC`` spent the budget on the *freshest* rows --
+    the ones that cannot have changed state yet -- so once a project held more
+    live rows than the limit, its stale tail never decayed at all. Oldest
+    access first also makes the scan resumable: rows it archives leave the
+    candidate set, so the next run starts further down.
+    """
+    stale = memory.l2.add(project_id=project, summary="ancient note", importance=0.2)
+    fresh = memory.l2.add(project_id=project, summary="just written", importance=0.9)
+    old = to_iso(utcnow() - dt.timedelta(hours=2000))
+    memory.store.execute(
+        "UPDATE l2_episodes SET last_access = ?, created_at = ? WHERE memory_id = ?",
+        (old, old, stale.memory_id),
+    )
+
+    report = memory.l2.refresh_states(limit=1)
+
+    assert report["examined"] == 1
+    assert memory.l2.get(stale.memory_id).state == "archived"
+    assert memory.l2.get(fresh.memory_id).state == "active"
+
+
 def test_search_ties_prefer_the_newer_memory(memory: MemorySystem, project: str):
     """Equal scores must not rank the oldest memory first."""
     older = memory.l2.add(project_id=project, summary="identical text", importance=0.5)

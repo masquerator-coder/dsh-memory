@@ -200,8 +200,14 @@ class Maintenance:
                 skill = self.registry.get(skill_id)
             except Exception:  # noqa: BLE001
                 continue
-            self.archive.snapshot(skill, status="active")
-            self.registry.retire(skill_id, reason="unused_past_window")
+            # Snapshot and retire are one act. Committing the snapshot first
+            # meant a failed retire left the skill live *and* an archive copy
+            # of it, which the next scan snapshotted again. One transaction per
+            # skill keeps the two in step without holding the lock for the
+            # whole batch.
+            with self.store.transaction():
+                self.archive.snapshot(skill, status="active")
+                self.registry.retire(skill_id, reason="unused_past_window")
             archived += 1
         return {"archived": archived}
 
