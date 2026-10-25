@@ -522,24 +522,36 @@ class PromotionService:
             raise ValidationError("sys-level promotion requires an administrative scope")
         base = promotion.copy_from[0] if promotion.copy_from else None
         base_name = name or _name_from_copies(self.store, promotion.copy_from)
-        skill = self.registry.create(
-            view=view,
-            definition=promotion.suggestion,
-            name=base_name,
-            scope_kind=scope_kind,
-            ns="user",
-            status="active",
-            origin_project=None,
-            parent_skill_id=base,
-            activation_reason=f"promotion:{promotion_id}",
-        )
         now = to_iso(utcnow())
+        # The skill and the decision are one act. Creating the skill in its own
+        # transaction left a window where the org-level skill existed while the
+        # promotion was still `pending`: accepting again then collided with
+        # "already exists", and the pending row could still be rejected,
+        # leaving a live skill whose promotion says it was refused. An outer
+        # transaction folds ``registry.create``'s inner one into a savepoint,
+        # so the skill, the decision and the provenance updates land together
+        # or not at all.
         with self.store.transaction():
-            self.store.execute(
+            skill = self.registry.create(
+                view=view,
+                definition=promotion.suggestion,
+                name=base_name,
+                scope_kind=scope_kind,
+                ns="user",
+                status="active",
+                origin_project=None,
+                parent_skill_id=base,
+                activation_reason=f"promotion:{promotion_id}",
+            )
+            # ``status='pending'`` in the predicate: the earlier read is outside
+            # the transaction, so re-assert it where it is actually enforced.
+            cur = self.store.execute(
                 "UPDATE l4_promotions SET status='accepted', decided_at=?, updated_at=?, decision_note=?, "
-                "decided_by=? WHERE promotion_id = ?",
+                "decided_by=? WHERE promotion_id = ? AND status = 'pending'",
                 (now, now, note, decided_by, promotion_id),
             )
+            if not cur.rowcount:
+                raise ValidationError(f"promotion {promotion_id} is no longer pending")
             for source_id in promotion.copy_from:
                 self.store.execute(
                     "UPDATE l4_skills SET promoted_to = ? WHERE skill_id = ?", (skill.skill_id, source_id)
@@ -551,13 +563,22 @@ class PromotionService:
         return skill
 
     def reject(self, promotion_id: str, *, note: str | None = None, decided_by: str = "user") -> Promotion:
+        promotion = self.get(promotion_id)
+        # A decided promotion is history. Overwriting an accepted one with
+        # 'rejected' left the org-level skill it created alive while its
+        # provenance said the proposal was refused; and re-rejecting re-armed
+        # the cooldown clock. Refuse instead of silently rewriting the record.
+        if promotion.status != "pending":
+            raise ValidationError(f"promotion {promotion_id} is {promotion.status}")
         now = to_iso(utcnow())
         with self.store.transaction():
-            self.store.execute(
+            cur = self.store.execute(
                 "UPDATE l4_promotions SET status='rejected', decided_at=?, updated_at=?, "
-                "decision_note=?, decided_by=? WHERE promotion_id = ?",
+                "decision_note=?, decided_by=? WHERE promotion_id = ? AND status = 'pending'",
                 (now, now, note, decided_by, promotion_id),
             )
+            if not cur.rowcount:
+                raise ValidationError(f"promotion {promotion_id} is no longer pending")
         return self.get(promotion_id)
 
     def expire_old(self) -> int:

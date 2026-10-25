@@ -335,6 +335,51 @@ def test_rejection_is_remembered(memory: MemorySystem, project: str):
     assert memory.promotions.propose() == []
 
 
+def test_rejecting_a_decided_promotion_is_refused(memory: MemorySystem, project: str):
+    """A decision is history, not a mutable slot.
+
+    ``reject`` used to UPDATE unconditionally, so rejecting an accepted
+    promotion flipped its status to 'rejected' while the org-level skill it had
+    created stayed live and visible -- the record then contradicted the graph.
+    """
+    memory.ensure_project("proj-b", org_id="acme")
+    memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
+    memory.add_skill(project_id="proj-b", definition=make_definition(), name="dep-upgrade")
+    promotion_id = memory.promotions.propose()[0].promotion_id
+    memory.decide_promotion(promotion_id, accept=True, project_id=project)
+
+    with pytest.raises(ValidationError):
+        memory.promotions.reject(promotion_id, note="too late")
+    assert memory.promotions.get(promotion_id).status == "accepted"
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_skills WHERE scope_kind='org'"
+    ) == 1
+
+
+def test_accept_is_atomic_with_the_decision(memory: MemorySystem, project: str, monkeypatch):
+    """Accepting creates a skill *and* records the decision.
+
+    They used to commit separately, so a failure between them left a live org
+    skill behind a still-``pending`` promotion: the next accept collided with
+    "already exists", and the stale pending row could still be rejected.
+    """
+    memory.ensure_project("proj-b", org_id="acme")
+    memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
+    memory.add_skill(project_id="proj-b", definition=make_definition(), name="dep-upgrade")
+    promotion_id = memory.promotions.propose()[0].promotion_id
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("archive unavailable")
+
+    monkeypatch.setattr(memory.promotions.archive, "snapshot", boom)
+    with pytest.raises(RuntimeError):
+        memory.promotions.accept(promotion_id, view=memory.view(project))
+
+    # Neither half may survive on its own.
+    assert memory.store.scalar("SELECT count(*) FROM l4_skills WHERE scope_kind='org'") == 0
+    assert memory.promotions.get(promotion_id).status == "pending"
+
+
 def test_promotion_daily_cap(memory: MemorySystem, project: str):
     memory.ensure_project("proj-b", org_id="acme")
     memory.config.l4.promotion_max_daily = 1
