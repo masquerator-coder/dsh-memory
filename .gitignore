@@ -26,6 +26,10 @@ node_modules/
 # text and local paths, so they stay on the machine that produced them.
 dsh-memory-*.md
 
+# Per-project work summary derived from the local memory database. dsh-memory
+# rewrites it whenever work is recorded, so it stays out of version control.
+DSH_MEMORY.md
+
 # Local scratch output
 .tmp_*
 *.log
