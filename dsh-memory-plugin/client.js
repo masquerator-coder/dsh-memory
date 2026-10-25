@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       "common.keywords": "关键词",
       "common.search": "搜索",
       "common.reset": "重置",
+      "common.unsaved": "未保存",
       "status.connected": "记忆库已连接",
       "status.disconnected": "记忆库未连接",
       "status.project": "当前项目",
@@ -61,6 +62,13 @@ window.__ModuleLoader__.load({
       "status.python": "Python",
       "status.pythonMissing": "找不到可用的 Python 解释器，请在插件配置中设置 pythonPath。",
       "status.latency": "{ms} ms",
+      "status.up": "已连接",
+      "status.checking": "检测中…",
+      "status.down": "未连接",
+      "status.unavailable": "记忆库不可用：{message}",
+      "status.digestBudget": "摘要预算",
+      "status.backend": "检索后端",
+      "status.degraded": "（降级）",
       "length.title": "记忆摘要长度",
       "length.hint": "注入系统提示词的记忆摘要预算上限。摘要由模型生成，实际长度通常远小于预算。",
       "length.preset": "{n} 字",
@@ -68,11 +76,16 @@ window.__ModuleLoader__.load({
       "length.customPlaceholder": "输入 1000 到 4000000 之间的字符数",
       "length.invalid": "请输入 {min} 到 {max} 之间的数字",
       "length.current": "当前预算：{n} 字（约 {tokens} tokens）",
+      "length.saved": "摘要长度已保存",
+      "length.unit": "字",
       "profile.title": "用户画像",
       "profile.hint": "写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。记忆摘要与助手都会参考它，系统提示词里会提示模型可以查看画像。",
       "profile.placeholder": "例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开",
       "profile.charCount": "{n} / {max} 字",
       "profile.saved": "用户画像已保存",
+      "profile.loadFailed": "读取用户画像失败：{message}",
+      "profile.updatedAt": "更新于 {time}",
+      "profile.save": "保存用户画像",
       "digest.title": "记忆摘要",
       "digest.generate": "记忆摘要生成",
       "digest.view": "查看记忆摘要",
@@ -95,6 +108,18 @@ window.__ModuleLoader__.load({
       "digest.scopeProject": "当前项目",
       "digest.scopeGlobal": "全部项目",
       "digest.viewerTitle": "记忆摘要 · {scope}",
+      "digest.loadFailed": "读取摘要失败：{message}",
+      "digest.generatingHint": "正在生成记忆摘要…这一步会调用模型，可能需要几十秒。",
+      "digest.scopeLabel": "摘要范围",
+      "digest.generatedLabel": "生成于",
+      "digest.size": "规模",
+      "digest.budget": "预算",
+      "digest.sourcesLabel": "来源",
+      "digest.materials": "{n} 字材料",
+      "digest.emptyHint": "还没有生成过记忆摘要。生成后，摘要会以锚点形式进入系统提示词。",
+      "digest.lastFailed": "上次生成失败",
+      "digest.statusNone": "无",
+      "digest.emptyBody": "（摘要内容为空）",
       "memories.title": "记忆查看与编辑",
       "memories.open": "记忆查看与编辑",
       "memories.count": "共 {total} 条",
@@ -130,6 +155,15 @@ window.__ModuleLoader__.load({
       "memories.next": "下一页",
       "memories.selectHint": "从左侧选择一条记忆查看详情",
       "memories.summaryRequired": "记忆内容不能为空",
+      "memories.hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。",
+      "memories.loadFailed": "读取记忆失败：{message}",
+      "memories.opFailed": "操作失败：{message}",
+      "memories.pageOf": "第 {page} / {pages} 页",
+      "memories.typePlaceholder": "类型（如 decision）",
+      "memories.emptyFiltered": "没有符合条件的记忆",
+      "memories.importanceValue": "重要度（{value}）",
+      "memories.outcomePlaceholder": "success / failure / 留空",
+      "memories.tagsLabel": "标签（逗号分隔）",
       "backup.title": "备份与恢复",
       "backup.hint": "备份是一个 Markdown 文件，可以直接阅读与编辑，也可以用它恢复记忆库。",
       "backup.export": "导出 Markdown 备份",
@@ -140,15 +174,24 @@ window.__ModuleLoader__.load({
       "backup.preview": "预览恢复",
       "backup.apply": "确认恢复",
       "backup.cancel": "取消",
-      "backup.dryRun": "将导入 {n} 条记忆",
+      "backup.dryRun": "将导入 {n} 条记忆。",
       "backup.dryRunProfile": "同时恢复用户画像",
       "backup.done": "导入 {n} 条记忆，跳过 {skipped} 条",
       "backup.restoredProfile": "用户画像已恢复",
       "backup.noFile": "请选择一个 Markdown 文件",
       "backup.readFailed": "读取文件失败：{message}",
+      "backup.exportFailed": "导出失败：{message}",
+      "backup.restoreFailed": "恢复失败：{message}",
+      "backup.dryRunProfileLine": "将导入 {n} 条记忆，并恢复用户画像。",
+      "backup.restoring": "恢复中…",
       "errors.loadFailed": "加载失败：{message}",
       "errors.saveFailed": "保存失败：{message}",
       "errors.unknown": "未知错误",
+      "errors.badResponse": "{path} 返回了非 JSON 响应（HTTP {status}）",
+      "time.justNow": "刚刚",
+      "time.minutesAgo": "{n} 分钟前",
+      "time.hoursAgo": "{n} 小时前",
+      "time.daysAgo": "{n} 天前",
     }
     const EN = {
       "meta.title": "Memory",
@@ -172,6 +215,7 @@ window.__ModuleLoader__.load({
       "common.keywords": "Keywords",
       "common.search": "Search",
       "common.reset": "Reset",
+      "common.unsaved": "Unsaved",
       "status.connected": "Memory store connected",
       "status.disconnected": "Memory store unavailable",
       "status.project": "Current project",
@@ -184,6 +228,13 @@ window.__ModuleLoader__.load({
       "status.python": "Python",
       "status.pythonMissing": "No usable Python interpreter was found. Set pythonPath in the plugin configuration.",
       "status.latency": "{ms} ms",
+      "status.up": "Connected",
+      "status.checking": "Checking…",
+      "status.down": "Disconnected",
+      "status.unavailable": "Memory store unavailable: {message}",
+      "status.digestBudget": "Digest budget",
+      "status.backend": "Retrieval backend",
+      "status.degraded": "(degraded)",
       "length.title": "Digest length",
       "length.hint": "Budget ceiling for the digest injected into the system prompt. A model writes the digest, so the real length is usually far below the budget.",
       "length.preset": "{n} chars",
@@ -191,14 +242,19 @@ window.__ModuleLoader__.load({
       "length.customPlaceholder": "Enter a value between 1000 and 4000000",
       "length.invalid": "Enter a number between {min} and {max}",
       "length.current": "Current budget: {n} chars (about {tokens} tokens)",
+      "length.saved": "Digest length saved",
+      "length.unit": "chars",
       "profile.title": "User profile",
       "profile.hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",
       "profile.placeholder": "For example:\n- Answer in Chinese, comment code in Chinese\n- Mostly TypeScript and Python\n- Prefer the conclusion first, then the detail",
       "profile.charCount": "{n} / {max} chars",
       "profile.saved": "User profile saved",
+      "profile.loadFailed": "Could not read the user profile: {message}",
+      "profile.updatedAt": "Updated {time}",
+      "profile.save": "Save profile",
       "digest.title": "Memory digest",
-      "digest.generate": "记忆摘要生成",
-      "digest.view": "查看记忆摘要",
+      "digest.generate": "Generate digest",
+      "digest.view": "View digest",
       "digest.generating": "Generating the digest…",
       "digest.generated": "Digest updated",
       "digest.generatedAt": "Generated {time}",
@@ -218,8 +274,20 @@ window.__ModuleLoader__.load({
       "digest.scopeProject": "This project",
       "digest.scopeGlobal": "All projects",
       "digest.viewerTitle": "Memory digest · {scope}",
+      "digest.loadFailed": "Could not read the digest: {message}",
+      "digest.generatingHint": "Generating the digest… this calls the model and can take a few tens of seconds.",
+      "digest.scopeLabel": "Digest scope",
+      "digest.generatedLabel": "Generated",
+      "digest.size": "Size",
+      "digest.budget": "Budget",
+      "digest.sourcesLabel": "Sources",
+      "digest.materials": "{n} chars of material",
+      "digest.emptyHint": "No digest has been generated yet. Once generated, it enters the system prompt as an anchor.",
+      "digest.lastFailed": "The last generation failed",
+      "digest.statusNone": "None",
+      "digest.emptyBody": "(the digest is empty)",
       "memories.title": "Browse and edit memories",
-      "memories.open": "记忆查看与编辑",
+      "memories.open": "Browse and edit memories",
       "memories.count": "{total} entries",
       "memories.filterState": "State",
       "memories.allStates": "All states",
@@ -253,6 +321,15 @@ window.__ModuleLoader__.load({
       "memories.next": "Next",
       "memories.selectHint": "Pick an entry on the left to see its details",
       "memories.summaryRequired": "Memory content cannot be empty",
+      "memories.hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone).",
+      "memories.loadFailed": "Could not load memories: {message}",
+      "memories.opFailed": "Action failed: {message}",
+      "memories.pageOf": "Page {page} / {pages}",
+      "memories.typePlaceholder": "Type (e.g. decision)",
+      "memories.emptyFiltered": "No memories match these filters",
+      "memories.importanceValue": "Importance ({value})",
+      "memories.outcomePlaceholder": "success / failure / leave empty",
+      "memories.tagsLabel": "Tags (comma separated)",
       "backup.title": "Backup and restore",
       "backup.hint": "A backup is a Markdown file you can read and edit by hand, and restore from later.",
       "backup.export": "Export Markdown backup",
@@ -263,15 +340,24 @@ window.__ModuleLoader__.load({
       "backup.preview": "Preview restore",
       "backup.apply": "Restore now",
       "backup.cancel": "Cancel",
-      "backup.dryRun": "{n} memories will be imported",
+      "backup.dryRun": "{n} memories will be imported.",
       "backup.dryRunProfile": "The user profile will be restored too",
       "backup.done": "Imported {n} memories, skipped {skipped}",
       "backup.restoredProfile": "User profile restored",
       "backup.noFile": "Choose a Markdown file first",
       "backup.readFailed": "Could not read the file: {message}",
+      "backup.exportFailed": "Export failed: {message}",
+      "backup.restoreFailed": "Restore failed: {message}",
+      "backup.dryRunProfileLine": "{n} memories will be imported, and the user profile will be restored.",
+      "backup.restoring": "Restoring…",
       "errors.loadFailed": "Could not load: {message}",
       "errors.saveFailed": "Could not save: {message}",
       "errors.unknown": "Unknown error",
+      "errors.badResponse": "{path} returned a non-JSON response (HTTP {status})",
+      "time.justNow": "just now",
+      "time.minutesAgo": "{n} min ago",
+      "time.hoursAgo": "{n} h ago",
+      "time.daysAgo": "{n} d ago",
     }
 
     /**
@@ -310,7 +396,7 @@ window.__ModuleLoader__.load({
       try {
         payload = await response.json()
       } catch {
-        throw new Error(`${path} 返回了非 JSON 响应（HTTP ${response.status}）`)
+        throw new Error(callTranslate('errors.badResponse', { path, status: response.status }))
       }
       if (!payload || payload.ok !== true) {
         const error = new Error(payload?.error?.message ?? `HTTP ${response.status}`)
@@ -370,11 +456,11 @@ window.__ModuleLoader__.load({
       const then = new Date(value).getTime()
       if (!Number.isFinite(then)) return String(value)
       const minutes = Math.round((Date.now() - then) / 60000)
-      if (minutes < 1) return '刚刚'
-      if (minutes < 60) return `${minutes} 分钟前`
+      if (minutes < 1) return callTranslate('time.justNow')
+      if (minutes < 60) return callTranslate('time.minutesAgo', { n: minutes })
       const hours = Math.round(minutes / 60)
-      if (hours < 24) return `${hours} 小时前`
-      return `${Math.round(hours / 24)} 天前`
+      if (hours < 24) return callTranslate('time.hoursAgo', { n: hours })
+      return callTranslate('time.daysAgo', { n: Math.round(hours / 24) })
     }
 
     // Bare digits: seven labels share one rail, and a thousands separator would
@@ -526,8 +612,14 @@ window.__ModuleLoader__.load({
 
     /** Status chips for a digest record. */
     function DigestStatus({ digest }) {
-      if (!digest) return h('span', { className: 'mem-chip mem-chip-idle' }, '无')
-      const map = { ok: '正常', truncated: '已截断', empty: '无内容', error: '失败' }
+      const t = useLocale()
+      if (!digest) return h('span', { className: 'mem-chip mem-chip-idle' }, t('digest.statusNone'))
+      const map = {
+        ok: t('digest.statusOk'),
+        truncated: t('digest.statusTruncated'),
+        empty: t('digest.statusEmpty'),
+        error: t('digest.statusError'),
+      }
       const cls = digest.status === 'ok' ? 'ok' : digest.status === 'error' ? 'error' : 'warn'
       return h('span', { className: `mem-chip mem-chip-${cls}` }, map[digest.status] ?? digest.status)
     }
@@ -607,7 +699,7 @@ window.__ModuleLoader__.load({
           const result = await api(ROUTE_DIGEST, { action: 'view', scope })
           setDigestState({ digest: result?.digest ?? null, history: result?.history ?? [] })
         } catch (error) {
-          setDigestNote({ kind: 'error', text: `读取摘要失败：${error.message}` })
+          setDigestNote({ kind: 'error', text: t('digest.loadFailed', { message: error.message }) })
         }
       }, [])
 
@@ -618,7 +710,7 @@ window.__ModuleLoader__.load({
           if (typeof result?.max_chars === 'number') setProfileMax(result.max_chars)
           setProfileDirty(false)
         } catch (error) {
-          setProfileNote({ kind: 'error', text: `读取用户画像失败：${error.message}` })
+          setProfileNote({ kind: 'error', text: t('profile.loadFailed', { message: error.message }) })
         }
       }, [])
 
@@ -689,11 +781,11 @@ window.__ModuleLoader__.load({
           // request went out; otherwise the echo would yank the thumb back
           // mid-drag.
           setLength((current) => (current === nextLength ? saved : current))
-          setLengthNote({ kind: 'ok', text: '摘要长度已保存' })
+          setLengthNote({ kind: 'ok', text: t('length.saved') })
         } catch (error) {
           // Keep the slider where the user put it; the note explains why the
           // value will not survive a reload.
-          setLengthNote({ kind: 'error', text: `保存失败：${error.message}` })
+          setLengthNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
         } finally {
           setSavingLength(false)
         }
@@ -706,9 +798,9 @@ window.__ModuleLoader__.load({
         try {
           await api(ROUTE_PROFILE, { content: profile })
           setProfileDirty(false)
-          setProfileNote({ kind: 'ok', text: '用户画像已保存' })
+          setProfileNote({ kind: 'ok', text: t('profile.saved') })
         } catch (error) {
-          setProfileNote({ kind: 'error', text: `保存失败：${error.message}` })
+          setProfileNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
         } finally {
           setSavingProfile(false)
         }
@@ -717,20 +809,23 @@ window.__ModuleLoader__.load({
       /** Generate a digest with the model. */
       async function generateDigest() {
         setGenerating(true)
-        setDigestNote({ kind: 'warn', text: '正在生成记忆摘要…这一步会调用模型，可能需要几十秒。' })
+        setDigestNote({ kind: 'warn', text: t('digest.generatingHint') })
         try {
           const result = await api(ROUTE_DIGEST, { action: 'generate', scope: digestScope, length })
           setDigestState({ digest: result?.digest ?? null, history: result?.history ?? [] })
           const generated = result?.generated
           if (generated?.status === 'error') {
-            setDigestNote({ kind: 'error', text: `摘要生成失败：${generated.error ?? '未知错误'}` })
+            setDigestNote({
+              kind: 'error',
+              text: t('digest.failed', { message: generated.error ?? t('errors.unknown') }),
+            })
           } else if (generated?.status === 'empty') {
-            setDigestNote({ kind: 'warn', text: '记忆库还没有内容，未生成摘要。先和助手聊几轮，或手动添加记忆。' })
+            setDigestNote({ kind: 'warn', text: t('digest.needMaterials') })
           } else {
-            setDigestNote({ kind: 'ok', text: '记忆摘要已更新' })
+            setDigestNote({ kind: 'ok', text: t('digest.generated') })
           }
         } catch (error) {
-          setDigestNote({ kind: 'error', text: `摘要生成失败：${error.message}` })
+          setDigestNote({ kind: 'error', text: t('digest.failed', { message: error.message }) })
         } finally {
           setGenerating(false)
         }
@@ -751,9 +846,12 @@ window.__ModuleLoader__.load({
           anchor.click()
           anchor.remove()
           setTimeout(() => URL.revokeObjectURL(url), 5000)
-          setBackupNote({ kind: 'ok', text: `已导出 ${result.chars} 字，共 ${result.lines} 行。` })
+          setBackupNote({
+            kind: 'ok',
+            text: t('backup.exported', { chars: result.chars, lines: result.lines }),
+          })
         } catch (error) {
-          setBackupNote({ kind: 'error', text: `导出失败：${error.message}` })
+          setBackupNote({ kind: 'error', text: t('backup.exportFailed', { message: error.message }) })
         } finally {
           setExporting(false)
         }
@@ -773,7 +871,7 @@ window.__ModuleLoader__.load({
         } catch (error) {
           setPendingRestore(null)
           setRestorePreview(null)
-          setBackupNote({ kind: 'error', text: `读取失败：${error.message}` })
+          setBackupNote({ kind: 'error', text: t('backup.readFailed', { message: error.message }) })
         }
       }
 
@@ -790,14 +888,17 @@ window.__ModuleLoader__.load({
           })
           setBackupNote({
             kind: 'ok',
-            text: `导入 ${result?.imported ?? 0} 条记忆，跳过 ${result?.skipped ?? 0} 条。${result?.profile_restored ? '用户画像已恢复。' : ''}`,
+            text: t(result?.profile_restored ? 'backup.dryRunProfileLine' : 'backup.done', {
+              n: result?.imported ?? 0,
+              skipped: result?.skipped ?? 0,
+            }),
           })
           setPendingRestore(null)
           setRestorePreview(null)
           await loadStatus()
           await loadProfile()
         } catch (error) {
-          setBackupNote({ kind: 'error', text: `恢复失败：${error.message}` })
+          setBackupNote({ kind: 'error', text: t('backup.restoreFailed', { message: error.message }) })
         } finally {
           setRestoring(false)
         }
@@ -826,33 +927,39 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 { className: status?.probe?.ok ? 'mem-chip mem-chip-ok' : 'mem-chip mem-chip-error' },
-                status?.probe?.ok ? '已连接' : loading ? '检测中…' : '未连接',
+                status?.probe?.ok
+                  ? t('status.up')
+                  : loading
+                    ? t('status.checking')
+                    : t('status.down'),
               ),
             ),
             statusError
-              ? h(Note, { kind: 'error' }, `记忆库不可用：${statusError}`)
+              ? h(Note, { kind: 'error' }, t('status.unavailable', { message: statusError }))
               : h(
                   'dl',
                   { className: 'mem-kv' },
-                  h('dt', null, '当前项目'),
+                  h('dt', null, t('status.project')),
                   h('dd', { className: 'mem-mono' }, status?.project_id ?? '—'),
-                  h('dt', null, '记忆条目'),
+                  h('dt', null, t('status.memories')),
                   h('dd', null, String(status?.memories ?? 0)),
-                  h('dt', null, '摘要预算'),
-                  h('dd', null, `${settings.length ?? 0} 字`),
-                  h('dt', null, '存储位置'),
+                  h('dt', null, t('status.digestBudget')),
+                  h('dd', null, t('length.preset', { n: settings.length ?? 0 })),
+                  h('dt', null, t('status.home')),
                   h('dd', { className: 'mem-mono' }, status?.home ?? '—'),
-                  h('dt', null, '检索后端'),
+                  h('dt', null, t('status.backend')),
                   h(
                     'dd',
                     null,
-                    status?.probe ? `${status.probe.provider}${status.probe.degraded ? '（降级）' : ''}` : '—',
+                    status?.probe
+                      ? `${status.probe.provider}${status.probe.degraded ? ` ${t('status.degraded')}` : ''}`
+                      : '—',
                   ),
                 ),
             h(
               'div',
               { className: 'mem-row' },
-              h('button', { type: 'button', className: 'mem-btn', onClick: () => void loadStatus(), disabled: loading }, '刷新'),
+              h('button', { type: 'button', className: 'mem-btn', onClick: () => void loadStatus(), disabled: loading }, t('common.refresh')),
             ),
           ),
 
@@ -864,7 +971,7 @@ window.__ModuleLoader__.load({
             h(
               'p',
               { className: 'mem-hint' },
-              '注入系统提示词的记忆摘要预算上限。摘要由模型按记忆库内容生成，实际长度通常远小于预算，所以拿不准时可以选大一点。',
+              t('length.hint'),
             ),
             h(
               'div',
@@ -915,9 +1022,9 @@ window.__ModuleLoader__.load({
                         const next = presets[Number(event.target.value)]
                         setLength(next)
                       },
-                      title: `${length.toLocaleString()} 字`,
-                      'aria-label': '记忆摘要长度',
-                      'aria-valuetext': `${length.toLocaleString()} 字`,
+                      title: t('length.preset', { n: length.toLocaleString() }),
+                      'aria-label': t('length.title'),
+                      'aria-valuetext': t('length.preset', { n: length.toLocaleString() }),
                     }),
                     // One slot per tick, each holding its own label.
                     h(
@@ -939,13 +1046,13 @@ window.__ModuleLoader__.load({
                 })(),
                 // The unit is rendered once, beside the rail, instead of on
                 // every tick label.
-                h('span', { className: 'mem-rail-unit' }, '字'),
+                h('span', { className: 'mem-rail-unit' }, t('length.unit')),
               ),
             ),
             h(
               Note,
               { kind: savingLength ? 'warn' : lengthNote?.kind },
-              savingLength ? '正在保存…' : lengthNote?.text,
+              savingLength ? t('common.saving') : lengthNote?.text,
             ),
           ),
 
@@ -958,18 +1065,18 @@ window.__ModuleLoader__.load({
               null,
               h('h3', { className: 'mem-title' }, t('profile.title')),
               settings.profile_updated_at
-                ? h('span', { className: 'mem-chip' }, `更新于 ${formatAge(settings.profile_updated_at)}`)
+                ? h('span', { className: 'mem-chip' }, t('profile.updatedAt', { time: formatAge(settings.profile_updated_at) }))
                 : null,
             ),
             h(
               'p',
               { className: 'mem-hint' },
-              '写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。系统提示词里会告诉模型"需要时可以查看用户画像"，生成记忆摘要时也会参考它。',
+              t('profile.hint'),
             ),
             h('textarea', {
               className: 'mem-textarea',
               value: profile,
-              placeholder: '例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开',
+              placeholder: t('profile.placeholder'),
               maxLength: profileMax,
               onChange: (event) => {
                 setProfile(event.target.value)
@@ -980,13 +1087,13 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'mem-row' },
-              h('span', { className: 'mem-hint' }, `${profile.length} / ${profileMax} 字`),
+              h('span', { className: 'mem-hint' }, t('profile.charCount', { n: profile.length, max: profileMax })),
               h('span', { className: 'mem-spacer' }),
-              profileDirty ? h('span', { className: 'mem-chip mem-chip-warn' }, '未保存') : null,
+              profileDirty ? h('span', { className: 'mem-chip mem-chip-warn' }, t('common.unsaved')) : null,
               h(
                 'button',
                 { type: 'button', className: 'mem-btn mem-btn-primary', onClick: () => void saveProfile(), disabled: savingProfile || !profileDirty },
-                savingProfile ? '保存中…' : '保存用户画像',
+                savingProfile ? t('common.saving') : t('profile.save'),
               ),
             ),
             h(Note, { kind: profileNote?.kind }, profileNote?.text),
@@ -1012,10 +1119,10 @@ window.__ModuleLoader__.load({
                       setDigestScope(event.target.value)
                       void loadDigest(event.target.value)
                     },
-                    'aria-label': '摘要范围',
+                    'aria-label': t('digest.scopeLabel'),
                   },
-                  h('option', { value: 'project' }, '当前项目'),
-                  h('option', { value: 'global' }, '全部项目'),
+                  h('option', { value: 'project' }, t('digest.scopeProject')),
+                  h('option', { value: 'global' }, t('digest.scopeGlobal')),
                 ),
                 h(DigestStatus, { digest: latest }),
               ),
@@ -1024,16 +1131,19 @@ window.__ModuleLoader__.load({
               ? h(
                   'dl',
                   { className: 'mem-kv' },
-                  h('dt', null, '生成于'),
+                  h('dt', null, t('digest.generatedLabel')),
                   h('dd', null, formatTime(latest.created_at)),
-                  h('dt', null, '规模'),
-                  h('dd', null, `${latest.actual_chars ?? 0} 字 · 约 ${latest.estimated_tokens ?? tokens} tokens`),
-                  h('dt', null, '预算'),
-                  h('dd', null, `${latest.requested_chars ?? 0} 字`),
-                  h('dt', null, '来源'),
-                  h('dd', null, `${latest.materials_chars ?? 0} 字材料${latest.generator ? ` · ${latest.generator}` : ''}`),
+                  h('dt', null, t('digest.size')),
+                  h('dd', null, t('digest.chars', {
+                    n: latest.actual_chars ?? 0,
+                    tokens: latest.estimated_tokens ?? tokens,
+                  })),
+                  h('dt', null, t('digest.budget')),
+                  h('dd', null, t('length.preset', { n: latest.requested_chars ?? 0 })),
+                  h('dt', null, t('digest.sourcesLabel')),
+                  h('dd', null, `${t('digest.materials', { n: latest.materials_chars ?? 0 })}${latest.generator ? ` · ${latest.generator}` : ''}`),
                 )
-              : h('p', { className: 'mem-hint' }, '还没有生成过记忆摘要。生成后，摘要会以锚点形式进入系统提示词。'),
+              : h('p', { className: 'mem-hint' }, t('digest.emptyHint')),
             h(
               'div',
               { className: 'mem-row' },
@@ -1052,7 +1162,7 @@ window.__ModuleLoader__.load({
                 },
                 t('digest.view'),
               ),
-              latest?.status === 'error' ? h('span', { className: 'mem-chip mem-chip-error' }, '上次生成失败') : null,
+              latest?.status === 'error' ? h('span', { className: 'mem-chip mem-chip-error' }, t('digest.lastFailed')) : null,
             ),
             h(Note, { kind: digestNote?.kind }, digestNote?.text),
 
@@ -1064,9 +1174,9 @@ window.__ModuleLoader__.load({
               'header',
               null,
               h('h3', { className: 'mem-title' }, t('memories.title')),
-              h('span', { className: 'mem-hint' }, `共 ${status?.memories ?? 0} 条`),
+              h('span', { className: 'mem-hint' }, t('memories.count', { total: status?.memories ?? 0 })),
             ),
-            h('p', { className: 'mem-hint' }, '记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。'),
+            h('p', { className: 'mem-hint' }, t('memories.hint')),
             h(
               'div',
               { className: 'mem-row' },
@@ -1086,7 +1196,7 @@ window.__ModuleLoader__.load({
             h(
               'p',
               { className: 'mem-hint' },
-              '备份是一个 Markdown 文件：可以直接阅读、编辑、放进自己的笔记系统，也可以用它恢复记忆库。恢复只会新增条目，不会删除现有记忆。',
+              t('backup.hint'),
             ),
             h(
               'div',
@@ -1094,12 +1204,12 @@ window.__ModuleLoader__.load({
               h(
                 'button',
                 { type: 'button', className: 'mem-btn', onClick: () => void exportBackup(), disabled: exporting },
-                exporting ? '正在导出…' : '导出 Markdown 备份',
+                exporting ? t('backup.exporting') : t('backup.export'),
               ),
               h(
                 'label',
                 { className: 'mem-btn', style: { display: 'inline-flex', alignItems: 'center' } },
-                '从 Markdown 恢复',
+                t('backup.restore'),
                 h('input', {
                   type: 'file',
                   accept: '.md,.markdown,text/markdown,text/plain',
@@ -1112,14 +1222,18 @@ window.__ModuleLoader__.load({
               ? h(
                   'div',
                   { className: 'mem-card', style: { background: 'var(--dsw-alias-bg-layer-2)' } },
-                  h('p', { className: 'mem-hint' }, `将导入 ${restorePreview.planned ?? 0} 条记忆${restorePreview.profile ? '，并恢复用户画像' : ''}。`),
+                  h('p', {
+                    className: 'mem-hint',
+                  }, t(restorePreview.profile ? 'backup.dryRunProfileLine' : 'backup.dryRun', {
+                    n: restorePreview.planned ?? 0,
+                  })),
                   h(
                     'div',
                     { className: 'mem-row' },
                     h(
                       'button',
                       { type: 'button', className: 'mem-btn mem-btn-primary', onClick: () => void applyRestore(), disabled: restoring },
-                      restoring ? '恢复中…' : '确认恢复',
+                      restoring ? t('backup.restoring') : t('backup.apply'),
                     ),
                     h(
                       'button',
@@ -1132,7 +1246,7 @@ window.__ModuleLoader__.load({
                         },
                         disabled: restoring,
                       },
-                      '取消',
+                      t('backup.cancel'),
                     ),
                   ),
                 )
@@ -1147,7 +1261,7 @@ window.__ModuleLoader__.load({
                 title: t('digest.viewerTitle', { scope: digestScope === 'global' ? t('digest.scopeGlobal') : t('digest.scopeProject') }),
                 onClose: () => setShowViewer(false),
                 footer: [
-                  h('span', { key: 'meta', className: 'mem-hint' }, `${formatTime(latest.created_at)} · ${latest.actual_chars ?? 0} 字`),
+                  h('span', { key: 'meta', className: 'mem-hint' }, `${formatTime(latest.created_at)} · ${t('length.preset', { n: latest.actual_chars ?? 0 })}`),
                   h('span', { key: 'spacer', className: 'mem-spacer' }),
                   h(
                     'button',
@@ -1157,12 +1271,12 @@ window.__ModuleLoader__.load({
                       className: 'mem-btn',
                       onClick: () => void navigator.clipboard?.writeText(latest.content ?? ''),
                     },
-                    '复制',
+                    t('common.copy'),
                   ),
-                  h('button', { key: 'close', type: 'button', className: 'mem-btn', onClick: () => setShowViewer(false) }, '关闭'),
+                  h('button', { key: 'close', type: 'button', className: 'mem-btn', onClick: () => setShowViewer(false) }, t('common.close')),
                 ],
               },
-              h('pre', { className: 'mem-pre' }, latest.content || '（摘要内容为空）'),
+              h('pre', { className: 'mem-pre' }, latest.content || t('digest.emptyBody')),
             )
           : null,
         showMemories ? h(MemoriesModal, { onClose: () => setShowMemories(false), onChanged: () => {
@@ -1204,7 +1318,7 @@ window.__ModuleLoader__.load({
           setTotal(result?.total ?? 0)
           setNote(null)
         } catch (error) {
-          setNote({ kind: 'error', text: `读取记忆失败：${error.message}` })
+          setNote({ kind: 'error', text: t('memories.loadFailed', { message: error.message }) })
         } finally {
           setBusy(false)
         }
@@ -1230,7 +1344,7 @@ window.__ModuleLoader__.load({
       async function save() {
         if (!selected || !draft) return
         if (!draft.summary.trim()) {
-          setNote({ kind: 'error', text: '记忆内容不能为空' })
+          setNote({ kind: 'error', text: t('memories.summaryRequired') })
           return
         }
         setBusy(true)
@@ -1246,12 +1360,12 @@ window.__ModuleLoader__.load({
           }
           if (draft.outcome) patch.outcome = draft.outcome
           const result = await api(ROUTE_MEMORIES, { action: 'update', memory_id: selected.memory_id, patch })
-          setNote({ kind: 'ok', text: '记忆已更新' })
+          setNote({ kind: 'ok', text: t('memories.updated') })
           setSelected(result?.memory ?? { ...selected, ...patch })
           onChanged()
           await load()
         } catch (error) {
-          setNote({ kind: 'error', text: `保存失败：${error.message}` })
+          setNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
         } finally {
           setBusy(false)
         }
@@ -1261,7 +1375,7 @@ window.__ModuleLoader__.load({
       async function toggleState() {
         if (!selected) return
         const archiving = selected.state !== 'archived'
-        if (archiving && !window.confirm('确定归档这条记忆吗？归档后默认检索不再返回它，但可以恢复。')) return
+        if (archiving && !window.confirm(t('memories.confirmForget'))) return
         setBusy(true)
         try {
           const result = await api(ROUTE_MEMORIES, {
@@ -1270,11 +1384,11 @@ window.__ModuleLoader__.load({
             reason: 'settings page',
           })
           setSelected(result?.memory ?? selected)
-          setNote({ kind: 'ok', text: archiving ? '已归档，可随时恢复' : '已恢复' })
+          setNote({ kind: 'ok', text: t(archiving ? 'memories.forgot' : 'memories.restored') })
           onChanged()
           await load()
         } catch (error) {
-          setNote({ kind: 'error', text: `操作失败：${error.message}` })
+          setNote({ kind: 'error', text: t('memories.opFailed', { message: error.message }) })
         } finally {
           setBusy(false)
         }
@@ -1289,14 +1403,14 @@ window.__ModuleLoader__.load({
           title: t('memories.title'),
           onClose,
           footer: [
-            h('span', { key: 'count', className: 'mem-hint' }, `共 ${total} 条`),
+            h('span', { key: 'count', className: 'mem-hint' }, t('memories.count', { total })),
             h('span', { key: 'spacer', className: 'mem-spacer' }),
             h('div', { key: 'pager', className: 'mem-pager' },
-              h('button', { type: 'button', className: 'mem-btn', disabled: busy || offset === 0, onClick: () => setOffset(Math.max(0, offset - limit)) }, '上一页'),
-              h('span', null, `第 ${page} / ${pages} 页`),
-              h('button', { type: 'button', className: 'mem-btn', disabled: busy || offset + limit >= total, onClick: () => setOffset(offset + limit) }, '下一页'),
+              h('button', { type: 'button', className: 'mem-btn', disabled: busy || offset === 0, onClick: () => setOffset(Math.max(0, offset - limit)) }, t('memories.prev')),
+              h('span', null, t('memories.pageOf', { page, pages })),
+              h('button', { type: 'button', className: 'mem-btn', disabled: busy || offset + limit >= total, onClick: () => setOffset(offset + limit) }, t('memories.next')),
             ),
-            h('button', { key: 'close', type: 'button', className: 'mem-btn', onClick: onClose }, '关闭'),
+            h('button', { key: 'close', type: 'button', className: 'mem-btn', onClick: onClose }, t('common.close')),
           ],
         },
         h(
@@ -1305,7 +1419,7 @@ window.__ModuleLoader__.load({
           h('input', {
             className: 'mem-input',
             type: 'search',
-            placeholder: '搜索记忆内容…',
+            placeholder: t('memories.searchPlaceholder'),
             value: query,
             onChange: (event) => {
               setQuery(event.target.value)
@@ -1322,16 +1436,16 @@ window.__ModuleLoader__.load({
                 setState(event.target.value)
                 setOffset(0)
               },
-              'aria-label': '状态',
+              'aria-label': t('memories.filterState'),
             },
-            h('option', { value: '' }, '全部状态'),
-            h('option', { value: 'active' }, '有效'),
-            h('option', { value: 'archived' }, '已归档'),
+            h('option', { value: '' }, t('memories.allStates')),
+            h('option', { value: 'active' }, t('memories.active')),
+            h('option', { value: 'archived' }, t('memories.archived')),
           ),
           h('input', {
             className: 'mem-input',
             type: 'text',
-            placeholder: '类型（如 decision）',
+            placeholder: t('memories.typePlaceholder'),
             value: eventType,
             onChange: (event) => {
               setEventType(event.target.value)
@@ -1350,9 +1464,9 @@ window.__ModuleLoader__.load({
                 setOffset(0)
               },
             }),
-            '全部项目',
+            t('memories.allProjects'),
           ),
-          h('button', { type: 'button', className: 'mem-btn', onClick: () => void load(), disabled: busy }, '刷新'),
+          h('button', { type: 'button', className: 'mem-btn', onClick: () => void load(), disabled: busy }, t('common.refresh')),
         ),
         h(Note, { kind: note?.kind }, note?.text),
         h(
@@ -1360,9 +1474,9 @@ window.__ModuleLoader__.load({
           { className: 'mem-split' },
           h(
             'div',
-            { className: 'mem-list', role: 'listbox', 'aria-label': '记忆条目' },
+            { className: 'mem-list', role: 'listbox', 'aria-label': t('status.memories') },
             items.length === 0
-              ? h('p', { className: 'mem-hint' }, busy ? '加载中…' : '没有符合条件的记忆')
+              ? h('p', { className: 'mem-hint' }, busy ? t('common.loading') : t('memories.emptyFiltered'))
               : items.map((item) =>
                   h(
                     'button',
@@ -1380,7 +1494,9 @@ window.__ModuleLoader__.load({
                       { className: 'mem-item-meta' },
                       h('span', { className: 'mem-mono' }, item.memory_id),
                       item.event_type ? h('span', null, item.event_type) : null,
-                      item.state ? h('span', null, item.state === 'archived' ? '已归档' : '有效') : null,
+                      item.state
+                        ? h('span', null, t(item.state === 'archived' ? 'memories.archived' : 'memories.active'))
+                        : null,
                       h('span', null, formatAge(item.created_at)),
                     ),
                   ),
@@ -1397,7 +1513,7 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'mem-chip' }, formatTime(selected.created_at)),
                 ),
                 h('label', { className: 'mem-field' },
-                  h('span', null, '内容'),
+                  h('span', null, t('memories.summary')),
                   h('textarea', {
                     className: 'mem-textarea',
                     value: draft.summary,
@@ -1406,7 +1522,7 @@ window.__ModuleLoader__.load({
                 ),
                 h('div', { className: 'mem-grid2' },
                   h('label', { className: 'mem-field' },
-                    h('span', null, `重要度（${draft.importance.toFixed(2)}）`),
+                    h('span', null, t('memories.importanceValue', { value: draft.importance.toFixed(2) })),
                     h('input', {
                       type: 'range',
                       className: 'mem-range',
@@ -1418,7 +1534,7 @@ window.__ModuleLoader__.load({
                     }),
                   ),
                   h('label', { className: 'mem-field' },
-                    h('span', null, '类型'),
+                    h('span', null, t('memories.eventType')),
                     h('input', {
                       className: 'mem-input',
                       type: 'text',
@@ -1427,17 +1543,17 @@ window.__ModuleLoader__.load({
                     }),
                   ),
                   h('label', { className: 'mem-field' },
-                    h('span', null, '结果'),
+                    h('span', null, t('memories.outcome')),
                     h('input', {
                       className: 'mem-input',
                       type: 'text',
                       value: draft.outcome,
-                      placeholder: 'success / failure / 留空',
+                      placeholder: t('memories.outcomePlaceholder'),
                       onChange: (event) => setDraft({ ...draft, outcome: event.target.value }),
                     }),
                   ),
                   h('label', { className: 'mem-field' },
-                    h('span', null, '标签（逗号分隔）'),
+                    h('span', null, t('memories.tagsLabel')),
                     h('input', {
                       className: 'mem-input',
                       type: 'text',
@@ -1447,12 +1563,12 @@ window.__ModuleLoader__.load({
                   ),
                 ),
                 h('div', { className: 'mem-row' },
-                  h('button', { type: 'button', className: 'mem-btn mem-btn-primary', onClick: () => void save(), disabled: busy }, '保存'),
+                  h('button', { type: 'button', className: 'mem-btn mem-btn-primary', onClick: () => void save(), disabled: busy }, t('common.save')),
                   h('button', { type: 'button', className: 'mem-btn mem-btn-danger', onClick: () => void toggleState(), disabled: busy },
-                    selected.state === 'archived' ? '恢复' : '归档'),
+                    t(selected.state === 'archived' ? 'memories.restore' : 'memories.forget')),
                 ),
               )
-            : h('p', { className: 'mem-hint' }, '从左侧选择一条记忆查看详情'),
+            : h('p', { className: 'mem-hint' }, t('memories.selectHint')),
         ),
       )
     }

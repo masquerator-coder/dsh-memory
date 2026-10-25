@@ -24,7 +24,8 @@
     "download": "下载",
     "keywords": "关键词",
     "search": "搜索",
-    "reset": "重置"
+    "reset": "重置",
+    "unsaved": "未保存"
   },
   "status": {
     "connected": "记忆库已连接",
@@ -38,7 +39,14 @@
     "home": "存储位置",
     "python": "Python",
     "pythonMissing": "找不到可用的 Python 解释器，请在插件配置中设置 pythonPath。",
-    "latency": "{ms} ms"
+    "latency": "{ms} ms",
+    "up": "已连接",
+    "checking": "检测中…",
+    "down": "未连接",
+    "unavailable": "记忆库不可用：{message}",
+    "digestBudget": "摘要预算",
+    "backend": "检索后端",
+    "degraded": "（降级）"
   },
   "length": {
     "title": "记忆摘要长度",
@@ -47,14 +55,19 @@
     "custom": "自定义",
     "customPlaceholder": "输入 1000 到 4000000 之间的字符数",
     "invalid": "请输入 {min} 到 {max} 之间的数字",
-    "current": "当前预算：{n} 字（约 {tokens} tokens）"
+    "current": "当前预算：{n} 字（约 {tokens} tokens）",
+    "saved": "摘要长度已保存",
+    "unit": "字"
   },
   "profile": {
     "title": "用户画像",
     "hint": "写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。记忆摘要与助手都会参考它，系统提示词里会提示模型可以查看画像。",
     "placeholder": "例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开",
     "charCount": "{n} / {max} 字",
-    "saved": "用户画像已保存"
+    "saved": "用户画像已保存",
+    "loadFailed": "读取用户画像失败：{message}",
+    "updatedAt": "更新于 {time}",
+    "save": "保存用户画像"
   },
   "digest": {
     "title": "记忆摘要",
@@ -78,7 +91,19 @@
     "failed": "生成失败：{message}",
     "scopeProject": "当前项目",
     "scopeGlobal": "全部项目",
-    "viewerTitle": "记忆摘要 · {scope}"
+    "viewerTitle": "记忆摘要 · {scope}",
+    "loadFailed": "读取摘要失败：{message}",
+    "generatingHint": "正在生成记忆摘要…这一步会调用模型，可能需要几十秒。",
+    "scopeLabel": "摘要范围",
+    "generatedLabel": "生成于",
+    "size": "规模",
+    "budget": "预算",
+    "sourcesLabel": "来源",
+    "materials": "{n} 字材料",
+    "emptyHint": "还没有生成过记忆摘要。生成后，摘要会以锚点形式进入系统提示词。",
+    "lastFailed": "上次生成失败",
+    "statusNone": "无",
+    "emptyBody": "（摘要内容为空）"
   },
   "memories": {
     "title": "记忆查看与编辑",
@@ -115,7 +140,16 @@
     "prev": "上一页",
     "next": "下一页",
     "selectHint": "从左侧选择一条记忆查看详情",
-    "summaryRequired": "记忆内容不能为空"
+    "summaryRequired": "记忆内容不能为空",
+    "hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。",
+    "loadFailed": "读取记忆失败：{message}",
+    "opFailed": "操作失败：{message}",
+    "pageOf": "第 {page} / {pages} 页",
+    "typePlaceholder": "类型（如 decision）",
+    "emptyFiltered": "没有符合条件的记忆",
+    "importanceValue": "重要度（{value}）",
+    "outcomePlaceholder": "success / failure / 留空",
+    "tagsLabel": "标签（逗号分隔）"
   },
   "backup": {
     "title": "备份与恢复",
@@ -128,16 +162,27 @@
     "preview": "预览恢复",
     "apply": "确认恢复",
     "cancel": "取消",
-    "dryRun": "将导入 {n} 条记忆",
+    "dryRun": "将导入 {n} 条记忆。",
     "dryRunProfile": "同时恢复用户画像",
     "done": "导入 {n} 条记忆，跳过 {skipped} 条",
     "restoredProfile": "用户画像已恢复",
     "noFile": "请选择一个 Markdown 文件",
-    "readFailed": "读取文件失败：{message}"
+    "readFailed": "读取文件失败：{message}",
+    "exportFailed": "导出失败：{message}",
+    "restoreFailed": "恢复失败：{message}",
+    "dryRunProfileLine": "将导入 {n} 条记忆，并恢复用户画像。",
+    "restoring": "恢复中…"
   },
   "errors": {
     "loadFailed": "加载失败：{message}",
     "saveFailed": "保存失败：{message}",
-    "unknown": "未知错误"
+    "unknown": "未知错误",
+    "badResponse": "{path} 返回了非 JSON 响应（HTTP {status}）"
+  },
+  "time": {
+    "justNow": "刚刚",
+    "minutesAgo": "{n} 分钟前",
+    "hoursAgo": "{n} 小时前",
+    "daysAgo": "{n} 天前"
   }
 }

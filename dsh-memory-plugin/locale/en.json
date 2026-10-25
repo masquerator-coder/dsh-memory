@@ -24,7 +24,8 @@
     "download": "Download",
     "keywords": "Keywords",
     "search": "Search",
-    "reset": "Reset"
+    "reset": "Reset",
+    "unsaved": "Unsaved"
   },
   "status": {
     "connected": "Memory store connected",
@@ -38,7 +39,14 @@
     "home": "Storage",
     "python": "Python",
     "pythonMissing": "No usable Python interpreter was found. Set pythonPath in the plugin configuration.",
-    "latency": "{ms} ms"
+    "latency": "{ms} ms",
+    "up": "Connected",
+    "checking": "Checking…",
+    "down": "Disconnected",
+    "unavailable": "Memory store unavailable: {message}",
+    "digestBudget": "Digest budget",
+    "backend": "Retrieval backend",
+    "degraded": "(degraded)"
   },
   "length": {
     "title": "Digest length",
@@ -47,19 +55,24 @@
     "custom": "Custom",
     "customPlaceholder": "Enter a value between 1000 and 4000000",
     "invalid": "Enter a number between {min} and {max}",
-    "current": "Current budget: {n} chars (about {tokens} tokens)"
+    "current": "Current budget: {n} chars (about {tokens} tokens)",
+    "saved": "Digest length saved",
+    "unit": "chars"
   },
   "profile": {
     "title": "User profile",
     "hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",
     "placeholder": "For example:\n- Answer in Chinese, comment code in Chinese\n- Mostly TypeScript and Python\n- Prefer the conclusion first, then the detail",
     "charCount": "{n} / {max} chars",
-    "saved": "User profile saved"
+    "saved": "User profile saved",
+    "loadFailed": "Could not read the user profile: {message}",
+    "updatedAt": "Updated {time}",
+    "save": "Save profile"
   },
   "digest": {
     "title": "Memory digest",
-    "generate": "记忆摘要生成",
-    "view": "查看记忆摘要",
+    "generate": "Generate digest",
+    "view": "View digest",
     "generating": "Generating the digest…",
     "generated": "Digest updated",
     "generatedAt": "Generated {time}",
@@ -78,11 +91,23 @@
     "failed": "Generation failed: {message}",
     "scopeProject": "This project",
     "scopeGlobal": "All projects",
-    "viewerTitle": "Memory digest · {scope}"
+    "viewerTitle": "Memory digest · {scope}",
+    "loadFailed": "Could not read the digest: {message}",
+    "generatingHint": "Generating the digest… this calls the model and can take a few tens of seconds.",
+    "scopeLabel": "Digest scope",
+    "generatedLabel": "Generated",
+    "size": "Size",
+    "budget": "Budget",
+    "sourcesLabel": "Sources",
+    "materials": "{n} chars of material",
+    "emptyHint": "No digest has been generated yet. Once generated, it enters the system prompt as an anchor.",
+    "lastFailed": "The last generation failed",
+    "statusNone": "None",
+    "emptyBody": "(the digest is empty)"
   },
   "memories": {
     "title": "Browse and edit memories",
-    "open": "记忆查看与编辑",
+    "open": "Browse and edit memories",
     "count": "{total} entries",
     "filterState": "State",
     "allStates": "All states",
@@ -115,7 +140,16 @@
     "prev": "Previous",
     "next": "Next",
     "selectHint": "Pick an entry on the left to see its details",
-    "summaryRequired": "Memory content cannot be empty"
+    "summaryRequired": "Memory content cannot be empty",
+    "hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone).",
+    "loadFailed": "Could not load memories: {message}",
+    "opFailed": "Action failed: {message}",
+    "pageOf": "Page {page} / {pages}",
+    "typePlaceholder": "Type (e.g. decision)",
+    "emptyFiltered": "No memories match these filters",
+    "importanceValue": "Importance ({value})",
+    "outcomePlaceholder": "success / failure / leave empty",
+    "tagsLabel": "Tags (comma separated)"
   },
   "backup": {
     "title": "Backup and restore",
@@ -128,16 +162,27 @@
     "preview": "Preview restore",
     "apply": "Restore now",
     "cancel": "Cancel",
-    "dryRun": "{n} memories will be imported",
+    "dryRun": "{n} memories will be imported.",
     "dryRunProfile": "The user profile will be restored too",
     "done": "Imported {n} memories, skipped {skipped}",
     "restoredProfile": "User profile restored",
     "noFile": "Choose a Markdown file first",
-    "readFailed": "Could not read the file: {message}"
+    "readFailed": "Could not read the file: {message}",
+    "exportFailed": "Export failed: {message}",
+    "restoreFailed": "Restore failed: {message}",
+    "dryRunProfileLine": "{n} memories will be imported, and the user profile will be restored.",
+    "restoring": "Restoring…"
   },
   "errors": {
     "loadFailed": "Could not load: {message}",
     "saveFailed": "Could not save: {message}",
-    "unknown": "Unknown error"
+    "unknown": "Unknown error",
+    "badResponse": "{path} returned a non-JSON response (HTTP {status})"
+  },
+  "time": {
+    "justNow": "just now",
+    "minutesAgo": "{n} min ago",
+    "hoursAgo": "{n} h ago",
+    "daysAgo": "{n} d ago"
   }
 }
