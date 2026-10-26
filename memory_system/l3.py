@@ -21,7 +21,6 @@ Retrieval lives in :mod:`memory_system.retrieval`; community summarization in
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 import uuid
 from dataclasses import dataclass, field, replace
@@ -1337,7 +1336,3 @@ def _like_literal(text: str) -> str:
     character the query declares via ``ESCAPE '\\'``.
     """
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def edge_signature(head: str, relation: str, tail: str) -> str:
-    return hashlib.sha1(f"{head}|{relation}|{tail}".encode("utf-8")).hexdigest()[:16]
