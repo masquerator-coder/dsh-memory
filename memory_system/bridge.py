@@ -307,6 +307,22 @@ def _refresh_project_summary(memory: MemorySystem, project_id: str) -> None:
         pass
 
 
+def _register_project(memory: MemorySystem, payload: dict[str, Any]) -> str:
+    """Resolve the payload's project and record the root that owns its file.
+
+    ``memory.remember`` registers the project id but knows nothing about the
+    checkout it belongs to, so a write routed through this function has no
+    ``root_path`` and the project summary cannot be written. Registering it
+    here is what makes "read ``DSH_MEMORY.md`` at session start" hold after a
+    ``memory_add`` that never touched ``projects`` or ``status`` first.
+    """
+    project = _project(payload)
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=resolve_project_root(payload.get("cwd"))
+    )
+    return project
+
+
 def _bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
@@ -590,7 +606,7 @@ def cmd_memory_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
 
 @command("memory.remember")
 def cmd_memory_remember(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    project = _project(payload)
+    project = _register_project(memory, payload)
     summary = str(payload.get("summary") or "").strip()
     if not summary:
         raise BridgeError("bad_request", "summary is required")
@@ -678,11 +694,7 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
             "dedupe_key": dedupe_key,
             "project_id": project,
         }
-    memory.ensure_project(
-        project,
-        display_name=payload.get("display_name"),
-        root_path=resolve_project_root(payload.get("cwd")),
-    )
+    _register_project(memory, payload)
     report: dict[str, Any] = {}
     result = memory.remember(
         project_id=project,

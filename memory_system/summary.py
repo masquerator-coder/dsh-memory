@@ -878,7 +878,13 @@ def _project_summary_markdown(memory: MemorySystem, project: Any) -> str:
         (project.project_id, *NON_WORK_EVENT_TYPES, PROJECT_SUMMARY_MAX_ITEMS),
     )
     display = project.display_name or project.project_id
-    updated = _iso_now()[:19].replace("T", " ")
+    # The stamp describes the newest work record, not the moment this function
+    # ran: with a wall-clock stamp every ``digest.commit`` rewrote the file even
+    # when no memory had changed, and the "unchanged -> skip" guard below could
+    # never fire.
+    updated = (
+        _normalize_iso(str(rows[0]["created_at"]))[:19].replace("T", " ") if rows else "（无）"
+    )
     lines = [
         PROJECT_SUMMARY_MARKER,
         f"# 项目摘要：{display}",

@@ -227,6 +227,64 @@ def test_commit_writes_each_project_root_markdown(service: DigestService, memory
     assert kept["memory_id"] != gone["memory_id"]
 
 
+def test_bridge_memory_add_refreshes_the_project_markdown(tmp_path: Path):
+    """A write through the bridge must update the checkout's own file.
+
+    ``memory.remember`` registers the project id but knows nothing about the
+    checkout, so without registering ``root_path`` first the project summary
+    was skipped and ``DSH_MEMORY.md`` only caught up when some other command
+    happened to pass through — while ``AGENTS.md`` tells every session to read
+    it first.
+    """
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+
+    remembered = handle(
+        {
+            "id": "1",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(repo), "summary": "接入了记忆工具", "event_type": "note"},
+        }
+    )
+    assert remembered["ok"], remembered
+    content = (repo / PROJECT_SUMMARY_FILE).read_text(encoding="utf-8")
+    assert "接入了记忆工具" in content
+
+
+def test_project_markdown_stamp_follows_the_newest_record(tmp_path: Path):
+    """The header time is the newest memory, not the moment the file was written.
+
+    A wall-clock stamp made every ``digest.commit`` rewrite the file even when
+    nothing had changed, which defeats the unchanged-file guard.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    memory = MemorySystem(MemoryConfig.for_home(tmp_path / "home"))
+    try:
+        memory.ensure_project("proj-stamp", display_name="Stamp", root_path=str(root))
+        memory.remember(project_id="proj-stamp", summary="第一条", event_type="note")
+        DigestService(memory).write_project_summaries(project_id="proj-stamp")
+        path = root / PROJECT_SUMMARY_FILE
+        first = path.read_text(encoding="utf-8")
+
+        # Nothing new was written: a later commit must leave the file alone.
+        DigestService(memory).commit(text="## 全局\n新摘要")
+        assert path.read_text(encoding="utf-8") == first
+
+        memory.remember(project_id="proj-stamp", summary="第二条", event_type="note")
+        DigestService(memory).write_project_summaries(project_id="proj-stamp")
+        second = path.read_text(encoding="utf-8")
+        assert second != first
+        assert "第二条" in second
+        stamp = memory.store.query_one(
+            "SELECT created_at FROM l2_episodes ORDER BY ord DESC LIMIT 1"
+        )["created_at"]
+        assert stamp[:19].replace("T", " ") in second
+    finally:
+        memory.close()
+
+
 def test_bridge_project_registration_creates_the_markdown_file(tmp_path: Path):
     repo = tmp_path / "checkout"
     (repo / ".git").mkdir(parents=True)
