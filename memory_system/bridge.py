@@ -43,6 +43,7 @@ from .config import MemoryConfig
 from .errors import MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
 from .l3 import FactInput
+from .l4 import Skill, SkillDefinition, render_index_line
 from .summary import (
     AUTO_MODE,
     DEFAULT_LENGTH,
@@ -710,6 +711,180 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
         "dedupe_key": dedupe_key,
         "project_id": project,
     }
+
+
+# ── L4: project skills ──────────────────────────────────────────────────
+#
+# Project-scope only. Nothing here may see or touch another project's skills:
+# the scope isolation of the design is enforced by the registry, and these
+# commands never widen it (``org``/``sys`` stays a user decision).
+
+
+def _skill_actor(payload: dict[str, Any]) -> str:
+    return "model" if _bool(payload.get("model_authored")) else "user"
+
+
+def _skill_name(payload: dict[str, Any]) -> str:
+    """The skill a command names, rejecting the empty string before the store."""
+    name = str(payload.get("skill") or payload.get("skill_id") or "").strip()
+    if not name:
+        raise BridgeError("bad_request", "skill is required")
+    return name
+
+
+def _skill_definition(payload: dict[str, Any]) -> SkillDefinition:
+    raw = payload.get("definition")
+    if not isinstance(raw, dict):
+        raise BridgeError("bad_request", "definition must be an object")
+    if "steps" not in raw:
+        raise BridgeError("bad_request", "definition.steps is required")
+    return SkillDefinition.from_dict(raw)
+
+
+def _skill_misc_flags(skill: Skill) -> dict[str, Any]:
+    """Non-visibility bookkeeping a hand-over needs to act on."""
+    return {
+        "tier": skill.tier,
+        "description": skill.definition.description,
+        "when_to_use": skill.definition.when_to_use,
+        "triggers": list(skill.definition.triggers),
+        "intent_labels": list(skill.definition.intent_labels),
+        "requires_tools": list(skill.definition.requires_tools),
+        "steps": [f"{s.tool}: {s.action}" if s.tool else s.action for s in skill.definition.steps],
+    }
+
+
+@command("skill.index")
+def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """The resident index: one line per visible skill, no steps (design §6.5).
+
+    Read-only. The host renders this into the system prompt, so it must cost
+    one query and must never create, retire or re-tier anything.
+    """
+    project = _project(payload)
+    view = memory.view(project)
+    # ``level1_index`` is the hot tier, which only ``refresh_tiers`` fills, and
+    # that runs off the request path. A project whose skills were never scored
+    # would then show an empty index while `skill.list` showed the skills, so
+    # the wrapper falls back to every visible skill and lets the attention
+    # budget, not the tier column, decide what fits.
+    lines = memory.skills.level1_index(view)
+    if not lines:
+        lines = [render_index_line(s) for s in memory.skills.visible(view, include_cold=True)]
+    return {
+        "project_id": project,
+        "index": lines,
+        "stats": memory.skills.stats(view),
+    }
+
+
+@command("skill.list")
+def cmd_skill_list(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Every skill this project can see, project scope first."""
+    project = _project(payload)
+    skills = memory.skills.visible(memory.view(project), include_cold=True)
+    return {
+        "project_id": project,
+        "items": [{**s.to_dict(), **_skill_misc_flags(s)} for s in skills],
+        "stats": memory.skills.stats(memory.view(project)),
+    }
+
+
+@command("skill.create")
+def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Create a project-scope skill.
+
+    ``model_authored`` marks the write as the agent saving a procedure it just
+    used: unaudited, active immediately. A user-authored skill keeps the old
+    review path (``candidate`` by default) unless it asks for ``active``.
+    """
+    project = _project(payload)
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(project, root_path=root)
+    definition = _skill_definition(payload)
+    name = payload.get("name")
+    name = str(name).strip() if name else None
+    scope_kind = str(payload.get("scope_kind") or "project")
+    if scope_kind != "project":
+        raise BridgeError(
+            "bad_request",
+            f"scope_kind {scope_kind!r} is not writable from a session; only 'project' skills "
+            "can be created here (org/sys promotion stays a user decision)",
+        )
+    if _bool(payload.get("model_authored")):
+        if payload.get("max_active") is None:
+            result = memory.add_project_skill(project_id=project, definition=definition, name=name)
+        else:
+            result = memory.add_project_skill(
+                project_id=project,
+                definition=definition,
+                name=name,
+                max_active=int(payload["max_active"]),
+            )
+    else:
+        status = str(payload.get("status") or "candidate")
+        if status not in ("candidate", "draft", "active"):
+            raise BridgeError("bad_request", f"status {status!r} is not one of candidate/draft/active")
+        result = memory.add_skill(
+            project_id=project,
+            definition=definition,
+            name=name or definition.title,
+            status=status,
+        )
+        result = {"created": status == "active", "reused": False, "skill": result["skill"]}
+    return {"project_id": project, "actor": _skill_actor(payload), **_jsonable(result)}
+
+
+@command("skill.get")
+def cmd_skill_get(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Level-3 disclosure: the full definition of one visible skill."""
+    project = _project(payload)
+    name_or_id = _skill_name(payload)
+    skill = memory.skills.find(name_or_id, memory.view(project))
+    return {
+        "project_id": project,
+        "skill": skill.to_dict(),
+        "definition": skill.definition.to_dict(),
+        "markdown": memory.skills.level3_definition(memory.view(project), skill.skill_id),
+    }
+
+
+@command("skill.run")
+def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Record one execution of a skill (feeds success rate and retirement)."""
+    project = _project(payload)
+    name_or_id = _skill_name(payload)
+    outcome = str(payload.get("outcome") or "success")
+    success = payload.get("success")
+    return {
+        "project_id": project,
+        **memory.record_skill_run(
+            project_id=project,
+            skill=name_or_id,
+            outcome=outcome,
+            success=None if success is None else _bool(success),
+            error=payload.get("error"),
+            deviation=payload.get("deviation"),
+        ),
+    }
+
+
+@command("skill.retire")
+def cmd_skill_retire(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Retire a skill this project owns. Retired rows are kept, never deleted."""
+    project = _project(payload)
+    name_or_id = _skill_name(payload)
+    view = memory.view(project)
+    skill = memory.skills.find(name_or_id, view)
+    mine = skill.scope_kind == "project" and skill.scope_ref == project
+    if not mine and _skill_actor(payload) != "user":
+        raise BridgeError(
+            "bad_request",
+            f"{skill.qualified_name} is not a skill of project {project}; "
+            "only the user can retire an org/sys skill",
+        )
+    retired = memory.skills.retire(skill.skill_id, reason=str(payload.get("reason") or "tool request"))
+    return {"project_id": project, "skill": retired.to_dict()}
 
 
 # ── backup / restore ────────────────────────────────────────────────────

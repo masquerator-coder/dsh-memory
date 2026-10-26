@@ -23,6 +23,11 @@
         autoSummaryDelayMs: 15000
         # Inject the memory anchor block into the system prompt.
         systemPromptAnchor: true
+        # Inject the project's L4 skill index (one line per available skill).
+        skillIndex: true
+        # Tell the model when it may save a tested, reusable procedure as a
+        # project-scope skill via `skill_create`.
+        skillAuthoring: true
         # Model steps between memory reminders; 0 disables the heartbeat.
         heartbeatSteps: 20
         # Ask the model once, at session teardown, for anything still unwritten.

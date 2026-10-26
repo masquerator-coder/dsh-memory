@@ -121,6 +121,35 @@ export function formatListing(result) {
 }
 
 /**
+ * Render one skill `skill.list` item as a single review line.
+ * @param {any} skill - item from the bridge.
+ * @returns {string} `- name · status · trigger · description`.
+ */
+function skillLine(skill) {
+  const trigger = (skill.triggers ?? []).slice(0, 2).join('|')
+  const flags = [skill.scope, skill.status, skill.tier].filter(Boolean).join(' · ')
+  return `- \`${skill.qualified_name}\`（${flags}）${trigger ? `触发：${trigger} ` : ''}${skill.description ?? ''}`
+}
+
+/**
+ * Render a `skill.list` result, project scope first.
+ * @param {any} result - bridge `skill.list` result.
+ * @returns {string} formatted text.
+ */
+export function formatSkillList(result) {
+  const items = Array.isArray(result?.items) ? result.items : []
+  if (items.length === 0) return '当前项目还没有任何技能。'
+  const rank = { project: 3, org: 2, sys: 1 }
+  const ordered = [...items].sort((a, b) => (rank[b.scope] ?? 0) - (rank[a.scope] ?? 0))
+  const active = ordered.filter((item) => item.status === 'active')
+  const others = ordered.filter((item) => item.status !== 'active')
+  const lines = [`共 ${items.length} 个技能（active ${active.length} 个）：`]
+  lines.push(...active.map(skillLine))
+  if (others.length > 0) lines.push(`候选/已退役 ${others.length} 个：`, ...others.map(skillLine))
+  return lines.join('\n')
+}
+
+/**
  * Compile one author-DSL property into a JSON Schema node.
  *
  * The DSL marks requiredness with `required: true` on the property itself; a
@@ -346,6 +375,162 @@ export function buildTools({ call, projectFor, generateDigest }) {
         return textOutput(
           `全局摘要已更新（\`${digest.digest_id}\`，${digest.actual_chars} 字，约 ${digest.estimated_tokens} tokens）。`,
         )
+      },
+    },
+    {
+      name: 'skill_create',
+      description:
+        '把一个刚被验证过的程序性做法存成**本项目**的技能（步骤 + 触发词），下次遇到同类任务时它会出现在技能索引里。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。',
+      parameters: {
+        title: { type: 'string', required: true, description: '技能名，简短可区分，如「定位失败的测试」。' },
+        description: { type: 'string', required: true, description: '一句话说明这个技能做什么，不超过 30 字。' },
+        when_to_use: { type: 'string', required: true, description: '什么时候该用：具体条件，不要只写「需要时」。' },
+        triggers: {
+          type: 'array',
+          description: '2-4 个触发关键词，用户提出同类任务时会命中；同类技能之间应互斥。',
+          items: { type: 'string' },
+        },
+        steps: {
+          type: 'array',
+          required: true,
+          description: '按执行顺序排列的步骤，每条一句话、用祈使句；关键步骤标 critical。',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              action: { type: 'string' },
+              tool: { type: 'string', description: '这一步主要用到的工具名，可省略。' },
+              args_hint: { type: 'string', description: '参数写法提示，可省略。' },
+              critical: { type: 'boolean' },
+            },
+          },
+        },
+        requires_tools: {
+          type: 'array',
+          description: '执行前提用到的工具名；缺少这些工具时该技能不会被推荐。',
+          items: { type: 'string' },
+        },
+        success_criteria: { type: 'string', description: '怎样算做完，可省略。' },
+        fallback: { type: 'string', description: '失败时怎么回退，可省略。' },
+      },
+      async execute(args, exec) {
+        const steps = (Array.isArray(args.steps) ? args.steps : [])
+          .map((step) => ({
+            action: typeof step?.action === 'string' ? step.action : '',
+            tool: step?.tool,
+            args_hint: step?.args_hint,
+            critical: step?.critical === true,
+          }))
+          .filter((step) => step.action.trim().length > 0)
+        const result = await call(
+          'skill.create',
+          {
+            project_id: await requireProject(exec),
+            model_authored: true,
+            definition: {
+              title: args.title,
+              description: args.description,
+              when_to_use: args.when_to_use,
+              triggers: Array.isArray(args.triggers) ? args.triggers : [],
+              steps,
+              requires_tools: Array.isArray(args.requires_tools) ? args.requires_tools : [],
+              success_criteria: args.success_criteria,
+              fallback: args.fallback,
+            },
+          },
+          exec?.signal,
+        )
+        const skill = result?.skill ?? {}
+        if (result?.reused) {
+          // The registry refuses near-duplicates: say so instead of claiming a
+          // new skill, because the model's next move is to update that one.
+          return textOutput(
+            `已存在相似技能 \`${skill.qualified_name}\`（相似度 ${result.similarity}），未新建。`,
+          )
+        }
+        return textOutput(
+          `已创建项目技能 \`${skill.qualified_name}\`（${skill.step_count} 步）。下一个回合起它会出现在技能索引里；执行后可用 skill_run 记录结果，做法过时用 skill_retire 退役。`,
+        )
+      },
+    },
+    {
+      name: 'skill_list',
+      description:
+        '列出当前项目可用的技能：项目技能 + 组织/系统级技能，含状态与触发词。新建技能前先用它确认没有同类技能。',
+      parameters: {},
+      output: TEXT_OUTPUT,
+      isConcurrencySafe: () => true,
+      async execute(_args, exec) {
+        const result = await call('skill.list', { project_id: await requireProject(exec) }, exec?.signal)
+        return textOutput(formatSkillList(result))
+      },
+    },
+    {
+      name: 'skill_get',
+      description: '读取一个技能的完整定义（全部步骤、前置条件、成功标准）。索引里只有一行摘要，执行前需要细节时调用。',
+      parameters: {
+        skill: { type: 'string', required: true, description: '技能名（如「定位失败的测试」）或 skill_id。' },
+      },
+      output: TEXT_OUTPUT,
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        const result = await call(
+          'skill.get',
+          { project_id: await requireProject(exec), skill: args.skill },
+          exec?.signal,
+        )
+        return textOutput(result?.markdown || `未找到技能 ${args.skill}。`)
+      },
+    },
+    {
+      name: 'skill_run',
+      description:
+        '记录一次技能执行的结果。技能被真正按步骤用过之后调用，用于成功率与自动退役；只是看一眼技能不要调用。',
+      parameters: {
+        skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
+        outcome: { type: 'string', description: 'success / failure / partial，默认 success。' },
+        error: { type: 'string', description: '失败原因，可省略。' },
+        deviation: { type: 'string', description: '步骤偏离说明，可省略。' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args, exec) {
+        const result = await call(
+          'skill.run',
+          {
+            project_id: await requireProject(exec),
+            skill: args.skill,
+            outcome: args.outcome || 'success',
+            error: args.error,
+            deviation: args.deviation,
+          },
+          exec?.signal,
+        )
+        return textOutput(
+          `已记录执行 \`${result?.run_id ?? '?'}\`，当前成功率 ${result?.success_rate ?? '?'}。`,
+        )
+      },
+    },
+    {
+      name: 'skill_retire',
+      description:
+        '退役一个**本项目**的技能：做法过时、被更好的做法替代、或用户明确说不要时使用。退役是软删除，记录保留可恢复；org/sys 级技能只有用户能退役。',
+      parameters: {
+        skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
+        reason: { type: 'string', description: '退役原因。' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args, exec) {
+        const result = await call(
+          'skill.retire',
+          {
+            project_id: await requireProject(exec),
+            skill: args.skill,
+            reason: args.reason || 'tool request',
+            model_authored: true,
+          },
+          exec?.signal,
+        )
+        return textOutput(`已退役 \`${result?.skill?.qualified_name ?? args.skill}\`，记录保留可恢复。`)
       },
     },
   ]

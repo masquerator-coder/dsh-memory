@@ -26,13 +26,34 @@ export const TOOL_NAMES = [
   'memory_profile_read',
   'memory_digest_read',
   'memory_digest_generate',
+  'skill_create',
+  'skill_list',
+  'skill_get',
+  'skill_run',
+  'skill_retire',
 ]
 
 /** Prompt section order: after the built-in tool docs, before the persona. */
 const ANCHOR_ORDER = 9500
 
+/** L4 index order: right after the memory anchor, still before the persona. */
+const SKILL_INDEX_ORDER = 9510
+
 /** How long an anchor stays usable before it is refreshed. */
 const ANCHOR_REFRESH_MS = 15_000
+
+/** How long the project's skill index stays usable before it is re-read. */
+const SKILL_REFRESH_MS = 30_000
+
+/**
+ * Skills one project may hold before the model must retire or merge one.
+ *
+ * The design's ceiling is 200, which is the right bound for a long-lived
+ * registry but far past what a model should ever create through a tool call:
+ * every project-scope skill competes for the Level-1 index and the model's
+ * attention. Two dozen is already generous for "worth keeping procedures".
+ */
+const MODEL_SKILL_CAP = 24
 
 /** Default configuration; the row's YAML may override any field. */
 const DEFAULTS_INNER = {
@@ -49,6 +70,10 @@ const DEFAULTS_INNER = {
   autoSummary: true,
   autoSummaryDelayMs: 15000,
   systemPromptAnchor: true,
+  // Project-scope L4 skills: the resident index block, and whether the model
+  // is told when it may save a procedure as a new skill.
+  skillIndex: true,
+  skillAuthoring: true,
   // Model steps between memory reminders; 0 disables the heartbeat.
   heartbeatSteps: 20,
   // Ask the model once, at session teardown, for anything still unwritten.
@@ -594,7 +619,7 @@ export function apply(ctx, rawConfig) {
     // attempt, so wrapping here keeps `tools.js` a pure schema+execute module.
     // A duplicate rejected by the memory store still counts: the model did its
     // part, and re-reminding it about the same insight is noise.
-    const registered =
+    const wrapped =
       definition.name === 'memory_add'
         ? {
             ...definition,
@@ -607,8 +632,46 @@ export function apply(ctx, rawConfig) {
             },
           }
         : definition
+    // Skill creation has the same shape of seam: the per-session guard in the
+    // prompt only needs to know that the model tried to save a procedure.
+    const registered =
+      wrapped.name === 'skill_create'
+        ? {
+            ...wrapped,
+            async execute(args, exec) {
+              try {
+                return await wrapped.execute(args, exec)
+              } finally {
+                noteSkillCreate(sessionIdOf(exec))
+              }
+            },
+          }
+        : wrapped
     ctx.effect(() => ctx.tools.register(registered), `dsh-memory.tool(${registered.name})`)
   }
+
+  // ── L4: project skills ───────────────────────────────────────────────
+
+  /**
+   * Skills created from this process.
+   *
+   * Deliberately in-memory and deliberately not a record of what exists: the
+   * project's skills are whatever the next `skill.index` reads back from the
+   * store. This only paces the model ("one new skill per session, more only
+   * when the user asks"), so losing it on restart costs nothing.
+   */
+  const skillsCreated = new Map()
+
+  /**
+   * Count one skill the model just tried to save.
+   * @param {string | undefined} sessionId - the creating session.
+   */
+  function noteSkillCreate(sessionId) {
+    if (!sessionId) return
+    skillsCreated.set(sessionId, (skillsCreated.get(sessionId) ?? 0) + 1)
+  }
+
+  ctx.effect(() => () => skillsCreated.clear(), 'dsh-memory.skill-state')
 
   // ── system prompt anchor ──────────────────────────────────────────────
 
@@ -703,6 +766,100 @@ export function apply(ctx, rawConfig) {
           },
         }),
       'dsh-memory.anchor-section',
+    )
+  }
+
+  // ── L4: skill index section ───────────────────────────────────────────
+
+  if (config.skillIndex || config.skillAuthoring) {
+    /**
+     * Index text per working directory, refreshed off the assembly path.
+     *
+     * Same trade as the memory anchor: assembly is synchronous, so a stale-by-
+     * seconds index beats a prompt that waits on the Python child. The slot is
+     * stamped with the moment the refresh *started*, so a long read cannot
+     * make the cache look fresh for longer than it is.
+     */
+    const skillCaches = new Map()
+
+    /** @param {string} cwd - session working directory, '' when unknown. */
+    function skillSlot(cwd) {
+      const key = cwd || ''
+      let slot = skillCaches.get(key)
+      if (!slot) {
+        slot = { at: 0, text: '', pending: false }
+        skillCaches.set(key, slot)
+      }
+      return slot
+    }
+
+    /**
+     * Start a read of this project's skill index when the cached one aged.
+     * @param {string | undefined} cwd - session working directory.
+     */
+    function refreshSkillIndex(cwd) {
+      const slot = skillSlot(cwd || '')
+      if (slot.pending) return
+      if (slot.at > 0 && Date.now() - slot.at < SKILL_REFRESH_MS) return
+      slot.at = Date.now()
+      slot.pending = true
+      void (async () => {
+        try {
+          const projectId = await projectFor(cwd)
+          if (!projectId) return
+          const result = await call('skill.index', { project_id: projectId })
+          const lines = Array.isArray(result?.index) ? result.index : []
+          slot.text = lines.join('\n')
+        } catch (error) {
+          logger.warn(`[dsh-memory] skill index refresh failed: ${error?.message ?? error}`)
+        } finally {
+          slot.pending = false
+        }
+      })()
+    }
+
+    /**
+     * The guidance for one assembly: what the project can already do, and when
+     * saving a new procedure is allowed.
+     * @param {string | undefined} sessionId - the assembling session.
+     * @param {string | undefined} cwd - the session's working directory.
+     * @returns {string} the skill block, or '' when there is nothing to say.
+     */
+    function skillBlock(sessionId, cwd) {
+      const slot = skillCaches.get(cwd ?? '')
+      const index = slot?.text?.trim() ?? ''
+      const created = skillsCreated.get(sessionId ?? '') ?? 0
+      const parts = []
+      if (config.skillIndex) {
+        parts.push(SKILL_INDEX_HEADER.replace('{{skill_index}}', index || SKILL_INDEX_EMPTY))
+        // `0` is not a literal cap: the first skill of a session is the one
+        // most likely to be worth keeping, and the user can ask for more.
+        if (config.skillAuthoring) {
+          const pace =
+            created === 0
+              ? SKILL_AUTHORING_RULE
+              : SKILL_AUTHORING_PACED.replace('{{count}}', String(created))
+          parts.push(`${pace}\n${SKILL_AUTHORING_CAP.replace('{{cap}}', String(MODEL_SKILL_CAP))}`)
+        }
+      }
+      return `\n\n${parts.join('\n\n')}`
+    }
+
+    ctx.effect(
+      () =>
+        ctx.systemPrompt.section({
+          name: 'dsh-memory:skills',
+          order: SKILL_INDEX_ORDER,
+          interpolate: false,
+          text: (context) => {
+            const session = context?.agent?.session
+            const cwd = session?.header?.cwd
+            rememberCwd(cwd)
+            refreshSkillIndex(cwd)
+            return skillBlock(session?.id, cwd)
+          },
+        }),
+      'dsh-memory.skill-section',
     )
   }
 
@@ -1068,3 +1225,48 @@ const ANCHOR_HEADER = [
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
 export const DEFAULTS = Object.freeze({ ...DEFAULTS_INNER })
+
+/**
+ * The skill index block: what this project already knows how to do.
+ * `{{skill_index}}` is replaced with the Python-rendered Level-1 lines.
+ */
+const SKILL_INDEX_HEADER = [
+  '## 技能（本项目的程序性记忆）',
+  '下面是本项目已保存的可用技能，一行一个，只有触发条件与作用，不含步骤：',
+  '',
+  '{{skill_index}}',
+  '',
+  '执行某个技能前先 `skill_get` 读完整步骤；正文细节不要凭索引里的摘要臆测。',
+].join('\n')
+
+/** Shown when the project has no skills yet. */
+const SKILL_INDEX_EMPTY = '（本项目还没有技能。遇到可复用的做法时，可以用 `skill_create` 存一个。）'
+
+/**
+ * When saving a procedure is allowed.
+ *
+ * This is the whole anti-noise policy: the cost of a bad skill is not disk, it
+ * is the model reading and trusting a wrong procedure next time, so the bar is
+ * "tested and reusable", not "plausible".
+ */
+const SKILL_AUTHORING_RULE = [
+  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。',
+  '同时满足下面全部条件才值得存：',
+  '- 这次任务中，这套步骤**真的被执行过并验证成功**（不是设想、不是只读过代码）；',
+  '- 同类任务**大概率会再来**，步骤基本可复用；',
+  '- 步骤里有**具体动作与顺序**（改了哪个模块、跑了什么命令、按什么顺序验证），不是“仔细阅读代码”这类空话；',
+  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。',
+  '不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。',
+].join('\n')
+
+/** Said after the session already saved one skill. */
+const SKILL_AUTHORING_PACED = [
+  '**技能写入职责**：本会话已经创建或尝试过 {{count}} 个技能。除非用户明确要求，**不要再新建**；',
+  '确有需要时，先 `skill_list` 确认没有同类技能，并优先考虑把可复用的部分补进已有技能。',
+].join('\n')
+
+/** The hard ceiling the store enforces per project. */
+const SKILL_AUTHORING_CAP = [
+  '项目技能上限约 {{cap}} 个；达到上限时必须先退役或合并，不要为了腾位置乱建。',
+  '技能存在本项目里，不写入记忆库：它们不会出现在 `memory_search` / `memory_recall` / 摘要里，要查看技能用 `skill_list`。',
+].join('\n')

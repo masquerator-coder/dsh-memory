@@ -5,11 +5,23 @@ DSH 记忆插件：把 `D:\Coding\dsh-memory\memory_system` 的长期记忆接�
 插件本身**不含任何记忆逻辑**。全局摘要生成、按预算控制详细程度、用户画像、条目编辑、
 Markdown 备份与项目根摘要文件全部由 `memory_system` 实现，插件只做三件事：
 
-1. 把记忆锚点注入系统提示词；
-2. 采集会话回合，并调用模型生成**一份覆盖全部项目的全局工作摘要**；
+1. 把记忆锚点与**本项目技能索引**注入系统提示词；
+2. 在回合结束、会话结束时驱动**一份覆盖全部项目的全局工作摘要**；
 3. 在设置页提供「记忆」入口，用来调参、看摘要、改画像、编辑条目、备份恢复。
 
 两者之间通过子进程 + 行分隔 JSON 协议通信（`memory_system.bridge`），因此 Python 侧可以脱离 DSH 单独测试。
+
+## 模型可用的 12 个工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `memory_recall` / `memory_search` / `memory_add` / `memory_forget` | 记忆的读、写、归档 |
+| `memory_profile_read` / `memory_digest_read` / `memory_digest_generate` | 画像与全局摘要 |
+| `skill_create` | 把验证过的做法存成**本项目**技能 |
+| `skill_list` / `skill_get` | 列出 / 读取技能 |
+| `skill_run` / `skill_retire` | 记录执行结果 / 退役 |
+
+技能只做 project 作用域：org / sys 级晋升是用户决策，工具与桥接命令都不提供。
 
 ## 设置页功能
 
@@ -53,11 +65,13 @@ patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪�
 | `memorySystemRoot` | `''` | 含 `memory_system` 包的仓库根目录，会加入子进程 `PYTHONPATH`；留空则按插件自身位置推导（`bridge.js` 的上一级目录），不绑定某台机器 |
 | `memoryHome` | `''` | 记忆库目录，留空为 `~/.dsh/memory`（或 `$DSH_HOME/memory`） |
 | `projectOverride` | `''` | 固定项目 id，不再按会话工作目录推导 |
-| `captureTurns` | `false` | 自动把用户消息与回合结果记入情景记忆。**默认关闭**：记忆只由模型通过 `memory_add` 主动写入；宿主注入的合成 user 消息（运行时上下文、技能目录、压缩检查点）若被当作用户发言收录，会污染召回 |
+| `captureTurns` | `false` | **当前版本未读取，无实际效果**：插件不会自动采集会话。记忆只由模型通过 `memory_add` 主动写入，会话结束时再由一次模型调用补漏。保留该键只为兼容旧配置 |
 | `autoSummary` | `true` | 回合结束、空闲后自动生成全局摘要；常开，界面不提供开关。摘要是**读**记忆，不受 `captureTurns` 影响 |
 | `autoSummaryDelayMs` | `15000` | 回合结束到生成摘要之间的空闲间隔 |
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
-| `heartbeatSteps` | `20` | 距上次 `memory_add` 经过多少个回合后，在系统提示词里追加一次记忆提醒；`0` 关闭 |
+| `skillIndex` | `true` | 是否注入本项目技能索引（一行一个技能，30 秒缓存） |
+| `skillAuthoring` | `true` | 是否在提示词里告诉模型何时可以 `skill_create`；默认每个会话最多新建 1 个 |
+| `heartbeatSteps` | `20` | 距上次 `memory_add` 经过多少个 `turn/start`（用户回合）后，在系统提示词里追加一次记忆提醒；`0` 关闭 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型，检查还有没有未写入的记忆 |
 | `requestTimeoutMs` | `60000` | 单次桥接调用超时；超时会重启子进程，避免响应错位 |
 | `embeddingPreset` | `''` | 传给 `MemoryConfig` 的向量化预设 |
@@ -108,4 +122,4 @@ python -m memory_system status '{\"cwd\": \"D:\\\\Coding\\\\dsh-memory\"}'
 - 记忆锚点只包含规模、时间与工具指引，**不含摘要正文**，正文通过工具按需读取；
 - 全局摘要只记录“做过什么工作”，不写入经验教训与用户偏好；
 - 项目根目录的 `DSH_MEMORY.md` 是派生文件，只包含该项目的工作记录，可随时重新生成；
-- 会话采集存的是用户消息与回合结果的一句话摘要，不存模型输出全文。
+- 会话结束检查存的是模型整理后的一句话摘要，不存模型输出全文或完整对话。
