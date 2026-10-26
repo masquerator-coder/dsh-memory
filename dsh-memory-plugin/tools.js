@@ -44,6 +44,11 @@ const TEXT_OUTPUT = {
 
 /**
  * Render a recall result as model-facing text.
+ *
+ * A degraded result is spelled out rather than folded into "nothing found":
+ * recall swallows a failing half (an index error, a provider outage) and
+ * reports it on `degraded`, so silence here would let the model conclude the
+ * memory does not exist when the lookup never ran.
  * @param {any} recall - bridge `memory.recall` result (`{ result: {...} }`).
  * @returns {string} formatted text.
  */
@@ -53,6 +58,7 @@ export function formatRecall(recall) {
   const facts = Array.isArray(payload.facts) ? payload.facts : []
   const disclosure =
     typeof payload.disclosure === 'string' ? payload.disclosure : payload.disclosure?.text ?? ''
+  const degraded = typeof payload.degraded === 'string' ? payload.degraded.trim() : ''
   const lines = []
   if (episodes.length > 0) {
     lines.push('### 相关事件')
@@ -72,6 +78,9 @@ export function formatRecall(recall) {
       const tail = edge.tail ?? edge.dst ?? '?'
       lines.push(`${index + 1}. ${head} —${relation}→ ${tail}`)
     })
+  }
+  if (degraded) {
+    lines.push(`> ⚠️ 本次检索部分降级（${degraded}）：结果可能不完整，不能据此断定“没有相关记忆”。`)
   }
   if (lines.length === 0) {
     return disclosure ? `${disclosure}\n\n没有检索到相关记忆。` : '没有检索到相关记忆。'
