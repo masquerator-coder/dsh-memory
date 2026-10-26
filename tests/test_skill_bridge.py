@@ -144,6 +144,46 @@ def test_index_falls_back_when_no_skill_was_ever_tiered(home):
     assert len(call(home, "skill.index")["index"]) == 1
 
 
+def test_index_respects_the_attention_budget(home):
+    """The fallback lists every visible skill, so it must still fit the budget.
+
+    Without a cut, a project with dozens of skills pushed all of them into the
+    system prompt: the hot path is budgeted by ``refresh_tiers``, the fallback
+    was not, and the two paths cost wildly different amounts for the same
+    question.
+    """
+    from memory_system import MemoryConfig, MemorySystem
+    from memory_system.text import estimate_tokens
+
+    for i in range(30):
+        call(
+            home,
+            "skill.create",
+            model_authored=True,
+            definition={
+                "title": f"流程 {i}",
+                "description": f"第 {i} 类的标准流程说明",
+                "when_to_use": "需要时",
+                "triggers": [f"触发{i}"],
+                "steps": [{"action": f"执行第 {i} 步", "tool": "run_terminal"}],
+            },
+        )
+
+    memory = MemorySystem(MemoryConfig.for_home(home))
+    try:
+        budget = memory.config.l4.index_budget_tokens
+    finally:
+        memory.close()
+
+    result = call(home, "skill.index")
+    index = result["index"]
+    assert index, "the index must not be emptied by the budget"
+    assert sum(estimate_tokens(line) for line in index) <= budget
+    # The skills that did not fit are counted, not silently vanished.
+    assert result["dropped"] > 0
+    assert len(index) + result["dropped"] == 30
+
+
 def test_get_returns_the_full_definition(home):
     call(home, "skill.create", model_authored=True, definition=DEFINITION)
     found = call(home, "skill.get", skill="定位失败的测试")

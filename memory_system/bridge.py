@@ -59,6 +59,7 @@ from .summary import (
     export_markdown,
 )
 from .system import MemorySystem
+from .text import estimate_tokens
 
 BRIDGE_VERSION = 1
 
@@ -783,9 +784,24 @@ def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
     lines = memory.skills.level1_index(view)
     if not lines:
         lines = [render_index_line(s) for s in memory.skills.visible(view, include_cold=True)]
+    # The hot path above is already budgeted by ``refresh_tiers``; the fallback
+    # lists everything visible, so without this cut a project with a hundred
+    # skills pushed every one of them into the system prompt. The design's rule
+    # is to degrade, never to overflow, and ``BudgetPlanner`` applies the same
+    # limit on the hot path -- so the two paths cost the same.
+    budget = memory.config.l4.index_budget_tokens
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = estimate_tokens(line)
+        if used + cost > budget:
+            break
+        kept.append(line)
+        used += cost
     return {
         "project_id": project,
-        "index": lines,
+        "index": kept,
+        "dropped": len(lines) - len(kept),
         "stats": memory.skills.stats(view),
     }
 
