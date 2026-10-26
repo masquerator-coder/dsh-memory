@@ -191,7 +191,12 @@ def coerce_scope(value: Any, *, allow_legacy: bool = False) -> str:
 
 
 def normalize_summary(text: str) -> str:
-    """Strip wrappers a model likes to add around a Markdown answer."""
+    """Strip wrappers a model likes to add around a Markdown answer.
+
+    Only fences and outer whitespace go; the length is never touched. The
+    character budget is an instruction to the generator (see the module
+    docstring), so a digest that overshoots it is stored as written.
+    """
     text = (text or "").strip()
     text = re.sub(r"^```(?:markdown|md)?\s*\n", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n```\s*$", "", text)
@@ -669,6 +674,11 @@ class DigestService:
         "digest updated" marker is left alone -- re-importing an old summary
         must not make the host believe the current one was just regenerated.
         Legacy ``project`` scopes are accepted so old backups still restore.
+
+        ``requested_chars`` is recorded as the larger of the import floor and
+        the text length. Unlike :meth:`commit`, the text being restored had no
+        generation budget to honour, so claiming the saved budget as its target
+        would make a short foreign digest look permanently under-target.
         """
         scope = coerce_scope(scope, allow_legacy=True)
         cleaned = normalize_summary(content or "")
