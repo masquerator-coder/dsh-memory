@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .config import MemoryConfig
-from .errors import MemoryError, NotFoundError, ProviderError, ValidationError
+from .errors import ConflictError, MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
 from .l3 import FactInput
 from .l4 import Skill, SkillDefinition, render_index_line
@@ -890,20 +890,53 @@ def cmd_skill_retire(memory: MemorySystem, payload: dict[str, Any]) -> dict[str,
 # ── backup / restore ────────────────────────────────────────────────────
 
 
+def _backup_base(memory: MemorySystem, payload: dict[str, Any]) -> Path:
+    """The directory tree a backup file may live in.
+
+    Next to the database it was read from: that is the one place the user
+    already chose for this store, so it is also the place to keep a copy of it.
+    A store that is not a file (the in-memory database tests use) falls back to
+    the requested home.
+    """
+    store = Path(str(memory.config.db_path))
+    if str(store) == ":memory:":
+        return Scope.from_payload(payload).home
+    return store.parent
+
+
 def _backup_target(memory: MemorySystem, payload: dict[str, Any]) -> Path:
     """Where an export that cannot travel inline is written.
 
-    Next to the database it was read from, under ``exports/``: a file the user
-    can keep, find again, and hand to ``backup.restore``. A store that is not a
-    file (the in-memory database tests use) falls back to the requested home.
+    Under ``exports/`` next to the database: a file the user can keep, find
+    again, and hand to ``backup.restore``.
     """
-    store = Path(str(memory.config.db_path))
-    base = Scope.from_payload(payload).home if str(store) == ":memory:" else store.parent
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
-    return base / "exports" / f"dsh-memory-backup-{stamp}.md"
+    return _backup_base(memory, payload) / "exports" / f"dsh-memory-backup-{stamp}.md"
 
 
-def _write_backup(markdown: str, target: Path) -> Path:
+def _inside(base: Path, target: Path) -> bool:
+    """Whether ``target`` resolves inside ``base``.
+
+    The bridge is reachable from a model tool payload and from the settings
+    page, so a caller-chosen path is untrusted input: without this check
+    ``backup.export`` was an arbitrary-file write (overwrite anything the
+    harness user can write) and ``backup.restore`` an arbitrary-file read
+    (import any local file into the memory store). Symlinks are resolved by
+    ``resolve()``, so a link out of the tree is refused too.
+    """
+    try:
+        base_path = base.expanduser().resolve()
+        target_path = target.expanduser().resolve()
+    except OSError:
+        return False
+    return target_path == base_path or base_path in target_path.parents
+
+
+def _write_backup(markdown: str, target: Path, *, base: Path) -> Path:
+    if not _inside(base, target):
+        raise BridgeError(
+            "bad_request", f"refusing to write a backup outside {base}: {target}"
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(markdown, encoding="utf-8")
@@ -914,7 +947,9 @@ def _write_backup(markdown: str, target: Path) -> Path:
     return target
 
 
-def _read_backup(path: Path) -> str:
+def _read_backup(path: Path, *, base: Path) -> str:
+    if not _inside(base, path):
+        raise BridgeError("bad_request", f"refusing to read a backup outside {base}: {path}")
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -948,7 +983,9 @@ def cmd_backup_export(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
     counts = {"chars": len(markdown), "lines": markdown.count("\n")}
     path = payload.get("path")
     if path:
-        target = _write_backup(markdown, Path(str(path)).expanduser())
+        target = _write_backup(
+            markdown, Path(str(path)), base=_backup_base(memory, payload)
+        )
         return {"path": str(target), "inline": False, **counts}
     result = {"markdown": markdown, "inline": True, **counts}
     if _fits_one_envelope(result):
@@ -958,7 +995,7 @@ def cmd_backup_export(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
     # the export would fail with "narrow the request" and no way to narrow it.
     # The command already knows how to write a file, so spill it there and let
     # the caller read it back (the plugin does, outside the pipe cap).
-    target = _write_backup(markdown, _backup_target(memory, payload))
+    target = _write_backup(markdown, _backup_target(memory, payload), base=_backup_base(memory, payload))
     return {"path": str(target), "inline": False, **counts}
 
 
@@ -1134,7 +1171,7 @@ BACKUP_MARKER_HINT = "dsh-memory-backup"
 def cmd_backup_restore(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     source = payload.get("path")
     if source:
-        text = _read_backup(Path(str(source)).expanduser())
+        text = _read_backup(Path(str(source)), base=_backup_base(memory, payload))
     else:
         text = str(payload.get("markdown") or "")
     if not text.strip():
@@ -1296,6 +1333,8 @@ def _error_payload(exc: BaseException) -> dict[str, Any]:
         code = exc.code
     elif isinstance(exc, NotFoundError):
         code = "not_found"
+    elif isinstance(exc, ConflictError):
+        code = "conflict"
     elif isinstance(exc, ValidationError):
         code = "validation"
     elif isinstance(exc, ProviderError):

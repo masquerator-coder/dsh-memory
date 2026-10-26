@@ -155,7 +155,7 @@ def test_backup_restore_reports_a_missing_file_as_a_client_error(tmp_path):
     ``FileNotFoundError`` -> code ``internal``: a typo in a path looked like a
     bug in the memory store, and the plugin answered it with HTTP 200.
     """
-    missing = tmp_path / "missing.md"
+    missing = tmp_path / "exports" / "missing.md"
     response = handle(
         {
             "id": 1,
@@ -171,8 +171,10 @@ def test_backup_restore_reports_a_missing_file_as_a_client_error(tmp_path):
 
 def test_backup_export_reports_an_unwritable_target_as_a_client_error(tmp_path):
     home = _seeded_home(tmp_path)
-    blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory", encoding="utf-8")
+    blocker = home / "exports" / "blocker"
+    blocker.mkdir(parents=True)
+    # A directory where the file should go: mkdir succeeds, write_text fails.
+    (blocker / "backup.md").mkdir()
 
     response = handle(
         {
@@ -185,6 +187,75 @@ def test_backup_export_reports_an_unwritable_target_as_a_client_error(tmp_path):
     assert response["ok"] is False
     assert response["error"]["code"] == "bad_request"
     assert "blocker" in response["error"]["message"]
+
+
+def test_backup_export_refuses_a_path_outside_the_store(tmp_path):
+    """The store directory is the only tree a backup may be written into.
+
+    ``backup.export`` forwarded ``path`` verbatim, so a caller (a settings-page
+    body, a CLI payload, or a model tool's extra argument) could overwrite any
+    file the harness user can write.
+    """
+    home = _seeded_home(tmp_path)
+    outside = tmp_path / "outside" / "INJECTED.md"
+
+    response = handle(
+        {"id": 1, "command": "backup.export", "payload": {"home": str(home), "path": str(outside)}}
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+    assert not outside.exists()
+
+
+def test_backup_export_refuses_a_traversal_out_of_the_store(tmp_path):
+    home = _seeded_home(tmp_path)
+    traversal = home / "exports" / ".." / ".." / "escaped.md"
+
+    response = handle(
+        {"id": 1, "command": "backup.export", "payload": {"home": str(home), "path": str(traversal)}}
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+    assert not (tmp_path / "escaped.md").exists()
+
+
+def test_backup_restore_refuses_a_file_outside_the_store(tmp_path):
+    """``backup.restore`` must not import an arbitrary local file."""
+    home = _seeded_home(tmp_path)
+    secret = tmp_path / "secret.md"
+    secret.write_text("## 记忆条目\n\n- [ ] `ep_x` `active` `note` 重要度 0.50 · 2026-01-01 00:00\n", encoding="utf-8")
+
+    response = handle(
+        {"id": 1, "command": "backup.restore", "payload": {"home": str(home), "path": str(secret)}}
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+    assert "outside" in response["error"]["message"]
+
+
+def test_backup_round_trips_through_the_guard(tmp_path):
+    """A file inside the store still exports and restores."""
+    from memory_system import bridge
+
+    home = _seeded_home(tmp_path)
+    target = home / "manual-backup.md"
+    exported = handle(
+        {"id": 1, "command": "backup.export", "payload": {"home": str(home), "path": str(target)}}
+    )
+    assert exported["ok"] is True, exported
+    assert target.exists()
+
+    memory = bridge.open_memory(bridge.Scope.from_payload({"home": str(home)}))
+    with memory as opened:
+        opened.store.execute("DELETE FROM l2_episodes")
+    restored = handle(
+        {"id": 2, "command": "backup.restore", "payload": {"home": str(home), "path": str(target), "project_id": "proj-a"}}
+    )
+    assert restored["ok"] is True, restored
+    assert restored["result"]["imported"] == 1
 
 
 # ── git remote resolution ───────────────────────────────────────────────
