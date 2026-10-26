@@ -507,6 +507,29 @@ export function apply(ctx, rawConfig) {
   const digestInFlight = new Map()
 
   /**
+   * The memory ids the last global digest was built from, or null before one
+   * has been seen. Seeded from `digest.history` on first use so a restarted
+   * host still knows what the on-disk digest already covers, and refreshed
+   * after every commit.
+   * @type {Set<string> | null}
+   */
+  let lastDigestSources = null
+
+  /** Load the previous digest's source snapshot once. */
+  async function loadLastDigestSources() {
+    if (lastDigestSources) return lastDigestSources
+    try {
+      const history = await call('digest.history', { limit: 1 })
+      const sources = history?.items?.[0]?.sources
+      lastDigestSources = Array.isArray(sources) ? new Set(sources) : new Set()
+    } catch {
+      // Unknown history must not block a digest: treat it as "nothing known".
+      lastDigestSources = new Set()
+    }
+    return lastDigestSources
+  }
+
+  /**
    * Plan the global digest, ask the model to write it, and commit it.
    * @param {object} options - generation options.
    * @param {string} [options.cwd] - project working directory (for root notes).
@@ -556,12 +579,45 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Whether a planned digest would read exactly what the last committed one read.
+   *
+   * `digest.plan` returns the memory ids its material digest was built from, and
+   * `digest.commit` stores that same list on the record. Comparing the two sets
+   * answers "has any work been recorded since the last summary?" without a model
+   * call. A plan with no sources is never considered unchanged: an empty store
+   * still deserves its one honest note.
+   * @param {{sources?: string[]}} plan - the plan just fetched.
+   * @returns {boolean} true when re-summarizing would produce the same digest.
+   */
+  function unchangedSince(plan) {
+    const planned = plan?.sources
+    if (!Array.isArray(planned) || planned.length === 0) return false
+    const last = lastDigestSources
+    if (!last) return false
+    if (last.size !== planned.length) return false
+    return planned.every((id) => last.has(id))
+  }
+
+  /**
    * The body of one digest run, without the in-flight bookkeeping.
    * @param {object} options - generation options.
    * @returns {Promise<any>} `{ digest }` as committed.
    */
   async function runDigest({ cwd, projectId, signal, reason, length }) {
     const plan = await call('digest.plan', { cwd, project_id: projectId, length }, signal)
+    // An automatic run that would read exactly the materials the last digest
+    // was built from produces the same summary again at full model cost. It
+    // happens constantly: every session teardown schedules one, so idle
+    // sessions would re-summarize an unchanged store all day. `plan.sources`
+    // is the memory-id snapshot the previous commit recorded, which makes
+    // "has anything new been written since?" a set comparison, not a model call.
+    if (reason === 'auto' && plan.has_materials !== false) {
+      await loadLastDigestSources()
+      if (unchangedSince(plan)) {
+        logger.info('[dsh-memory] automatic digest skipped: no new work records')
+        return { digest: null, skipped: 'no-change' }
+      }
+    }
     const llm = ctx.get?.('llm')
     let text = ''
     let error
@@ -609,6 +665,9 @@ export function apply(ctx, rawConfig) {
       signal,
     )
     logger.info(`[dsh-memory] digest ${committed?.digest?.status ?? 'unknown'} (${reason}, global)`)
+    // Record what this digest now covers, so the next automatic run can tell
+    // whether anything new has been written since.
+    lastDigestSources = new Set(plan.sources ?? [])
     return committed
   }
 
