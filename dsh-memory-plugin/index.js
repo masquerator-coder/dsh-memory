@@ -1354,8 +1354,16 @@ const SKILL_AUTHORING_PACED = [
   '确有需要时，先 `skill_list` 确认没有同类技能，并优先考虑把可复用的部分补进已有技能。',
 ].join('\n')
 
-/** The hard ceiling the store enforces per project. */
+/**
+ * How many project skills the prompt asks the model to aim for.
+ *
+ * Deliberately far below what the store accepts: `l4.max_active_per_project`
+ * (200 by default) is the enforced ceiling and rejects with `capacity`, while
+ * this is guidance about attention. The text below must not present it as a
+ * hard limit, or the model reports a cap that nothing enforces.
+ */
 const SKILL_AUTHORING_CAP = [
-  '项目技能上限约 {{cap}} 个；达到上限时必须先退役或合并，不要为了腾位置乱建。',
+  '项目技能建议控制在 {{cap}} 个左右；接近这个数量时优先合并或退役旧技能，不要为了腾位置乱建。',
+  '这个数字是建议值；真正的硬性上限由记忆库配置决定，超过时会直接拒绝写入。',
   '技能存在本项目里，不写入记忆库：它们不会出现在 `memory_search` / `memory_recall` / 摘要里，要查看技能用 `skill_list`。',
 ].join('\n')
