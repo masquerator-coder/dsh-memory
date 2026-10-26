@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .errors import NotFoundError, ValidationError
+from .errors import ConflictError, NotFoundError, ValidationError
 from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens
@@ -1095,6 +1095,16 @@ class MemoryNotepad:
                 raise ValidationError("summary must be non-empty")
             if len(summary) > SUMMARY_MAX_CHARS:
                 raise ValidationError(f"summary is longer than {SUMMARY_MAX_CHARS} characters")
+            # An edit may land on the text of another row. ``summary_hash`` is
+            # what the write path dedups on, so two rows sharing it makes a
+            # later ``remember`` merge into whichever one ``LIMIT 1`` returns
+            # and makes recall show the same sentence twice. Refuse instead of
+            # silently creating a second copy of one memory.
+            clash = self.memory.l2.find_duplicate(row["project_id"], summary)
+            if clash is not None and clash.memory_id != memory_id:
+                raise ConflictError(
+                    f"another memory in this project already has this text: {clash.memory_id}"
+                )
             sets += ["summary = ?", "summary_hash = ?"]
             from .l2 import summary_hash
 

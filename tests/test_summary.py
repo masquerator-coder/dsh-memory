@@ -367,6 +367,65 @@ def test_memory_edit_reembeds_the_new_text(memory: MemorySystem, project: str):
     assert distance("database index tuning") > 0.05
 
 
+def test_memory_edit_refuses_to_duplicate_another_memory(memory: MemorySystem, project: str):
+    """Editing a memory onto another's text must not create two rows.
+
+    ``summary_hash`` is the key the write path dedups on. Before the guard, an
+    edit could hand two rows the same hash: a later ``remember`` of that text
+    merged into whichever row ``LIMIT 1`` happened to return, and recall showed
+    the same sentence twice.
+    """
+    from memory_system.errors import ConflictError
+
+    first = memory.remember(project_id=project, summary="原始文本 A", event_type="note")
+    second = memory.remember(project_id=project, summary="原始文本 B", event_type="note")
+    notepad = MemoryNotepad(memory)
+
+    with pytest.raises(ConflictError, match=first["memory_id"]):
+        notepad.update(second["memory_id"], {"summary": "原始文本 A"})
+
+    hashes = {
+        row["summary_hash"]
+        for row in memory.store.query(
+            "SELECT summary_hash FROM l2_episodes WHERE project_id = ?", (project,)
+        )
+    }
+    assert len(hashes) == 2
+    # The refused edit left the row untouched.
+    assert notepad.get(second["memory_id"])["summary"] == "原始文本 B"
+
+
+def test_memory_edit_accepts_its_own_text(memory: MemorySystem, project: str):
+    """Re-saving a row's own summary (e.g. only importance changed) is not a clash."""
+    created = memory.remember(project_id=project, summary="同一条文本", event_type="note")
+    updated = MemoryNotepad(memory).update(
+        created["memory_id"], {"summary": "同一条文本", "importance": 0.9}
+    )
+    assert updated["importance"] == 0.9
+
+
+def test_duplicate_lookup_is_deterministic_across_identical_hashes(memory: MemorySystem, project: str):
+    """A legacy store may still hold two rows sharing one hash.
+
+    The merge must land on a fixed row (the newest) instead of whichever one
+    SQLite visits first, which made a re-observation attach to a different
+    memory on every call.
+    """
+    created = memory.remember(project_id=project, summary="部署命令是 make deploy", event_type="note")
+    # Force the legacy shape: a second row with the same hash.
+    duplicate = memory.remember(project_id=project, summary="部署命令变了", event_type="note")
+    memory.store.execute(
+        "UPDATE l2_episodes SET summary_hash = (SELECT summary_hash FROM l2_episodes WHERE memory_id = ?) "
+        "WHERE memory_id = ?",
+        (created["memory_id"], duplicate["memory_id"]),
+    )
+
+    first = memory.l2.find_duplicate(project, "部署命令是 make deploy")
+    second = memory.l2.find_duplicate(project, "部署命令是 make deploy")
+    assert first is not None and second is not None
+    assert first.memory_id == second.memory_id
+
+
 def test_memory_edit_accepts_tags_only(memory: MemorySystem, project: str):
     """Tags live in a meta blob, not a column, so they must not trip the
     empty-patch guard on their own."""

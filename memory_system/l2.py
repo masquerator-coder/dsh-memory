@@ -770,8 +770,14 @@ class EpisodicMemory:
             )
             if row is not None:
                 return Episode.from_row(row)
+        # ``LIMIT 1`` without an ORDER BY returns whichever row SQLite visits
+        # first, so a project that ended up with two rows sharing one hash (an
+        # edit before the notepad refused duplicates) merged new writes into a
+        # different memory on each call. Prefer the newest row: it is the one a
+        # re-observation most likely restates.
         row = self.store.query_one(
-            "SELECT * FROM l2_episodes WHERE project_id = ? AND summary_hash = ? LIMIT 1",
+            "SELECT * FROM l2_episodes WHERE project_id = ? AND summary_hash = ? "
+            "ORDER BY ord DESC LIMIT 1",
             (project_id, h),
         )
         if row is not None:
