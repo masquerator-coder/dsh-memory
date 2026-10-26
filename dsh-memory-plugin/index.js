@@ -696,7 +696,7 @@ export function apply(ctx, rawConfig) {
       const key = cwd || ''
       let slot = anchorCaches.get(key)
       if (!slot) {
-        slot = { at: 0, text: '', pending: false }
+        slot = { at: 0, text: '', summary: null, profile: null, pending: false }
         anchorCaches.set(key, slot)
       }
       return slot
@@ -725,6 +725,8 @@ export function apply(ctx, rawConfig) {
             include_profile: true,
           })
           slot.text = typeof result?.text === 'string' ? result.text : ''
+          slot.summary = Boolean(result?.summary)
+          slot.profile = Boolean(result?.profile)
         } catch (error) {
           logger.warn(`[dsh-memory] anchor refresh failed: ${error?.message ?? error}`)
         } finally {
@@ -732,6 +734,21 @@ export function apply(ctx, rawConfig) {
           slot.pending = false
         }
       })()
+    }
+
+    /**
+     * The anchor body for one assembly.
+     *
+     * An empty slot means "never read yet" and a failed read lands here too, so
+     * `summary` and `profile` are reported as unknown: absence of a digest must
+     * not be inferred from a state that may simply predate the first read.
+     * @param {{text?: string, summary?: boolean, profile?: boolean}} slot - anchor cache entry.
+     * @returns {string} the body text.
+     */
+    function anchorBody(slot) {
+      if (slot?.text) return slot.text
+      if (slot?.summary === false) return ANCHOR_NO_SUMMARY
+      return ANCHOR_NOTHING_YET
     }
 
     /**
@@ -761,8 +778,7 @@ export function apply(ctx, rawConfig) {
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
             // body and the heartbeat vary.
-            const body = slot?.text || '（还没有可用的记忆摘要。）'
-            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', body)}${heartbeatLine(session?.id)}`
+            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', anchorBody(slot))}${heartbeatLine(session?.id)}`
           },
         }),
       'dsh-memory.anchor-section',
@@ -1200,27 +1216,43 @@ export function apply(ctx, rawConfig) {
 }
 
 /**
+ * What stands in for the anchor body.
+ *
+ * The bridge answers `''` when there is neither a digest nor a profile, which
+ * is the normal state of a fresh install; the old single placeholder then
+ * announced a missing digest even when the section above it showed the live
+ * profile, so the two contradicted each other.
+ */
+const ANCHOR_NOTHING_YET = '（还没有全局摘要，也没有用户画像；记忆库仍可正常读写。）'
+const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_generate` 生成。）'
+
+/**
  * The anchor block: what the model sees instead of the digest itself.
  * `{{memory_anchor}}` is replaced with the Python-rendered pointer text.
+ *
+ * What a tool's `description` already says is deliberately absent here: this
+ * block is resident in every request, so it carries only what the model cannot
+ * read off the tool list — when a fact is worth storing, where each kind of
+ * memory actually lands, and the sharp edges of read/forget.
  */
 const ANCHOR_HEADER = [
   '## 记忆',
-  '本会话连接了持久记忆库（memory_system）。下面是记忆锚点：只有规模与时间，不含正文。',
+  '跨会话持久记忆：全机共享一个库，按工作目录推导的项目隔离。当前状态如下（只有规模与时间，不含正文）：',
   '',
   '{{memory_anchor}}',
   '',
-  '**写入职责**：记忆库不会自动收录对话，**只有你主动调用 `memory_add` 才会写入**。',
-  '- 遇到**有价值的经验、决策、操作规则、用户明确偏好**时，主动用 `memory_add` 记下来，不要等用户要求。',
-  '- 反例：闲聊、能从代码直接读到的事实、一次性且不会再用的中间步骤，都不要记。',
-  '- 写一条好的记忆 = 一句话说清关键实体与结论，并选对 `event_type`（decision / preference / fix / fact / note）。',
+  '**写入**：库不会自动抄录对话，**只有你调用 `memory_add` 才会写入**（另有会话结束时的一次补漏）。',
+  '- 值得存：经验教训、已定的决策与理由、踩过的坑、操作规则、用户明确偏好；`event_type` 对号入座。',
+  '- 不要存：闲聊、能从代码或文档直接读到的、一次性的中间步骤。',
+  '- 一条 = 一句话说清关键实体与结论（含文件、命令、项目名），以后才能按问题检索到。',
+  '- 偏好与教训**不进摘要、也不进画像**：只能靠 `memory_add` + 检索留住。',
   '',
-  '使用方式：',
-  '- `memory_digest_read` 读取全局摘要全文（所有项目已做过的工作），`memory_recall` 按问题检索事件与事实。',
-  '- 想知道某个项目做过什么时，也可以查看该项目根目录下的 `DSH_MEMORY.md`。',
-  '- 用户提到"之前说过""上次""我们的约定"时，先 `memory_recall` 再回答；不要凭印象编造记忆。',
-  '- 需要了解用户偏好时调用 `memory_profile_read`；用户画像由用户本人维护。',
-  '- 用户明确要求记住某件事时用 `memory_add`；要求忘掉时用 `memory_forget`。',
-  '- 引用记忆时说明来源，并注意摘要的生成时间；过时内容以当前代码与用户的最新说法为准。',
+  '**读取**：用户提到"之前说过""上次""我们的约定"时，先 `memory_recall`（或 `memory_search`）再回答，不要凭印象编造。',
+  '- 摘要、`DSH_MEMORY.md` 只记工程动作；经验、决策、偏好、坑只在检索里。',
+  '- 本项目做过什么：读仓库根的 `DSH_MEMORY.md`（同样不含偏好）。',
+  '- 召回默认只给 `active`；淡出检索的条目不会被删，`memory_search` 里靠 `state`（active / dormant / archived）能找回。',
+  '- 用户画像只能读，由用户自己在设置页维护。',
+  '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"，别说成彻底删除。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
