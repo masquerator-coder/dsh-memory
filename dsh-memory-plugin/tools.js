@@ -422,6 +422,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
         success_criteria: { type: 'string', description: '怎样算做完，可省略。' },
         fallback: { type: 'string', description: '失败时怎么回退，可省略。' },
       },
+      output: TEXT_OUTPUT,
       async execute(args, exec) {
         const steps = (Array.isArray(args.steps) ? args.steps : [])
           .map((step) => ({
