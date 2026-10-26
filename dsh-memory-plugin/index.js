@@ -46,6 +46,18 @@ const ANCHOR_REFRESH_MS = 15_000
 const SKILL_REFRESH_MS = 30_000
 
 /**
+ * How much recent work the anchor shows for the current project.
+ *
+ * A hard ceiling, not a target: the block is resident in every request, and a
+ * digest plus a five-line list is the point where the rest is cheaper to read
+ * from `DSH_MEMORY.md` than to carry every turn.
+ */
+const RECENT_CHARS = 400
+
+/** How many newest memories the anchor considers before the character cut. */
+const RECENT_LIMIT = 8
+
+/**
  * Skills one project may hold before the model must retire or merge one.
  *
  * The design's ceiling is 200, which is the right bound for a long-lived
@@ -309,6 +321,10 @@ export function apply(ctx, rawConfig) {
   /**
    * Model steps taken since the last `memory_add`, per session id.
    *
+   * A step is one model call (`step/start`), not one user turn: a turn that
+   * runs thirty tool calls is thirty steps, which is what `heartbeatSteps`
+   * counts and what the reminder text promises.
+   *
    * The heartbeat is host pacing, not memory logic: it decides *when* to
    * remind the model, never *what* is worth remembering. The reminder rides
    * the system-prompt section so it costs no session event.
@@ -334,7 +350,10 @@ export function apply(ctx, rawConfig) {
 
   ctx.on('session/event', (session, event) => {
     const type = event?.type
-    if (type === 'turn/start') {
+    if (type === 'step/start') {
+      // One step is one model call. Counting `turn/start` instead made a
+      // single long turn — thirty tool calls, no `memory_add` — look like one
+      // step, so the reminder stayed silent exactly when it was needed.
       bumpStep(session?.id)
       return
     }
@@ -736,22 +755,15 @@ export function apply(ctx, rawConfig) {
 
   if (config.systemPromptAnchor) {
     /**
-     * Anchor text per working directory, refreshed off the assembly path.
+     * One slot, not one per working directory.
      *
-     * Prompt assembly is synchronous, so the anchor cannot await the bridge.
-     * A provider kicks off a refresh and returns the last known text; the
-     * first assembly of a directory therefore omits the block and the next one
-     * includes it. That is a deliberate trade: a stale-by-seconds count line
-     * beats a prompt that blocks on a child process.
-     *
-     * One slot, not one per working directory. `digest.anchor` takes no cwd and
-     * answers the same global text (the cross-project digest and the user
-     * profile) for every caller, so keying the cache by directory only made N
-     * projects each age out and each pay for an identical bridge round trip.
-     * The directory stays in the signature because assembly still has to know
-     * which session it is rendering for.
+     * The `@@dsh-memory` count line and the profile are global — `digest.anchor`
+     * ignores the caller's directory — so keying that part by directory only
+     * made N projects each age out and each pay for an identical round trip.
+     * `recent` is per project, but the refresh is on one slot: the extra
+     * `memory.list` rides along with the anchor call it already makes.
      */
-    const anchorSlotShared = { at: 0, text: '', summary: null, profile: null, pending: false }
+    const anchorSlotShared = { at: 0, text: '', summary: null, profile: null, recent: null, pending: false }
 
     /** @param {string} _cwd - session working directory; the anchor is global. */
     function anchorSlot(_cwd) {
@@ -759,7 +771,7 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * Start a refresh when the cached anchor for this directory has aged.
+     * Start a refresh when the cached anchor has aged.
      * @param {any} context - assembly context carrying the agent.
      */
     function refreshAnchor(context) {
@@ -773,9 +785,10 @@ export function apply(ctx, rawConfig) {
       slot.at = Date.now()
       slot.pending = true
       void (async () => {
+        // The count line and the profile are global: the one cross-project
+        // digest, for every session. The per-project lines are read next to
+        // it, and a failure there must not lose the global part.
         try {
-          // The anchor is global: it advertises the one cross-project digest
-          // and the user profile, not a per-project summary.
           const result = await call('digest.anchor', {
             include_summary: true,
             include_profile: true,
@@ -785,11 +798,55 @@ export function apply(ctx, rawConfig) {
           slot.profile = Boolean(result?.profile)
         } catch (error) {
           logger.warn(`[dsh-memory] anchor refresh failed: ${error?.message ?? error}`)
+        }
+        try {
+          slot.recent = await refreshRecent(cwd)
+        } catch (error) {
+          logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
+          slot.recent = { lines: [], truncated: false }
         } finally {
           slot.at = Date.now()
           slot.pending = false
         }
       })()
+    }
+
+    /**
+     * Read this project's most recent work lines for the anchor.
+     *
+     * The digest is cross-project, so for the project the session is actually
+     * in it says almost nothing. These are the newest L2 summaries for this
+     * project only, cut to a hard character budget: the block is resident in
+     * every request, so the section earns its tokens by answering "what has
+     * been done here" without a tool round trip, and by staying short enough
+     * that the full digest and `DSH_MEMORY.md` remain the place for detail.
+     *
+     * A project with no memories answers `[]`, and the block then omits the
+     * section entirely instead of advertising emptiness every turn.
+     *
+     * @param {string} cwd - the session's working directory.
+     * @returns {Promise<{lines: string[], truncated: boolean}>} the lines.
+     */
+    async function refreshRecent(cwd) {
+      const projectId = await projectFor(cwd)
+      if (!projectId) return { lines: [], truncated: false }
+      const result = await call('memory.list', {
+        project_id: projectId,
+        limit: RECENT_LIMIT,
+        state: 'active',
+      })
+      const items = Array.isArray(result?.items) ? result.items : []
+      const lines = []
+      let used = 0
+      for (const item of items) {
+        const summary = String(item?.summary ?? '').replace(/\s+/g, ' ').trim()
+        if (!summary) continue
+        const line = `- ${summary}`
+        if (used + line.length > RECENT_CHARS) break
+        lines.push(line)
+        used += line.length
+      }
+      return { lines, truncated: items.length > lines.length }
     }
 
     /**
@@ -808,6 +865,24 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
+     * The per-project work lines, or '' when this project has no memories yet.
+     *
+     * Absent is not the same as empty here: a fresh project would otherwise
+     * spend resident tokens announcing that it has nothing.
+     *
+     * @param {{recent?: {lines?: string[], truncated?: boolean} | null}} slot - anchor cache entry.
+     * @returns {string} the section, or ''.
+     */
+    function recentSection(slot) {
+      const lines = slot?.recent?.lines ?? []
+      if (lines.length === 0) return ''
+      const tail = slot.recent.truncated
+        ? `- …更早的用 \`memory_search\`（state 可查 dormant/archived）或读仓库根的 \`DSH_MEMORY.md\``
+        : '- 全量历史读仓库根的 `DSH_MEMORY.md`'
+      return ['**本项目最近的工作**（从新到旧，节选用）', ...lines, tail].join('\n')
+    }
+
+    /**
      * The reminder line for one session, or '' when the heartbeat is quiet.
      * @param {string | undefined} sessionId - the assembling session.
      * @returns {string} a one-line nudge, or ''.
@@ -817,7 +892,7 @@ export function apply(ctx, rawConfig) {
       if (threshold <= 0) return ''
       const steps = stepsSinceWrite.get(sessionId ?? '') ?? 0
       if (steps < threshold) return ''
-      return `\n\n**记忆提醒**：距上次调用 \`memory_add\` 已过 ${steps} 个回合。若这期间出现了值得长期保留的经验、决策或操作规则，现在就记下来；没有则忽略本条。`
+      return `\n\n**记忆提醒**：距上次调用 \`memory_add\` 已过 ${steps} 个模型步。若这期间出现了值得长期保留的经验、决策或操作规则，现在就记下来；没有则忽略本条。`
     }
 
     ctx.effect(
@@ -829,13 +904,17 @@ export function apply(ctx, rawConfig) {
           text: (context) => {
             refreshAnchor(context)
             // Same assembly context the refresh just looked at. One shared
-            // slot: the anchor body is global, so every session reads it.
+            // slot: the count line is global, so every session reads it; only
+            // the recent-work section is this project's.
             const session = context?.agent?.session
             const slot = anchorSlot(session?.header?.cwd ?? '')
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
-            // body and the heartbeat vary.
-            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', anchorBody(slot))}${heartbeatLine(session?.id)}`
+            // body, the recent-work section and the heartbeat vary.
+            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', anchorBody(slot)).replace(
+              '{{recent_work}}',
+              recentSection(slot),
+            )}${heartbeatLine(session?.id)}`
           },
         }),
       'dsh-memory.anchor-section',
@@ -1284,32 +1363,29 @@ const ANCHOR_NOTHING_YET = '（还没有全局摘要，也没有用户画像；�
 const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_generate` 生成。）'
 
 /**
- * The anchor block: what the model sees instead of the digest itself.
- * `{{memory_anchor}}` is replaced with the Python-rendered pointer text.
+ * The anchor block.
  *
- * What a tool's `description` already says is deliberately absent here: this
- * block is resident in every request, so it carries only what the model cannot
- * read off the tool list — when a fact is worth storing, where each kind of
- * memory actually lands, and the sharp edges of read/forget.
+ * `{{memory_anchor}}` is the Python-rendered count line (digest size and age,
+ * profile size), and `{{recent_work}}` this project's newest work lines — or
+ * nothing, when the project has no memories yet.
+ *
+ * What a tool's own definition already says stays out of here: this block is
+ * resident in every request and the full tool schemas ride along with it, so
+ * repeating names and parameters would only cost tokens and drift. What it
+ * carries is what no single tool description can hold — the order the tools
+ * are meant to be used in, and the edge each one has.
  */
 const ANCHOR_HEADER = [
   '## 记忆',
-  '跨会话持久记忆：全机共享一个库，按工作目录推导的项目隔离。当前状态如下（只有规模与时间，不含正文）：',
+  '跨会话持久记忆：全机共享一个库，按工作目录推导项目。工具定义见工具列表，这里只写工具定义装不下的使用顺序与边界。',
   '',
   '{{memory_anchor}}',
   '',
-  '**写入**：库不会自动抄录对话，**只有你调用 `memory_add` 才会写入**（另有会话结束时的一次补漏）。',
-  '- 值得存：经验教训、已定的决策与理由、踩过的坑、操作规则、用户明确偏好；`event_type` 对号入座。',
-  '- 不要存：闲聊、能从代码或文档直接读到的、一次性的中间步骤。',
-  '- 一条 = 一句话说清关键实体与结论（含文件、命令、项目名），以后才能按问题检索到。',
-  '- 偏好与教训**不进摘要、也不进画像**：只能靠 `memory_add` + 检索留住。',
+  '{{recent_work}}',
   '',
-  '**读取**：用户提到"之前说过""上次""我们的约定"时，先 `memory_recall`（或 `memory_search`）再回答，不要凭印象编造。',
-  '- 摘要、`DSH_MEMORY.md` 只记工程动作；经验、决策、偏好、坑只在检索里。',
-  '- 本项目做过什么：读仓库根的 `DSH_MEMORY.md`（同样不含偏好）。',
-  '- 召回默认只给 `active`；淡出检索的条目不会被删，`memory_search` 里靠 `state`（active / dormant / archived）能找回。',
-  '- 用户画像只能读，由用户自己在设置页维护。',
-  '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"，别说成彻底删除。',
+  '**收尾时写**：库不会自动抄录对话，**只有调用 `memory_add` 才会写入**（另有会话结束时的一次补漏）。任务收尾或提交前，把值得留下的经验、决策与理由、踩过的坑、操作规则写成一条，`summary` 一句话说清关键实体与结论（含文件、命令、项目名）——一句话，太长会挤占这里的篇幅；不存闲聊、代码里能直接读到的、一次性中间步骤，用户偏好照记原话。偏好与教训**不进摘要、也不进画像**，只能靠 `memory_add` + 检索留住。',
+  '',
+  '**回答前读**：用户提到"之前说过""上次""我们的约定"时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造；换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。摘要与 `DSH_MEMORY.md` 只记工程动作，经验、决策、偏好、坑只在检索里。用户画像只能读，由用户自己在设置页维护。`memory_forget` 是软删除：做完告知用户"已归档、可恢复"，别说成彻底删除。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
@@ -1328,8 +1404,16 @@ const SKILL_INDEX_HEADER = [
   '执行某个技能前先 `skill_get` 读完整步骤；正文细节不要凭索引里的摘要臆测。',
 ].join('\n')
 
-/** Shown when the project has no skills yet. */
-const SKILL_INDEX_EMPTY = '（本项目还没有技能。遇到可复用的做法时，可以用 `skill_create` 存一个。）'
+/**
+ * Shown when the project has no skills yet.
+ *
+ * The "check for a duplicate first" half moved here from the authoring rule:
+ * the host already publishes its own skill catalog ("do not infer until
+ * loaded"), and this line is what the model reads next, so it must not invite
+ * creating one — it must point at the same dedupe step as the rule below.
+ */
+const SKILL_INDEX_EMPTY =
+  '（本项目还没有技能。确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`；只探索过的做法先不存。）'
 
 /**
  * When saving a procedure is allowed.

@@ -34,6 +34,10 @@ DSH_MEMORY.md
 .tmp_*
 *.log
 
+# Scratch directory used by local experiments and probes; its contents are
+# regenerable and include local paths and probe databases.
+.memtest/
+
 # Ad-hoc verification artifacts for the rail markup: written against the local
 # build and not part of the plugin, so they stay out of history.
 .verify-rail.cjs

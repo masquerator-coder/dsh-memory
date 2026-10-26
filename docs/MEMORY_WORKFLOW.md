@@ -47,13 +47,13 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
 
 `systemPrompt.section.text(context)` 被同步调用，内部触发一次**异步** `digest.anchor`（`index.js:646-672`）：
 
-- 锚点缓存按 `cwd` 分槽；
-- 15 秒内复用旧文本（`ANCHOR_REFRESH_MS = 15_000`，`index.js:35`）；
+- 锚点缓存按 `cwd` 分槽：`@@dsh-memory` 计数行与画像行是全局的，紧随其后的**本项目最近工作**按项目不同；
+- 15 秒内复用旧文本（`ANCHOR_REFRESH_MS = 15_000`，`index.js:43`）；
 - 第一次装配时缓存为空，所以模型看到的是规则 + 占位文本：
   `（还没有可用的记忆摘要。）`
-- 锚点**只含摘要规模、时间、用户画像规模**，不含正文（`summary.py:761-816`）。
+- 计数行**只含摘要规模、时间、用户画像规模**，不含摘要正文（`summary.py:807-826`）；正文由 `{{recent_work}}` 单独提供：当前项目最新 `memory.list` 条目，最多 8 条、合计 ≤400 字（`RECENT_CHARS` / `RECENT_LIMIT`），超出时尾注指向 `memory_search`，没有记忆的项目整节省略。
 
-锚点末尾还有固定的写入职责说明：只有模型主动 `memory_add` 才会写入（`index.js:1049-1067`）。
+锚点里的写入/读取职责说明只写工具定义装不下的部分——收尾时写、回答前读、两条工具链的顺序（`memory_recall` → 换说法用 `memory_search`；`skill_list` 查重 → `skill_create` → 执行前 `skill_get`）；工具名与参数不在此重复（`index.js` 末尾 `ANCHOR_HEADER`）。
 
 #### （2）第一次工具调用才注册项目
 
@@ -74,7 +74,7 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
 
 | 入口 | 触发方式 | 实际行为 |
 |---|---|---|
-| 系统提示词锚点 | 每次提示词装配 | 15 秒节流的规模/时间信息，不含正文 |
+| 系统提示词锚点 | 每次提示词装配 | 15 秒节流的规模/时间信息 + 本项目最近 ≤400 字的工作条目，不含摘要正文 |
 | `memory_recall` | 模型主动调用 | 按问题做 L2+L3 混合检索 |
 | `memory_search` | 模型主动调用 | SQL 列表/筛选，不按相关度排序 |
 | `memory_digest_read` | 模型主动调用 | 读全局摘要全文 |
@@ -205,13 +205,13 @@ L3 写时校验顺序（`l3.py:512-619`）：
 | 时机 | 触发者 | 动作 | 是否写库 |
 |---|---|---|---|
 | 插件加载 | DSH | 注册工具/锚点/事件/路由，不启动子进程 | 否 |
-| 首次提示词装配 | 系统提示词 | `digest.anchor` 异步刷新，首屏为占位 | 否 |
+| 首次提示词装配 | 系统提示词 | `digest.anchor` + 本项目 `memory.list` 异步刷新，首屏为占位 | 否 |
 | 首次工具调用 | 模型 | `projects` 注册项目 + 创建 `DSH_MEMORY.md` | 是（projects） |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
 | 检索 | 模型 | `memory_recall` → 融合排序 + 强化命中的行 | 是（access_count） |
 | 审阅 | 模型/设置页 | `memory_search` / `memory.list` | 否 |
 | 用户要求遗忘 | 模型/设置页 | 软归档 + `forgotten_at` | 是 |
-| 每 N 个 `turn/start` | 插件 | 提示词尾部追加“记忆提醒” | 否 |
+| 每 N 个 `step/start` | 插件 | 提示词尾部追加“记忆提醒” | 否 |
 | `turn/end` | 插件 | 15 秒防抖后自动生成全局摘要 | 是（memory_digests） |
 | `session/disposed` | 插件 | 一次模型补写检查 | 是（通常 0–N 条） |
 | 设置页操作 | 用户 | 改配置/画像/条目/摘要/备份 | 是 |
@@ -355,7 +355,7 @@ score = similarity * (0.2 + 0.8 * R)
 | 首次 `memory_recall` | 空库返回“没有检索到相关记忆”；同时注册项目 `acme-demo-repo`，创建 `DSH_MEMORY.md` |
 | `memory_add` 带 2 条事实 | 写入 `ep_690a...`；`uses` 成功，`lives_in` 被 `unknown_relation` 拒绝，并提示合法关系表 |
 | 重复写同一条 | 返回同一个 `memory_id`，未新增行 |
-| 心跳 | 2 个 `turn/start` 后出现“距上次调用 memory_add 已过 2 个回合” |
+| 心跳 | 2 个 `step/start` 后出现“距上次调用 memory_add 已过 2 个模型步” |
 | 写入 preference | 成功，但**没有**进入摘要材料，也**没有**进入 `DSH_MEMORY.md` |
 | `turn/end` + 400ms | 自动摘要 `status=ok, scope=global, reason=auto, 119 字 / 53 tokens` |
 | 15 秒后装配 | 锚点出现摘要规模/时间；15 秒内仍是旧占位 |
@@ -408,8 +408,8 @@ python -m memory_system memory.recall '{\"home\":\"C:\\\\temp\\\\mem\",\"cwd\":\
 2. **会话开始时没有自动读取 `DSH_MEMORY.md`**
    `AGENTS.md` 要求新会话先读该文件，但代码只把它当作普通文件放在仓库根；插件不会自动注入其内容。模型需要自己打开文件，或通过 `memory_recall` 检索。
 
-3. **心跳按 `turn/start` 计数，不是按模型 step**
-   代码监听的是 `turn/start`（`index.js:310-315`），注释和 README 写的是“模型回合/步”。实际是“用户回合数”。
+3. ~~心跳按 `turn/start` 计数，不是按模型 step~~（已修）
+   代码曾监听 `turn/start`，而提示词写的是“已过 N 个回合”，于是一个跑 30 次工具调用的长回合只算 1 步，提醒在最该出现时沉默。现在改听 `step/start`（`index.js` 心跳 section），文案随之改为“个模型步”。回归检查：`node dsh-memory-plugin/selfcheck.js`。
 
 4. **L4 技能系统已接入（只做项目作用域）**
    Python 侧原本就有完整的 skills / trajectories / governance，插件现在通过桥接命令
