@@ -744,21 +744,18 @@ export function apply(ctx, rawConfig) {
      * includes it. That is a deliberate trade: a stale-by-seconds count line
      * beats a prompt that blocks on a child process.
      *
-     * The cache is keyed by working directory, because concurrent sessions in
-     * different projects assemble in the same window; one shared slot let a
-     * second project render the first project's memory counts.
+     * One slot, not one per working directory. `digest.anchor` takes no cwd and
+     * answers the same global text (the cross-project digest and the user
+     * profile) for every caller, so keying the cache by directory only made N
+     * projects each age out and each pay for an identical bridge round trip.
+     * The directory stays in the signature because assembly still has to know
+     * which session it is rendering for.
      */
-    const anchorCaches = new Map()
+    const anchorSlotShared = { at: 0, text: '', summary: null, profile: null, pending: false }
 
-    /** @param {string} cwd - session working directory, '' when unknown. */
-    function anchorSlot(cwd) {
-      const key = cwd || ''
-      let slot = anchorCaches.get(key)
-      if (!slot) {
-        slot = { at: 0, text: '', summary: null, profile: null, pending: false }
-        anchorCaches.set(key, slot)
-      }
-      return slot
+    /** @param {string} _cwd - session working directory; the anchor is global. */
+    function anchorSlot(_cwd) {
+      return anchorSlotShared
     }
 
     /**
@@ -831,9 +828,10 @@ export function apply(ctx, rawConfig) {
           interpolate: false,
           text: (context) => {
             refreshAnchor(context)
-            // Same assembly context the refresh just looked at.
+            // Same assembly context the refresh just looked at. One shared
+            // slot: the anchor body is global, so every session reads it.
             const session = context?.agent?.session
-            const slot = anchorCaches.get(session?.header?.cwd ?? '')
+            const slot = anchorSlot(session?.header?.cwd ?? '')
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
             // body and the heartbeat vary.
