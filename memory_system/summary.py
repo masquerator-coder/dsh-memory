@@ -1324,10 +1324,14 @@ def export_markdown(
         names = {e.entity_id: e.name for e in memory.entities(pid)}
         out += [f"### 项目 {pid}", ""]
         for edge in edges:
+            # Four decimals, not two: a restored edge must keep the confidence
+            # it was exported with. ``:.2f`` turned every value below 0.005 into
+            # 0.00 and everything at or above 0.995 into 1.00, so a round trip
+            # silently rewrote the graph's certainty.
             out.append(
                 f"- `{edge.edge_id}` {names.get(edge.head_id, edge.head_id)} --"
                 f"{edge.relation}--> {names.get(edge.tail_id, edge.tail_id)} "
-                f"（置信度 {edge.confidence:.2f}）"
+                f"（置信度 {edge.confidence:.4f}）"
             )
         out.append("")
     return "\n".join(out).rstrip() + "\n"

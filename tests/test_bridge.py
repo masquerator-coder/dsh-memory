@@ -103,6 +103,44 @@ def _seeded_home(tmp_path) -> Path:
     return home
 
 
+def test_backup_keeps_edge_confidence_across_a_round_trip(tmp_path):
+    """A restored edge must carry the confidence it was exported with.
+
+    The exporter formatted confidence with two decimals, so every value below
+    0.005 became ``0.00`` and everything at or above 0.995 became ``1.00``:
+    a backup silently rewrote the graph's certainty.
+    """
+    from memory_system import FactInput
+
+    home = tmp_path / "home"
+    memory = MemorySystem(MemoryConfig.for_home(home))
+    try:
+        memory.ensure_project("proj-conf")
+        for head, confidence in (("a", 0.001), ("b", 0.5), ("c", 0.999)):
+            memory.l3.add_fact(
+                "proj-conf",
+                FactInput(head=head, relation="related_to", tail="z", confidence=confidence),
+            )
+        text = export_markdown(memory)
+    finally:
+        memory.close()
+
+    parsed = parse_backup_markdown(text)
+    got = sorted(round(fact["confidence"], 4) for fact in parsed["facts"])
+    assert got == [0.001, 0.5, 0.999]
+
+
+def test_parse_backup_reads_both_confidence_widths():
+    """Old backups wrote two decimals; new ones write four. Both must parse."""
+    from memory_system.bridge import _FACT_LINE
+
+    old = _FACT_LINE.match("- `ed_1` a --rel--> b （置信度 0.82）")
+    new = _FACT_LINE.match("- `ed_2` a --rel--> b （置信度 0.8200）")
+    assert old is not None and new is not None
+    assert old.group(5) == "0.82"
+    assert new.group(5) == "0.8200"
+
+
 def test_backup_export_stays_inline_when_it_fits(tmp_path):
     home = _seeded_home(tmp_path)
     response = handle(
