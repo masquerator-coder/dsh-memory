@@ -107,6 +107,52 @@ def test_knn_window_grows_when_scope_rows_rank_beyond_the_fetch():
         conn.close()
 
 
+def test_knn_window_never_exceeds_the_backend_limit():
+    """A scope smaller than ``k`` must return what exists, not raise.
+
+    The over-fetch window doubles until it satisfies ``k`` or exhausts the
+    table. A scope with fewer members than ``k`` can never satisfy it, so on a
+    table larger than the backend's k limit (4096 in sqlite-vec) the window
+    doubled past it and the query raised ``OperationalError`` — a small project
+    stopped being recallable once the shared vector table grew.
+    """
+    import sqlite3
+
+    from memory_system.embedding import _l2_normalize
+    from memory_system.vectors import MAX_KNN_K, VectorIndex
+
+    pytest.importorskip("sqlite_vec")
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    index = VectorIndex(conn, dim=3, enabled=True)
+    try:
+        query = _l2_normalize([1.0, 0.0, 0.0])
+        # An index larger than the backend's k limit is what made widening
+        # walk past it. The rows are inserted directly: this is about the query
+        # window, not about ranking.
+        for j in range(1, MAX_KNN_K + 1200):
+            index.upsert("l2", j, _l2_normalize([1.0, (j % 500) * 0.001, 0.0]))
+
+        # One allowed row, k=5: impossible to satisfy, must degrade instead.
+        hits = index.knn("l2", query, k=5, allowed_rowids={7})
+        assert [rid for rid, _ in hits] == [7]
+
+        # A scope smaller than k but bigger than one keeps every member.
+        allowed = {11, 12, 13}
+        hits = index.knn("l2", query, k=5, allowed_rowids=allowed)
+        assert {rid for rid, _ in hits} == allowed
+
+        # And a large enough scope still fills k.
+        allowed = set(range(1, 200))
+        hits = index.knn("l2", query, k=5, allowed_rowids=allowed)
+        assert len(hits) == 5
+        assert set(rid for rid, _ in hits) <= allowed
+    finally:
+        conn.close()
+
+
 def test_exact_scan_fallback(monkeypatch):
     from memory_system.vectors import VectorIndex
 

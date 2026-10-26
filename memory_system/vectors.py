@@ -24,6 +24,11 @@ from .storage import VEC_TABLES
 
 _KIND_FALLBACK_TABLE = "_fallback_vectors"
 
+# sqlite-vec refuses a knn request larger than this
+# ("k value in knn query too large, provided N and the limit is 4096"), so the
+# over-fetch window in :meth:`VectorIndex.knn` must never ask for more.
+MAX_KNN_K = 4096
+
 
 def pack_vector(vec: Sequence[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
@@ -175,11 +180,24 @@ class VectorIndex:
                 # and filter. A starved window must not quietly return fewer
                 # than k while allowed candidates still exist deeper in the
                 # ranking (scope-restricted recall would otherwise depend on
-                # how well-scoped rows rank globally), so double the window
+                # how well-scoped rows rank globally), so widen the window
                 # until the fetch is satisfied or the table is exhausted.
+                #
+                # The window is capped: sqlite-vec rejects ``k > 4096``
+                # outright, and since the window only ever holds
+                # ``min(fetch, total)`` rows, a request whose allowed set is
+                # smaller than k can *never* satisfy ``len(filtered) >= k``.
+                # Doubling without a cap then walked 64 -> 128 -> ... -> 5120 on
+                # a table with more than 4096 vectors and raised
+                # ``OperationalError`` instead of returning the rows it had --
+                # a project with a couple of memories stopped being recallable
+                # the moment the shared table outgrew 4096 rows. Capping means
+                # such a caller gets the allowed rows that exist, which is the
+                # honest answer: it asked for k and there are fewer.
                 total = self.count(kind)
+                if total <= 0:
+                    return []
                 fetch = max(k * 8, 64)
-                filtered = []
                 while True:
                     rows = self.conn.execute(
                         f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
@@ -188,7 +206,9 @@ class VectorIndex:
                     filtered = [r for r in rows if r["rowid"] in allowed_rowids]
                     if len(filtered) >= k or len(rows) < fetch:
                         break
-                    fetch *= 2
+                    if fetch >= MAX_KNN_K:
+                        break
+                    fetch = min(fetch * 2, MAX_KNN_K, total)
                 filtered = filtered[:k]
             out: list[tuple[int, float]] = []
             for r in filtered:
