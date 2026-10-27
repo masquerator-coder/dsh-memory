@@ -301,6 +301,17 @@ def _project(payload: dict[str, Any]) -> str:
     return resolve_project_id(payload.get("cwd"))
 
 
+def _is_known_project(project: str | None) -> bool:
+    """Whether a resolved project id names a real project.
+
+    ``ProjectResolver.resolve`` answers ``"unknown"`` when it has neither a cwd
+    nor a git remote, and a caller that treats that as "any project" reads every
+    project's rows at once. That is how one checkout's recent work showed up in
+    another checkout's system prompt.
+    """
+    return bool(project) and project != "unknown"
+
+
 def _refresh_project_summary(memory: MemorySystem, project_id: str) -> None:
     """Keep the project's root Markdown in step with a memory edit/write."""
     try:
@@ -560,9 +571,22 @@ def cmd_digest_anchor(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
 @command("memory.list")
 def cmd_memory_list(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     project = _project(payload)
+    all_projects = _bool(payload.get("all_projects"))
+    # An id that did not resolve is not "every project": refuse, rather than
+    # answering with the whole store to a caller that asked for its own scope.
+    if not all_projects and not _is_known_project(project):
+        return {
+            "items": [],
+            "total": 0,
+            "limit": _limit(payload, "limit", 50, 500),
+            "offset": max(0, int(payload.get("offset") or 0)),
+            "project_id": project or None,
+            "error": "unknown_project",
+            "detail": "project_id could not be resolved; pass project_id, cwd or all_projects",
+        }
     notepad = MemoryNotepad(memory)
     listing = notepad.list(
-        project_id=None if _bool(payload.get("all_projects")) else project,
+        project_id=None if all_projects else project,
         query=payload.get("query"),
         state=payload.get("state") or None,
         event_type=payload.get("event_type") or None,

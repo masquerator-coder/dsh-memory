@@ -802,27 +802,46 @@ export function apply(ctx, rawConfig) {
 
   if (config.systemPromptAnchor) {
     /**
-     * One slot, not one per working directory.
+     * One slot for the global part, one slot per working directory for the
+     * project part.
      *
      * The `@@dsh-memory` count line and the profile are global — `digest.anchor`
      * ignores the caller's directory — so keying that part by directory only
      * made N projects each age out and each pay for an identical round trip.
-     * `recent` is per project, but the refresh is on one slot: the extra
-     * `memory.list` rides along with the anchor call it already makes.
+     * `recent` is per project, so it is keyed by cwd: a shared slot let a
+     * refresh stamped for one directory install its lines under every other
+     * session, which is how another project's work reached the block.
      */
     const anchorSlotShared = {
       at: 0,
       text: '',
       summary: null,
       profile: null,
-      recent: null,
       pending: false,
       failed: false,
     }
 
-    /** @param {string} _cwd - session working directory; the anchor is global. */
+    /** @type {Map<string, {recent: {lines: string[], truncated: boolean, ok: boolean} | null, at: number}>} */
+    const recentSlots = new Map()
+
+    /** @param {string} cwd - session working directory; the global part is shared. */
     function anchorSlot(_cwd) {
       return anchorSlotShared
+    }
+
+    /**
+     * The recent-work entry for one directory.
+     * @param {string} cwd - session working directory, '' when unknown.
+     * @returns {{recent: {lines: string[], truncated: boolean, ok: boolean} | null, at: number}} the entry.
+     */
+    function recentSlot(cwd) {
+      const key = cwd || ''
+      let slot = recentSlots.get(key)
+      if (!slot) {
+        slot = { recent: null, at: 0 }
+        recentSlots.set(key, slot)
+      }
+      return slot
     }
 
     /**
@@ -850,22 +869,35 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * Read the count line, the profile and the project's recent work into the
-     * shared slot.
+     * Read the count line, the profile and the project's recent work.
      *
      * The count line and the profile are global — one cross-project digest, for
-     * every session. The per-project lines are read next to it, and a failure
-     * there must not lose the global part.
+     * every session, stamped by the shared slot's `at`. The per-project lines
+     * are read into that directory's own slot, and a failure there must not
+     * lose the global part.
+     *
+     * A recent-work read that did not happen (`ok: false`) is not stored: the
+     * directory keeps whatever it had and its slot stays unstamped, so the next
+     * assembly retries instead of serving a wrong or empty block for a whole
+     * refresh window.
      * @param {string} cwd - session working directory, '' when unknown.
      */
     async function loadAnchor(cwd) {
       const slot = anchorSlotShared
-      await readAnchorLine()
+      const recent = recentSlot(cwd)
       try {
-        slot.recent = await refreshRecent(cwd)
-      } catch (error) {
-        logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
-        slot.recent = { lines: [], truncated: false }
+        await readAnchorLine()
+        try {
+          const result = await refreshRecent(cwd)
+          if (result.ok) {
+            recent.recent = result
+            recent.at = Date.now()
+          }
+        } catch (error) {
+          logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
+          recent.recent = { lines: [], truncated: false, ok: true }
+          recent.at = Date.now()
+        }
       } finally {
         slot.at = Date.now()
         slot.pending = false
@@ -902,12 +934,22 @@ export function apply(ctx, rawConfig) {
      * A project with no memories answers `[]`, and the block then omits the
      * section entirely instead of advertising emptiness every turn.
      *
+     * `ok: false` means the project could not be resolved, which is not the
+     * same as an empty project: the read never happened. The caller must not
+     * cache that state, and must not fall back to an unfiltered query — an
+     * empty project id makes `memory.list` list every project's memories, so a
+     * session whose cwd is not known yet would carry another project's work in
+     * its recent-work block for a full refresh window.
+     *
      * @param {string} cwd - the session's working directory.
-     * @returns {Promise<{lines: string[], truncated: boolean}>} the lines.
+     * @returns {Promise<{lines: string[], truncated: boolean, ok: boolean}>} the lines.
      */
     async function refreshRecent(cwd) {
       const projectId = await projectFor(cwd)
-      if (!projectId) return { lines: [], truncated: false }
+      if (!projectId) {
+        logger.warn(`[dsh-memory] recent-work skipped: no project for cwd ${JSON.stringify(cwd)}`)
+        return { lines: [], truncated: false, ok: false }
+      }
       const result = await call('memory.list', {
         project_id: projectId,
         limit: RECENT_LIMIT,
@@ -924,7 +966,7 @@ export function apply(ctx, rawConfig) {
         lines.push(line)
         used += line.length
       }
-      return { lines, truncated: items.length > lines.length }
+      return { lines, truncated: items.length > lines.length, ok: true }
     }
 
     /**
@@ -954,13 +996,15 @@ export function apply(ctx, rawConfig) {
      * Absent is not the same as empty here: a fresh project would otherwise
      * spend resident tokens announcing that it has nothing.
      *
-     * @param {{recent?: {lines?: string[], truncated?: boolean} | null}} slot - anchor cache entry.
+     * @param {{recent?: {lines?: string[], truncated?: boolean} | null} | null} entry -
+     *   this directory's recent-work slot; null when it was never read.
      * @returns {string} the section, or ''.
      */
-    function recentSection(slot) {
-      const lines = slot?.recent?.lines ?? []
+    function recentSection(entry) {
+      const recent = entry?.recent
+      const lines = recent?.lines ?? []
       if (lines.length === 0) return ''
-      const tail = slot.recent.truncated
+      const tail = recent.truncated
         ? `- …更早的用 \`memory_search\`（state 可查 dormant/archived）或读仓库根的 \`DSH_MEMORY.md\``
         : '- 全量历史读仓库根的 `DSH_MEMORY.md`'
       return ['**本项目最近的工作**（从新到旧，节选用）', ...lines, tail].join('\n')
@@ -994,17 +1038,18 @@ export function apply(ctx, rawConfig) {
           interpolate: false,
           text: (context) => {
             refreshAnchor(context)
-            // Same assembly context the refresh just looked at. One shared
-            // slot: the count line is global, so every session reads it; only
-            // the recent-work section is this project's.
+            // Same assembly context the refresh just looked at. The count line
+            // is global, so every session reads the shared slot; the
+            // recent-work section comes from this directory's own slot.
             const session = context?.agent?.session
-            const slot = anchorSlot(session?.header?.cwd ?? '')
+            const cwd = session?.header?.cwd ?? ''
+            const slot = anchorSlot(cwd)
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
             // body, the recent-work section and the heartbeat vary.
             return `${ANCHOR_HEADER.replace('{{memory_anchor}}', anchorBody(slot)).replace(
               '{{recent_work}}',
-              recentSection(slot),
+              recentSection(recentSlot(cwd)),
             )}${heartbeatLine(session?.id)}`
           },
         }),
@@ -1016,10 +1061,22 @@ export function apply(ctx, rawConfig) {
      *
      * Digest generation and profile writes use this so the next prompt
      * assembly sees the new state; the 15s TTL stays for ordinary sessions.
+     *
+     * Those callers only change the global part. The project's recent work is
+     * re-read when a session cwd is known (a memory write may have changed it);
+     * with no cwd there is nothing project-specific to refresh, so the global
+     * read alone runs — calling the recent-work read with an empty path is how
+     * a block for the wrong project (or for every project) could be installed.
      */
     refreshAnchorNow = async () => {
       anchorSlotShared.pending = true
-      await loadAnchor(lastCwd.value || '')
+      const cwd = lastCwd.value || ''
+      if (!cwd) {
+        anchorSlotShared.pending = false
+        await readAnchorLine()
+        return
+      }
+      await loadAnchor(cwd)
     }
 
     // Warm the global part at load. Assembly is synchronous, so without this
