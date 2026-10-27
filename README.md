@@ -94,7 +94,7 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并立即生成该项目的 `DSH_MEMORY.md`。
 4. **读写**：模型通过 `memory_add` 主动写入记忆；通过 `memory_recall` / `memory_search` / `memory_digest_read` / `memory_profile_read` 读取。**当前版本不会自动抄录对话。**
 5. **技能**：模型通过 `skill_create` 把**验证过、可复用**的做法存成本项目技能，`skill_list` / `skill_get` 查看，`skill_run` 记录执行结果，`skill_retire` 退役。见下文「L4 程序性技能」。
-6. **心跳**：自上次写入起每经过 `heartbeatSteps` 个**模型步**（`step/start`，一个模型步 = 一次模型调用），在提示词尾部追加一次记忆提醒；`0` 关闭。
+6. **心跳（默认关闭）**：自上次写入起每经过 `heartbeatSteps` 个**模型步**（`step/start`，一个模型步 = 一次模型调用）在提示词尾部出现一次记忆提醒，随后重新计数；`0` 关闭。提醒文本在系统提示词里，所以它每出现/消失一次都会让前缀缓存失效，默认关。
 7. **回合结束**：`turn/end` 后等待 `autoSummaryDelayMs`（默认 15 秒）。同一会话再次结束会取消并重排定时器；全局摘要同时只允许一个生成任务。
 8. **会话销毁**：若本会话有真实对话且有可用模型路由，再调用一次模型检查遗漏，最多补写 10 条，来源标记为 `dsh-session-end`；失败只记 warning，不阻塞销毁。
 
@@ -103,7 +103,7 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | 时机 | 触发者 | 动作 | 写库 |
 |---|---|---|---|
 | 插件加载 | DSH | 注册工具 / 锚点 / 技能索引 / 事件 / 路由 | 否 |
-| 首次提示词装配 | 系统提示词 | 异步刷新锚点、本项目最近工作与技能索引，首屏为占位 | 否 |
+| 首次提示词装配 | 系统提示词 | 异步刷新锚点、本项目最近工作与技能索引，首屏显示「正在读取记忆摘要…」 | 否 |
 | 首次工具调用 | 模型 | 注册项目 + 创建 `DSH_MEMORY.md` | 是 |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
 | 模型判断做法可复用 | 模型 | `skill_create` → 本项目 L4 技能（active） | 是 |
@@ -234,7 +234,7 @@ score = similarity × (0.2 + 0.8 × R)
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
 | `skillIndex` | `true` | 是否在系统提示词注入本项目技能索引 |
 | `skillAuthoring` | `true` | 是否告诉模型何时可以把做法存成技能（关闭后模型仍可调用工具，只是没有指引） |
-| `heartbeatSteps` | `20` | 距上次 `memory_add` 经过多少个模型步（`step/start`）后提醒；`0` 关闭 |
+| `heartbeatSteps` | `0` | 距上次 `memory_add` 经过多少个模型步（`step/start`）后提醒一次（随后重新计数）；`0` 关闭。默认关闭，因为它会改写系统提示词、使前缀缓存失效 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型检查遗漏 |
 | `requestTimeoutMs` | `60000` | 单次桥接调用超时；超时会 `ping`，仍无响应则重启子进程 |
 | `embeddingPreset` | `''` | 传给 `MemoryConfig` 的向量化预设；留空用库默认 |
@@ -279,8 +279,8 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 
 1. **没有“会话开始”钩子。** 不会自动读取或注入 `DSH_MEMORY.md`，也不会预加载项目记忆。`AGENTS.md` 里的“先读 `DSH_MEMORY.md`”需要模型自己执行。
 2. **不自动采集对话。** `captureTurns` 是死配置（`index.js` 定义后从未读取）。唯一由模型触发的写入是 `memory_add`；会话结束检查是额外补写。`memory.capture` 命令存在，但插件没有调用。
-3. **锚点有 15 秒缓存。** 新摘要生成后的前 15 秒内仍显示旧文本；首次装配是占位。这是为了不让提示词装配阻塞在子进程上。
-4. **心跳按模型步计数。** 监听的是 `step/start`（一次模型调用）：一个跑 30 次工具调用的长回合算 30 步，不是 1 步。
+3. **锚点有 15 秒缓存，但写入会主动失效。** 摘要生成、画像保存、摘要删除都会立刻重读锚点，下一次装配就能看到新值；普通会话仍按 15 秒 TTL 刷新。冷启动（进程刚起或插件刚重载）的首个装配显示「正在读取记忆摘要…」，读完即替换，不再声称「还没有摘要」。
+4. **心跳按模型步计数，且只在默认关闭时无成本。** 监听 `step/start`（一次模型调用）：一个跑 30 次工具调用的长回合算 30 步。开启后每满一个窗口才出现一次并重新计数；关掉（`0`）则不进入提示词。
 5. **后台维护没有调度者。** 插件不调用 `run_maintenance`，所以 `decay` / `consolidate` / `communities` / `archive_scan` / `promotions` 不会自动运行。召回实时计算 R 仍然正确，但 `state` 列和统计会滞后。技能分层（Hot/Warm/Cold）同样不会自动刷新：`skill.index` 在没有 hot 层时退化为列出全部可见技能。
 6. **L4 只做项目作用域。** 会话与桥接命令都只能读写 project 技能；org / sys 晋升、跨项目备份归档（`SkillArchive`）与轨迹归纳（`maturity`）仍需调用 Python API，插件没有暴露。
 7. **`status.home` 返回数据库文件路径**，不是目录。

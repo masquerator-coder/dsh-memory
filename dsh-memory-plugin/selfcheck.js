@@ -83,21 +83,28 @@ async function assemble(scenario) {
   }
 
   try {
-    apply(stub, {})
-    for (const event of scenario.events ?? []) {
+    // The shipped default is 0 (off); these checks exercise the feature, so
+    // every scenario runs with a 20-step window.
+    apply(stub, { heartbeatSteps: 20 })
+    const emit = (event) => {
       for (const entry of listeners) {
         if (entry.event === 'session/event') entry.listener({ id: 's1', header: { cwd: CWD } }, event)
       }
     }
+    for (const event of scenario.events ?? []) emit(event)
 
     // Assembly is synchronous and the bridge read resolves off to the side:
-    // one pass starts it, the wait lets it land, the second pass renders it.
+    // one pass starts it, the wait lets it land, the next pass renders it.
     const context = { agent: { session: { id: 's1', header: { cwd: CWD } } } }
-    sections.get('dsh-memory:anchor')(context)
+    const render = () => sections.get('dsh-memory:anchor')(context)
+    const anchorFirst = render()
     await new Promise((resolve) => setTimeout(resolve, 30))
     return {
-      anchor: sections.get('dsh-memory:anchor')(context),
+      anchorFirst,
+      anchor: render(),
       skills: sections.get('dsh-memory:skills')(context),
+      render,
+      emit,
     }
   } finally {
     BridgeClient.prototype.call = originalCall
@@ -107,10 +114,10 @@ async function assemble(scenario) {
 
 console.log('heartbeat counts model steps')
 {
-  const { anchor } = await assemble({
+  const { anchorFirst } = await assemble({
     events: [1, 2, 3, 4].map((turn) => ({ type: 'turn/start', data: { turn } })),
   })
-  check(!anchor.includes('记忆提醒'), 'four user turns alone do not trip a 20-step reminder')
+  check(!anchorFirst.includes('记忆提醒'), 'four user turns alone do not trip a 20-step reminder')
 }
 {
   const events = []
@@ -118,9 +125,20 @@ console.log('heartbeat counts model steps')
     events.push({ type: 'turn/start', data: { turn } })
     for (let step = 1; step <= 12; step += 1) events.push({ type: 'step/start', data: { turn, step } })
   }
-  const { anchor } = await assemble({ events })
-  check(anchor.includes('记忆提醒'), '24 model steps across two turns do trip the reminder')
-  check(anchor.includes('个模型步'), 'the reminder names model steps, not user turns')
+  const { anchorFirst, anchor, render, emit } = await assemble({ events })
+  check(anchorFirst.includes('记忆提醒'), '24 model steps across two turns do trip the reminder')
+  check(anchorFirst.includes('个模型步'), 'the reminder names model steps, not user turns')
+  // One reminder per window: emitting it on every later step rewrote the whole
+  // system prompt (and dropped the prefix cache) on every model call.
+  check(!anchor.includes('记忆提醒'), 'the reminder fires once, not on every step past the threshold')
+  for (let step = 1; step <= 20; step += 1) emit({ type: 'step/start', data: { turn: 3, step } })
+  check(render().includes('记忆提醒'), 'another full window fires it again')
+}
+
+console.log('a cold anchor does not claim the store is empty')
+{
+  const { anchorFirst } = await assemble({})
+  check(!anchorFirst.includes('还没有全局摘要'), 'an unread anchor does not report a missing digest')
 }
 
 console.log('recent work is bounded and conditional')

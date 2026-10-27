@@ -71,7 +71,7 @@ patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪�
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
 | `skillIndex` | `true` | 是否注入本项目技能索引（一行一个技能，30 秒缓存） |
 | `skillAuthoring` | `true` | 是否在提示词里告诉模型何时可以 `skill_create`；默认每个会话最多新建 1 个 |
-| `heartbeatSteps` | `20` | 距上次 `memory_add` 经过多少个模型步（`step/start`，一次模型调用算一步）后，在系统提示词里追加一次记忆提醒；`0` 关闭 |
+| `heartbeatSteps` | `0` | 距上次 `memory_add` 经过多少个模型步（`step/start`，一次模型调用算一步）后，在系统提示词里出现一次记忆提醒，随后重新计数；`0` 关闭（默认）。提醒会改写常驻提示词，开启即意味着周期性前缀缓存失效 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型，检查还有没有未写入的记忆 |
 | `requestTimeoutMs` | `60000` | 单次桥接调用超时；超时会重启子进程，避免响应错位 |
 | `embeddingPreset` | `''` | 传给 `MemoryConfig` 的向量化预设 |

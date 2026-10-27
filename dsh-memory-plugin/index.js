@@ -86,8 +86,11 @@ const DEFAULTS_INNER = {
   // is told when it may save a procedure as a new skill.
   skillIndex: true,
   skillAuthoring: true,
-  // Model steps between memory reminders; 0 disables the heartbeat.
-  heartbeatSteps: 20,
+  // Model steps between memory reminders; 0 disables the heartbeat. Off by
+  // default: the reminder rides the system prompt, so each appearance is a
+  // prefix-cache miss for every session in flight, and the session-end check
+  // already covers what would otherwise be lost.
+  heartbeatSteps: 0,
   // Ask the model once, at session teardown, for anything still unwritten.
   sessionEndCheck: true,
   requestTimeoutMs: 60000,
@@ -475,6 +478,15 @@ export function apply(ctx, rawConfig) {
   /** The most recent model route a session used, so digests use a real model. */
   let lastRoute
 
+  /**
+   * Set by the anchor section: re-read the cached anchor immediately.
+   *
+   * A no-op when the anchor section is disabled. Digest generation and profile
+   * writes call it so the next prompt assembly sees the new state instead of
+   * waiting out `ANCHOR_REFRESH_MS` on a stale cache.
+   */
+  let refreshAnchorNow = async () => {}
+
   ctx.on('agent/request', async (payload, next) => {
     // `next()` is the only thing that drives the request; if it throws, the
     // error must reach the host unchanged, so there is nothing to clean up
@@ -687,6 +699,10 @@ export function apply(ctx, rawConfig) {
     // Record what this digest now covers, so the next automatic run can tell
     // whether anything new has been written since.
     lastDigestSources = new Set(plan.sources ?? [])
+    // The anchor caches the count line for `ANCHOR_REFRESH_MS`. Re-read it now:
+    // the whole point of generating a digest is that the next prompt shows it,
+    // and waiting out the cache made the settings page look like it did nothing.
+    await refreshAnchorNow()
     return committed
   }
 
@@ -763,11 +779,66 @@ export function apply(ctx, rawConfig) {
      * `recent` is per project, but the refresh is on one slot: the extra
      * `memory.list` rides along with the anchor call it already makes.
      */
-    const anchorSlotShared = { at: 0, text: '', summary: null, profile: null, recent: null, pending: false }
+    const anchorSlotShared = {
+      at: 0,
+      text: '',
+      summary: null,
+      profile: null,
+      recent: null,
+      pending: false,
+      failed: false,
+    }
 
     /** @param {string} _cwd - session working directory; the anchor is global. */
     function anchorSlot(_cwd) {
       return anchorSlotShared
+    }
+
+    /**
+     * Read the global part of the anchor — the digest count line and the
+     * profile size — into the shared slot.
+     *
+     * A failed read leaves `summary` unknown rather than claiming there is no
+     * digest: the error says nothing about what the store holds.
+     */
+    async function readAnchorLine() {
+      const slot = anchorSlotShared
+      try {
+        const result = await call('digest.anchor', {
+          include_summary: true,
+          include_profile: true,
+        })
+        slot.text = typeof result?.text === 'string' ? result.text : ''
+        slot.summary = Boolean(result?.summary)
+        slot.profile = Boolean(result?.profile)
+        slot.failed = false
+      } catch (error) {
+        slot.failed = true
+        logger.warn(`[dsh-memory] anchor refresh failed: ${error?.message ?? error}`)
+      }
+    }
+
+    /**
+     * Read the count line, the profile and the project's recent work into the
+     * shared slot.
+     *
+     * The count line and the profile are global — one cross-project digest, for
+     * every session. The per-project lines are read next to it, and a failure
+     * there must not lose the global part.
+     * @param {string} cwd - session working directory, '' when unknown.
+     */
+    async function loadAnchor(cwd) {
+      const slot = anchorSlotShared
+      await readAnchorLine()
+      try {
+        slot.recent = await refreshRecent(cwd)
+      } catch (error) {
+        logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
+        slot.recent = { lines: [], truncated: false }
+      } finally {
+        slot.at = Date.now()
+        slot.pending = false
+      }
     }
 
     /**
@@ -784,31 +855,7 @@ export function apply(ctx, rawConfig) {
       if (slot.at > 0 && age < ANCHOR_REFRESH_MS) return
       slot.at = Date.now()
       slot.pending = true
-      void (async () => {
-        // The count line and the profile are global: the one cross-project
-        // digest, for every session. The per-project lines are read next to
-        // it, and a failure there must not lose the global part.
-        try {
-          const result = await call('digest.anchor', {
-            include_summary: true,
-            include_profile: true,
-          })
-          slot.text = typeof result?.text === 'string' ? result.text : ''
-          slot.summary = Boolean(result?.summary)
-          slot.profile = Boolean(result?.profile)
-        } catch (error) {
-          logger.warn(`[dsh-memory] anchor refresh failed: ${error?.message ?? error}`)
-        }
-        try {
-          slot.recent = await refreshRecent(cwd)
-        } catch (error) {
-          logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
-          slot.recent = { lines: [], truncated: false }
-        } finally {
-          slot.at = Date.now()
-          slot.pending = false
-        }
-      })()
+      void loadAnchor(cwd)
     }
 
     /**
@@ -860,8 +907,14 @@ export function apply(ctx, rawConfig) {
      */
     function anchorBody(slot) {
       if (slot?.text) return slot.text
+      // A failed read says nothing about the store: say so instead of claiming
+      // there is no digest.
+      if (slot?.failed) return ANCHOR_READ_FAILED
       if (slot?.summary === false) return ANCHOR_NO_SUMMARY
-      return ANCHOR_NOTHING_YET
+      // Still unknown: the first read has not landed yet. Announcing "no digest
+      // yet" here was wrong whenever a digest existed but the process had just
+      // started (or the plugin had just reloaded).
+      return ANCHOR_LOADING
     }
 
     /**
@@ -890,9 +943,16 @@ export function apply(ctx, rawConfig) {
     function heartbeatLine(sessionId) {
       const threshold = Number(config.heartbeatSteps) || 0
       if (threshold <= 0) return ''
-      const steps = stepsSinceWrite.get(sessionId ?? '') ?? 0
+      const key = sessionId ?? ''
+      const steps = stepsSinceWrite.get(key) ?? 0
       if (steps < threshold) return ''
-      return `\n\n**记忆提醒**：距上次调用 \`memory_add\` 已过 ${steps} 个模型步。若这期间出现了值得长期保留的经验、决策或操作规则，现在就记下来；没有则忽略本条。`
+      // Fire once per window, then restart the count. Returning the reminder on
+      // every step past the threshold rewrote the system prompt on every model
+      // call — the step count in the text changed each time — which invalidated
+      // the provider's prefix cache on every request. The reminder text now
+      // carries the threshold, a constant, and the counter restarts here.
+      stepsSinceWrite.set(key, 0)
+      return `\n\n**记忆提醒**：距上次调用 \`memory_add\` 已过 ${threshold} 个模型步。若这期间出现了值得长期保留的经验、决策或操作规则，现在就记下来；没有则忽略本条。`
     }
 
     ctx.effect(
@@ -919,6 +979,24 @@ export function apply(ctx, rawConfig) {
         }),
       'dsh-memory.anchor-section',
     )
+
+    /**
+     * Re-read the anchor now, for callers that just changed its inputs.
+     *
+     * Digest generation and profile writes use this so the next prompt
+     * assembly sees the new state; the 15s TTL stays for ordinary sessions.
+     */
+    refreshAnchorNow = async () => {
+      anchorSlotShared.pending = true
+      await loadAnchor(lastCwd.value || '')
+    }
+
+    // Warm the global part at load. Assembly is synchronous, so without this
+    // the very first prompt after a host start or a plugin reload carries the
+    // "not read yet" body even though the digest is already on disk. The
+    // per-project lines are not read here: there is no session cwd yet, and
+    // stamping the slot with an empty one would hide them for a full TTL.
+    void readAnchorLine()
   }
 
   // ── L4: skill index section ───────────────────────────────────────────
@@ -1225,6 +1303,9 @@ export function apply(ctx, rawConfig) {
       }
       if (body?.profile !== undefined) {
         await call('profile.write', { content: body.profile })
+        // The anchor carries the profile size; re-read it so the next prompt
+        // does not keep showing the old count until the cache ages out.
+        await refreshAnchorNow()
       }
       const settings = await call('settings.get', {})
       const profile = await call('profile.read', {})
@@ -1233,7 +1314,9 @@ export function apply(ctx, rawConfig) {
 
     route('/dsh-memory/profile', async (body) => {
       if (typeof body?.content === 'string') {
-        return await call('profile.write', { content: body.content })
+        const written = await call('profile.write', { content: body.content })
+        await refreshAnchorNow()
+        return written
       }
       return await call('profile.read', {})
     })
@@ -1250,8 +1333,13 @@ export function apply(ctx, rawConfig) {
           const view = await call('digest.view', {})
           return { ...view, generated: record?.digest ?? null }
         }
-        case 'delete':
-          return await call('digest.delete', { digest_id: body?.digest_id })
+        case 'delete': {
+          const deleted = await call('digest.delete', { digest_id: body?.digest_id })
+          // Dropping the digest changes the anchor body; do not leave the old
+          // count line resident until the TTL expires.
+          await refreshAnchorNow()
+          return deleted
+        }
         case 'history':
           return await call('digest.history', {})
         default:
@@ -1369,12 +1457,14 @@ export function apply(ctx, rawConfig) {
 /**
  * What stands in for the anchor body.
  *
- * The bridge answers `''` when there is neither a digest nor a profile, which
- * is the normal state of a fresh install; the old single placeholder then
- * announced a missing digest even when the section above it showed the live
- * profile, so the two contradicted each other.
+ * `ANCHOR_LOADING` must not claim anything about the store: the slot is empty
+ * on a cold process even when a digest exists, and the first assembly happens
+ * before the asynchronous read returns. Saying "no digest yet" there made a
+ * freshly started (or freshly reloaded) host look like an empty memory.
+ * `ANCHOR_NO_SUMMARY` is only for a read that actually answered "no digest".
  */
-const ANCHOR_NOTHING_YET = '（还没有全局摘要，也没有用户画像；记忆库仍可正常读写。）'
+const ANCHOR_LOADING = '（正在读取记忆摘要…）'
+const ANCHOR_READ_FAILED = '（记忆摘要暂时读取失败；记忆库仍可正常读写。）'
 const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_generate` 生成。）'
 
 /**

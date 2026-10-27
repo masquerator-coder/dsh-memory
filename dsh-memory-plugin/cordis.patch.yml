@@ -29,7 +29,11 @@
         # project-scope skill via `skill_create`.
         skillAuthoring: true
         # Model steps between memory reminders; 0 disables the heartbeat.
-        heartbeatSteps: 20
+        # The reminder lives inside the system prompt, so every time it appears
+        # or changes the whole resident prefix stops matching the provider's
+        # cache. Default off: the session-end check already covers "don't lose
+        # the last insight", and a prompt that never drifts is worth more.
+        heartbeatSteps: 0
         # Ask the model once, at session teardown, for anything still unwritten.
         sessionEndCheck: true
         # Per-bridge-request timeout in ms.
