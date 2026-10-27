@@ -9,13 +9,29 @@
  *    reminder text says so;
  * 2. the recent-work section appears only for a project that has memories,
  *    stays inside its character budget, and disappears without one;
- * 3. the skill index's empty state points at dedupe before authoring.
+ * 3. the skill index's empty state points at dedupe before authoring;
+ * 4. digest generation reaches a model even when no session in this process has
+ *    used one yet, via the deployment default model.
  *
  * Exits non-zero on the first failed expectation.
  */
 
 import { BridgeClient } from './bridge.js'
 import { apply } from './index.js'
+
+/**
+ * The bridge must never start from a self-check.
+ *
+ * `assemble` stubs `BridgeClient.prototype.call`, but the plugin also starts
+ * fire-and-forget reads (anchor refresh, skill index) that can land after a
+ * scenario's stub is restored. Those used to spawn the real Python child, and
+ * any write path among them (a digest commit) lands in the user's real memory
+ * database. Blocking the spawn for the whole process turns such a leak into a
+ * visible failure instead of a silent write.
+ */
+BridgeClient.prototype.ensureChild = async () => {
+  throw new Error('selfcheck: the memory bridge must stay stubbed')
+}
 
 const CWD = 'D:/selfcheck/project'
 const RECENT_BUDGET = 400
@@ -36,17 +52,33 @@ function check(condition, label) {
 }
 
 /**
- * Render the prompt sections for one scenario.
- * @param {{memories?: Array<{summary: string}>, events?: Array<{type: string, data?: any}>}} scenario - inputs.
+ * Render the prompt sections for one scenario, and expose what `apply` mounted.
+ * @param {{memories?: Array<{summary: string}>, events?: Array<{type: string, data?: any}>, llm?: any, defaultModel?: any, run?: (assembled: any) => Promise<void>}} scenario - inputs.
  * @returns {Promise<{anchor: string, skills: string}>} rendered text per section.
  */
 async function assemble(scenario) {
   const sections = new Map()
   const listeners = []
+  const registered = []
+  const services = {
+    tools: {
+      register(definition) {
+        registered.push(definition)
+      },
+    },
+    systemPrompt: {},
+    agents: {},
+  }
+  // The host mounts both of these in every profile; a scenario that omits one
+  // is checking what happens without it, exactly as `ctx.get` reports it.
+  if (scenario.llm) services.llm = scenario.llm
+  if (scenario.defaultModel) services.agentDefaultModel = scenario.defaultModel
+
+  const tools = services.tools
   const stub = {
     get(name) {
-      // Only the three services `apply` hard-requires; `connection` is optional.
-      return ['tools', 'systemPrompt', 'agents'].includes(name) ? {} : undefined
+      // Only the three services `apply` hard-requires; the rest are optional.
+      return services[name]
     },
     effect(fn) {
       const dispose = fn()
@@ -61,19 +93,43 @@ async function assemble(scenario) {
         return () => {}
       },
     },
-    tools: { register() {} },
+    tools,
     inject() {},
     logger: { info() {}, warn() {}, error() {} },
   }
 
   const originalCall = BridgeClient.prototype.call
-  const originalEnsureChild = BridgeClient.prototype.ensureChild
-  // No Python child at all: the check is about prompt text, not the bridge.
-  BridgeClient.prototype.ensureChild = async () => null
+  // Every bridge answer this scenario needs comes from the stub below. The
+  // spawn itself is blocked process-wide at the top of this file, so a read
+  // that escapes this window fails instead of touching the real store.
   BridgeClient.prototype.call = async (command, payload = {}) => {
     if (command === 'projects') return { project_id: 'selfcheck-project' }
     if (command === 'digest.anchor') {
       return { text: '@@dsh-memory 1\n@@', summary: {}, profile: null }
+    }
+    if (command === 'digest.plan') {
+      return {
+        system: 'selfcheck system prompt',
+        user: 'selfcheck user material',
+        sources: [],
+        target_chars: 500,
+        material_chars: 100,
+        prompt_version: 1,
+        has_materials: scenario.hasMaterials !== false,
+      }
+    }
+    if (command === 'digest.commit') {
+      return {
+        digest: {
+          digest_id: 'selfcheck-digest',
+          status: payload.error ? 'error' : 'ok',
+          error: payload.error,
+          text: payload.text,
+          generator: payload.generator,
+          actual_chars: (payload.text ?? '').length,
+          estimated_tokens: 42,
+        },
+      }
     }
     if (command === 'memory.list') {
       return { items: payload.state === 'active' ? (scenario.memories ?? []) : [] }
@@ -91,6 +147,13 @@ async function assemble(scenario) {
         if (entry.event === 'session/event') entry.listener({ id: 's1', header: { cwd: CWD } }, event)
       }
     }
+    // Forward `agent/request` as the loop does: the listener returns the route
+    // a model call is about to use, which is the route the plugin remembers.
+    const request = async (route) => {
+      for (const entry of listeners) {
+        if (entry.event === 'agent/request') await entry.listener({}, async () => route)
+      }
+    }
     for (const event of scenario.events ?? []) emit(event)
 
     // Assembly is synchronous and the bridge read resolves off to the side:
@@ -99,16 +162,42 @@ async function assemble(scenario) {
     const render = () => sections.get('dsh-memory:anchor')(context)
     const anchorFirst = render()
     await new Promise((resolve) => setTimeout(resolve, 30))
-    return {
+    const assembled = {
       anchorFirst,
       anchor: render(),
       skills: sections.get('dsh-memory:skills')(context),
       render,
       emit,
+      request,
+      /** Execute one registered tool the way the loop would. */
+      runTool(name, args = {}) {
+        const definition = registered.find((entry) => entry.name === name)
+        if (!definition) throw new Error(`tool "${name}" was not registered`)
+        return definition.execute(args, context)
+      },
     }
+    // Tool runs must happen inside this `try`: the bridge stub is restored on
+    // the way out, so a digest tool call after `assemble` returns would find no
+    // stub at all.
+    if (scenario.run) await scenario.run(assembled)
+    return assembled
   } finally {
     BridgeClient.prototype.call = originalCall
-    BridgeClient.prototype.ensureChild = originalEnsureChild
+  }
+}
+
+/**
+ * A stub `llm` service that records the route of every stream it serves.
+ * @param {Array<{provider: string, model: string}>} calls - route log to append to.
+ * @returns {{stream: (request: any) => AsyncGenerator<any>}} the stub service.
+ */
+function recordingLlm(calls) {
+  return {
+    async *stream(request) {
+      calls.push({ provider: request.provider, model: request.model })
+      yield { type: 'text-delta', text: '## 示例摘要\n默认模型写出的摘要正文。' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
   }
 }
 
@@ -174,6 +263,55 @@ console.log('skill index empty state')
 {
   const { skills } = await assemble({})
   check(skills.includes('skill_list'), 'the empty state asks for a dedupe check first')
+}
+
+console.log('digest generation finds a model without a session route')
+{
+  // A freshly started host: the settings page is open, no message has been
+  // sent yet, so no session route exists. The digest must still be written.
+  const calls = []
+  let result
+  await assemble({
+    llm: recordingLlm(calls),
+    defaultModel: { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) },
+    async run({ runTool }) {
+      result = await runTool('memory_digest_generate')
+    },
+  })
+  check(calls.length === 1, 'a host with no session route still calls the model once')
+  check(
+    calls[0]?.provider === 'deepseek-official' && calls[0]?.model === 'deepseek-flash',
+    'the fallback uses the deployment default model',
+  )
+  check(!String(result?.text ?? '').includes('失败'), 'the digest is committed instead of failing')
+}
+{
+  // A session route is a route this process has proven works; it stays the
+  // first choice even when a different default model is configured.
+  const calls = []
+  await assemble({
+    llm: recordingLlm(calls),
+    defaultModel: { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) },
+    async run({ runTool, request }) {
+      await request({ provider: 'deepseek-official', model: 'deepseek-pro' })
+      await runTool('memory_digest_generate')
+    },
+  })
+  check(calls[0]?.model === 'deepseek-pro', 'a session route still wins over the default model')
+}
+{
+  // No session route and no default model is a genuine dead end: report it
+  // rather than pretending a digest was written by nobody.
+  const calls = []
+  let result
+  await assemble({
+    llm: recordingLlm(calls),
+    async run({ runTool }) {
+      result = await runTool('memory_digest_generate')
+    },
+  })
+  check(calls.length === 0, 'no model is called when no route is resolvable')
+  check(String(result?.text ?? '').includes('失败'), 'the dead end is still reported as a failure')
 }
 
 if (failures > 0) {

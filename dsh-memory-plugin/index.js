@@ -497,6 +497,35 @@ export function apply(ctx, rawConfig) {
   })
 
   /**
+   * The model route a host-side call should use right now.
+   *
+   * A route observed on a session wins: this process already proved it works,
+   * and the digest should be written by the model that wrote the work it
+   * summarizes. A fresh process has no such route until its first message is
+   * sent — which is exactly when the settings page can be opened and its
+   * 「生成」 button pressed — so fall back to the deployment's default model,
+   * the same selection a new agent would be created with. Read lazily, so a
+   * selection saved from the model picker is honored without a restart.
+   * @returns {{ provider: string, model: string } | undefined} a resolvable route.
+   */
+  function hostRoute() {
+    if (lastRoute) return lastRoute
+    let selection
+    try {
+      selection = ctx.get?.('agentDefaultModel')?.currentSelection?.()
+    } catch {
+      // A default model that cannot be read is the same as none: the caller
+      // reports "no model available" instead of failing the whole digest run.
+      return undefined
+    }
+    const provider = selection?.provider
+    const model = selection?.model
+    if (typeof provider !== 'string' || !provider) return undefined
+    if (typeof model !== 'string' || !model) return undefined
+    return { provider, model }
+  }
+
+  /**
    * Read all streamed text from a model call.
    * @param {any} llm - the llm service.
    * @param {{ provider: string, model: string }} route - model route.
@@ -650,14 +679,16 @@ export function apply(ctx, rawConfig) {
       }
     }
     const llm = ctx.get?.('llm')
+    // Session route first, deployment default model second: see `hostRoute`.
+    const route = hostRoute()
     let text = ''
     let error
     let generator = 'host-llm'
     if (!llm) {
       error = 'llm 服务不可用，无法调用模型生成摘要'
       generator = 'unavailable'
-    } else if (!lastRoute) {
-      error = '本进程还没有任何会话使用过模型，无法确定调用哪个模型'
+    } else if (!route) {
+      error = '无法确定要调用的模型：本进程还没有会话使用过模型，也没有可用的默认模型'
       generator = 'unavailable'
     } else if (plan.has_materials === false) {
       // Empty memory is a real state, not a failure: record the honest note.
@@ -667,7 +698,7 @@ export function apply(ctx, rawConfig) {
       try {
         text = await collectText(
           llm,
-          lastRoute,
+          route,
           [
             { role: 'system', content: plan.system },
             { role: 'user', content: plan.user },

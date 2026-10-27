@@ -110,7 +110,8 @@ python -m memory_system status '{\"cwd\": \"D:\\\\Coding\\\\dsh-memory\"}'
 `ctx.llm.stream`，再 `digest.commit` 原样落库。预算写在提示词里（预算越大要求越详细），
 **提交时不再裁剪文本**。因此：
 
-- 摘要生成需要一个已经用过模型的会话进程（插件会记录最近的模型路由）；
+- 模型路由优先用会话最近用过的 provider/model；本进程还没有会话用过模型时（例如刚启动就打开设置页点「生成」），
+  回退到 DSH 的默认模型（`agentDefaultModel` 的 `currentSelection()`，即新建 agent 会用的那一个）；
 - 记忆库为空时不会硬编摘要，而是记录「还没有可总结的工作记录」；
 - 自动生成与手动生成走同一条路径，只有 `reason` 不同；
 - 每次提交还会刷新各项目根目录的 `DSH_MEMORY.md`；该文件由 L2 工作记录派生，失败不会影响摘要。
