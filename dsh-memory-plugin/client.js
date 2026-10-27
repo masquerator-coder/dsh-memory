@@ -465,6 +465,51 @@ window.__ModuleLoader__.load({
     // make each one wide enough to crowd its neighbours.
     const formatLengthValue = (value) => String(value)
 
+    /**
+     * Where a preset sits on the rail, as a percentage of the track.
+     *
+     * The rail is linear in the *value*, not in the preset's index: 300 and 500
+     * are close together and 2000 and 3000 are far apart, which is what makes
+     * the ticks read as a scale instead of as decorations. Clamped, so a stored
+     * budget outside the rail's ends cannot push the bubble off the card.
+     * @param {number} value - a budget.
+     * @param {number} min - the rail's low end.
+     * @param {number} max - the rail's high end.
+     * @returns {number} 0–100.
+     */
+    function railPercent(value, min, max) {
+      if (!(max > min)) return 0
+      const percent = ((value - min) / (max - min)) * 100
+      return Math.min(100, Math.max(0, percent))
+    }
+
+    /**
+     * The preset a value lands on, or the value itself.
+     *
+     * The rail is continuous, so any budget is reachable; but a preset is a
+     * round number a user aims for, and a native range input cannot stop there
+     * by itself. Within the snap window the preset wins, outside it the exact
+     * value does — that is what "slides onto the ticks, and anywhere else" means.
+     * @param {number} value - raw budget from the input.
+     * @param {number[]} presets - the tick values.
+     * @param {number} min - the rail's low end.
+     * @param {number} max - the rail's high end.
+     * @param {number} [tolerance] - window as a percentage of the track.
+     * @returns {{value: number, snapped: boolean}} the value to keep.
+     */
+    function snapToPreset(value, presets, min, max, tolerance = 2) {
+      let best = value
+      let bestDistance = Number.POSITIVE_INFINITY
+      for (const preset of presets) {
+        const distance = Math.abs(railPercent(preset, min, max) - railPercent(value, min, max))
+        if (distance < bestDistance) {
+          bestDistance = distance
+          best = preset
+        }
+      }
+      return bestDistance <= tolerance ? { value: best, snapped: true } : { value, snapped: false }
+    }
+
     const CSS = `
 .mem-root { display: flex; flex-direction: column; gap: 18px; color: var(--dsw-alias-label-primary); }
 .mem-card { background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l1); border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
@@ -490,64 +535,68 @@ window.__ModuleLoader__.load({
 .mem-textarea { width: 100%; min-height: 150px; resize: vertical; line-height: 1.6; font-family: inherit; }
 .mem-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mem-range { flex: 1; min-width: 180px; accent-color: var(--dsw-alias-brand-primary); }
-/* Length rail: the tick labels sit ON the track, not beside it. */
-/* The rail and its unit form one horizontal row; the rail itself stretches,
-   the unit keeps its own width on the right. */
-.mem-rail-wrap { flex: 1; min-width: 260px; display: flex; flex-direction: row; align-items: center; gap: 0; }
-/* The box the ticks are positioned in. Everything is placed from one anchor —
-   --track-y, the distance from this box's top to the groove's centre — so the
-   painted groove, the tick marks, the native input and its thumb cannot drift
-   apart. padding-inline equals half a thumb because the browser's own track
-   spans half a thumb in at each end; the ticks sit on that same span. */
-/* Lanes: the groove lane (whose centre line is H --track-y) then the label row.
-   Every painted part derives from H, and the input's own box spans exactly the
-   groove lane, so its centre — where the browser centres the thumb — is H too.
-   align-items is reset because the enclosing .mem-row centres its items on the
-   cross axis, which would otherwise lay these two lanes out side by side. The
-   height is explicit because the groove and the input are absolutely positioned. */
-.mem-rail { --thumb: 16px; --lane: 24px; --track-y: calc(var(--lane) / 2); --labels: 21px; position: relative; flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: stretch; height: calc(var(--lane) + var(--labels)); padding-inline: calc(var(--thumb) / 2); }
-/* The painted groove and the ticks span the browser's own track, so resizing
-   keeps them aligned without measuring anything. */
-.mem-rail-track { box-sizing: border-box; position: absolute; top: calc(var(--track-y) - 4px); left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2); height: 8px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); }
-/* One painted tick per preset value, laid ON the groove: 2px wide, the full
-   groove height, centred on each value's position so it also reads as the
-   dividing line between one step and the next. The markup adds one .mem-rail-tick
-   per preset; this gradient layer is the fallback when that markup is absent. */
-.mem-rail::before { content: ''; position: absolute; top: calc(var(--track-y) - 4px); left: calc(var(--thumb) / 2); right: calc(var(--thumb) / 2); height: 8px; border-radius: 4px; background: repeating-linear-gradient(to right, var(--dsw-alias-label-secondary) 0 2px, transparent 2px var(--rail-gap, 50%)); opacity: 0; pointer-events: none; }
-.mem-rail:not(:has(.mem-rail-tick))::before { opacity: .5; }
-/* Tick layer: transparent to input; the spans inside place themselves. */
-.mem-rail-ticks { position: absolute; inset: 0; pointer-events: none; }
-/* A tick drawn by markup (one span per preset): the groove lane, 2px wide,
-   centred on its value so it doubles as the divider between two steps.
-   --thumb/2 offsets the first and last ticks onto the track's rounded ends. */
-.mem-rail-tick { position: absolute; top: calc(var(--track-y) - 4px); width: 3px; height: 8px; margin-left: -1.5px; border-radius: 1.5px; background: var(--dsw-alias-label-secondary); opacity: .55; pointer-events: none; }
-.mem-rail-tick[data-current='true'] { background: var(--dsw-alias-brand-primary); opacity: 1; }
-/* The input is anchored to the same line: its box spans the groove lane, so its
-   native track and thumb land on the groove. */
-.mem-rail input { position: absolute; top: 0; left: 0; z-index: 1; box-sizing: border-box; width: 100%; height: var(--lane); margin: 0; padding: 0; background: transparent; -webkit-appearance: none; appearance: none; cursor: pointer; }
-.mem-rail input:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; border-radius: 999px; }
-.mem-rail input::-webkit-slider-runnable-track { height: 8px; border-radius: 999px; background: transparent; }
-.mem-rail input::-moz-range-track { height: 8px; border-radius: 999px; background: transparent; }
-/* The thumb is centred in the groove lane, i.e. exactly on --track-y. */
-.mem-rail input::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: var(--thumb); height: var(--thumb); margin-top: 0; border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 3px rgba(0,0,0,.3); }
-.mem-rail input::-moz-range-thumb { width: var(--thumb); height: var(--thumb); border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 3px rgba(0,0,0,.3); }
-/* One slot per tick, holding its label inside its own width so neighbouring
-   labels keep clear of each other while the slot centres stay fixed at
-   0%/25%/50%/75%/100%. The row sits below the input's lane, never over it. */
-.mem-rail-labels { display: flex; flex: 0 0 var(--labels); margin-top: auto; }
-/* A fixed, one-line-tall row: every slot gets the same height, so all labels
-   share one baseline no matter how many presets there are. */
-.mem-rail-label { position: relative; flex: 1 1 0; min-width: 0; height: 13px; display: flex; align-items: flex-start; justify-content: center; }
-.mem-rail-label > span { max-width: 100%; text-align: center; white-space: nowrap; overflow: hidden; font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); text-shadow: 0 0 3px var(--dsw-alias-bg-layer-1), 0 0 3px var(--dsw-alias-bg-layer-1); }
-.mem-rail-label[data-current='true'] > span { color: var(--dsw-alias-brand-primary); font-weight: 600; }
+/* ── digest-length rail ────────────────────────────────────────────────
+   A continuous rail with a tick per preset value, laid out by VALUE rather than
+   by index: 300 and 500 are close, 2000 and 3000 are not, and the ticks have to
+   show that. Three stacked lanes share one vertical anchor:
+     bubble   the value the thumb currently stands on (the one in the picture)
+     groove   the rail itself, with one tick per preset drawn under it
+     labels   one label per preset, each centred on its own tick
+   --rail-y is the distance from the rail box's top to the groove's centre;
+   --thumb/2 is the inset the native thumb adds at each end, so the painted
+   ticks, the fill, the bubble and the thumb all read from one coordinate. */
+.mem-rail-wrap { flex: 1; min-width: 260px; display: flex; flex-direction: row; align-items: center; }
+.mem-rail { --thumb: 16px; --rail-y: 48px; --ticks: 10px; --labels: 18px; --edge: calc(var(--thumb) / 2); position: relative; flex: 1 1 auto; min-width: 0; height: calc(var(--rail-y) + var(--ticks) + var(--labels)); padding-inline: var(--edge); }
+/* The track is the whole rail width; --pos (set inline per part) is how far
+   along it that part stands, in % of the track. */
+.mem-rail-groove { position: absolute; top: calc(var(--rail-y) - 2px); left: var(--edge); right: var(--edge); height: 4px; border-radius: 999px; background: var(--dsw-alias-border-l1); }
+.mem-rail-fill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--pos, 0%); border-radius: 999px; background: var(--dsw-alias-brand-primary); }
+.mem-rail-ticks { position: absolute; top: calc(var(--rail-y) + 2px); left: var(--edge); right: var(--edge); height: var(--ticks); pointer-events: none; }
+/* One tick per preset, a hairline hanging below the groove so the groove and
+   the thumb still read as the rail while the ticks stay visible. */
+.mem-rail-tick { position: absolute; top: 0; left: var(--pos, 0%); width: 1px; height: 8px; margin-left: -.5px; background: var(--dsw-alias-border-l2); }
+.mem-rail-tick[data-reached='true'] { background: var(--dsw-alias-brand-primary); }
+.mem-rail-labels { position: absolute; top: calc(var(--rail-y) + var(--ticks) + 4px); left: var(--edge); right: var(--edge); height: var(--labels); }
+/* A label is centred on its own value instead of filling a slot: the values are
+   unevenly spaced, and only its centre has to line up with its tick. */
+.mem-rail-label { position: absolute; left: var(--pos, 0%); transform: translateX(-50%); white-space: nowrap; font-size: 11px; line-height: 13px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); }
+.mem-rail-label[data-current='true'] { color: var(--dsw-alias-brand-primary); font-weight: 600; }
+/* Value bubble above the thumb, pointing down at it with a rotated square. */
+.mem-rail-bubble { position: absolute; left: var(--pos, 0%); top: 0; transform: translateX(-50%); padding: 3px 8px; border-radius: 6px; background: var(--dsw-alias-label-primary); color: var(--dsw-alias-bg-layer-1); font-size: 12px; font-weight: 600; line-height: 18px; white-space: nowrap; font-variant-numeric: tabular-nums; pointer-events: none; }
+.mem-rail-bubble::after { content: ''; position: absolute; left: 50%; bottom: -4px; width: 8px; height: 8px; margin-left: -4px; transform: rotate(45deg); border-radius: 1px; background: inherit; }
+/* The native input sits exactly on the groove, so its thumb lands on it: the
+   full-thumb inset of its own track cancels the rail's padding of the same
+   size, which gives the input and the painted groove identical geometry. */
+.mem-rail input { position: absolute; top: calc(var(--rail-y) - 12px); left: 0; z-index: 1; box-sizing: border-box; width: 100%; height: 24px; margin: 0; padding: 0; background: transparent; -webkit-appearance: none; appearance: none; cursor: pointer; }
+.mem-rail input:focus-visible { outline: none; }
+.mem-rail input::-webkit-slider-runnable-track { height: 4px; border-radius: 999px; background: transparent; }
+.mem-rail input::-moz-range-track { height: 4px; border-radius: 999px; background: transparent; }
+/* The thumb: a solid dot on the groove line, with a halo so it reads as
+   grabbable. The halo is the brand colour thinned out via color-mix, so it
+   follows the theme; the plain rgba line above it is the fallback for a
+   renderer without color-mix. */
+.mem-rail input::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; box-sizing: border-box; width: var(--thumb); height: var(--thumb); border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-brand-primary); box-shadow: 0 0 0 4px rgba(37, 99, 235, .18); box-shadow: 0 0 0 4px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent); }
+.mem-rail input::-moz-range-thumb { box-sizing: border-box; width: var(--thumb); height: var(--thumb); border-radius: 50%; border: 2px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-brand-primary); box-shadow: 0 0 0 4px rgba(37, 99, 235, .18); box-shadow: 0 0 0 4px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent); }
+.mem-rail input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 5px rgba(37, 99, 235, .3); box-shadow: 0 0 0 5px color-mix(in srgb, var(--dsw-alias-brand-primary) 30%, transparent); }
+.mem-rail input:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 5px rgba(37, 99, 235, .3); box-shadow: 0 0 0 5px color-mix(in srgb, var(--dsw-alias-brand-primary) 30%, transparent); }
 /* The unit sits beside the rail on the groove's line: same centre as the
    thumb, so it reads as the rail's unit rather than as a stray word. */
-.mem-rail-unit { flex: 0 0 auto; display: flex; align-items: center; padding-left: 8px; padding-top: calc(var(--lane, 24px) / 2); transform: translateY(-50%); font-size: 11px; line-height: 1; color: var(--dsw-alias-label-secondary); }
+.mem-rail-unit { flex: 0 0 auto; align-self: flex-start; margin-top: calc(var(--rail-y, 48px) - 8px); padding-left: 8px; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-secondary); }
+/* The current budget, stated in words beside the rail (the bubble only shows
+   the number and the hint only explains what the number means). */
+.mem-length-current { font-size: 12px; color: var(--dsw-alias-label-secondary); }
 .mem-list { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow: auto; }
-.mem-item { text-align: left; font: inherit; font-size: 13px; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2); color: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+/* One row, always one line high: a row of different heights made the list
+   impossible to scan, so the text is clipped with an ellipsis and the meta is
+   one short phrase pinned to the right. The full text is the row's tooltip. */
+.mem-item { flex: 0 0 auto; min-width: 0; display: flex; align-items: center; gap: 10px; text-align: left; font: inherit; font-size: 13px; line-height: 18px; height: 38px; padding: 0 11px; box-sizing: border-box; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2); color: inherit; cursor: pointer; }
 .mem-item:hover { border-color: var(--dsw-alias-border-l2); }
 .mem-item[aria-selected='true'] { border-color: var(--dsw-alias-brand-primary); }
-.mem-item-meta { font-size: 11px; color: var(--dsw-alias-label-secondary); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.mem-item-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-item-meta { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; font-size: 11px; line-height: 1; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+/* Inside a row the chip has to fit a single 18px line, so it gives up the
+   999px pill radius and its vertical padding for a compact tag. */
+.mem-item .mem-chip { padding: 0 6px; border-radius: 4px; font-size: 11px; line-height: 16px; }
 .mem-split { display: grid; grid-template-columns: minmax(240px, 340px) 1fr; gap: 14px; align-items: start; }
 @media (max-width: 900px) { .mem-split { grid-template-columns: 1fr; } }
 .mem-pre { margin: 0; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-base); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; max-height: 480px; overflow: auto; }
@@ -762,8 +811,6 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [])
 
-      const isPreset = presets.includes(length)
-
       /** Persist the length budget. */
       async function saveLength(nextLength) {
         setSavingLength(true)
@@ -976,66 +1023,92 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'mem-rail-wrap' },
                 (() => {
-                  const sliderMax = Math.max(1, presets.length - 1)
-                  const sliderValue = Math.max(
-                    0,
-                    presets.indexOf(isPreset ? length : presets.reduce((best, value, index) => (Math.abs(value - length) < Math.abs(presets[best] - length) ? index : best), 0)),
-                  )
-                  // Distance between neighbouring ticks, in % of the track.
-                  const railGap = sliderMax > 0 ? `${100 / sliderMax}%` : '100%'
+                  // The rail is continuous over [min, max]; the presets are only
+                  // ticks on it. `rangeStep` is the browser's own step (1 char),
+                  // `keyStep` what an arrow key moves by — a one-char arrow key
+                  // would take 2700 presses to cross the rail.
+                  const { min, max } = bounds
+                  const rangeStep = 1
+                  const keyStep = Math.max(1, Math.round((max - min) / 100))
+                  const at = (value) => `${railPercent(value, min, max)}%`
+                  const pins = presets.map((preset) => ({ preset, pos: at(preset) }))
                   return h(
                     'div',
-                    {
-                      className: 'mem-rail',
-                      'data-preset-count': presets.length,
-                      style: { '--rail-gap': railGap },
-                    },
-                    // The groove and the ticks are drawn separately from the
-                    // native input so the ticks can sit ON the rail; the input's
-                    // own track and thumb stay transparent above them.
-                    h('span', { className: 'mem-rail-track' }),
-                    // One tick per preset, positioned as a percentage of the
-                    // track so it stays aligned with its label at any width.
+                    { className: 'mem-rail', 'data-preset-count': presets.length },
+                    // The bubble is the value under the thumb — the one thing
+                    // the picture's rail makes visible that a bare track does not.
+                    h('span', {
+                      key: 'bubble',
+                      className: 'mem-rail-bubble',
+                      style: { '--pos': at(length) },
+                      'aria-hidden': 'true',
+                    }, formatLengthValue(length)),
+                    // The painted track: a groove plus the part already travelled.
                     h(
                       'span',
-                      { className: 'mem-rail-ticks', 'aria-hidden': 'true' },
-                      ...presets.map((preset, index) =>
+                      { key: 'groove', className: 'mem-rail-groove', 'aria-hidden': 'true' },
+                      h('span', { className: 'mem-rail-fill', style: { '--pos': at(length) } }),
+                    ),
+                    // One tick per preset, each at its VALUE's position: the gap
+                    // between 2000 and 3000 is visibly wider than 300 → 500.
+                    h(
+                      'span',
+                      { key: 'ticks', className: 'mem-rail-ticks', 'aria-hidden': 'true' },
+                      ...pins.map(({ preset, pos }) =>
                         h('i', {
                           key: preset,
                           className: 'mem-rail-tick',
-                          'data-current': String(index === sliderValue),
-                          style: { left: `calc(var(--thumb) / 2 + (100% - var(--thumb)) * ${sliderMax > 0 ? index / sliderMax : 0})` },
+                          'data-reached': String(length >= preset),
+                          style: { '--pos': pos },
                         }),
                       ),
                     ),
                     h('input', {
+                      key: 'input',
                       type: 'range',
-                      min: 0,
-                      max: sliderMax,
-                      step: 1,
-                      value: sliderValue,
+                      min,
+                      max,
+                      step: rangeStep,
+                      value: length,
                       onChange: (event) => {
-                        const next = presets[Number(event.target.value)]
-                        setLength(next)
+                        // Snap only near a tick; everywhere else the exact value
+                        // the user dragged to is kept.
+                        const raw = Number(event.target.value)
+                        setLength(snapToPreset(raw, presets, min, max).value)
+                      },
+                      onKeyDown: (event) => {
+                        const keys = {
+                          ArrowUp: keyStep,
+                          ArrowRight: keyStep,
+                          ArrowDown: -keyStep,
+                          ArrowLeft: -keyStep,
+                          PageUp: keyStep * 5,
+                          PageDown: -keyStep * 5,
+                        }
+                        const delta = keys[event.key]
+                        if (delta === undefined) return
+                        // Let the browser compute the step from the raw event so
+                        // focus, IME and repeat behaviour stay native.
+                        const base = Number(event.currentTarget.value)
+                        event.preventDefault()
+                        const next = Math.min(max, Math.max(min, base + delta))
+                        setLength(snapToPreset(next, presets, min, max).value)
                       },
                       title: t('length.preset', { n: length.toLocaleString() }),
                       'aria-label': t('length.title'),
                       'aria-valuetext': t('length.preset', { n: length.toLocaleString() }),
                     }),
-                    // One slot per tick, each holding its own label.
+                    // Labels share one row; each is centred on its own tick.
                     h(
                       'div',
-                      { className: 'mem-rail-labels', 'aria-hidden': 'true' },
-                      ...presets.map((preset, index) =>
-                        h(
-                          'div',
-                          {
-                            key: preset,
-                            className: 'mem-rail-label',
-                            'data-current': String(index === sliderValue),
-                          },
-                          h('span', null, formatLengthValue(preset)),
-                        ),
+                      { key: 'labels', className: 'mem-rail-labels', 'aria-hidden': 'true' },
+                      ...pins.map(({ preset, pos }) =>
+                        h('span', {
+                          key: preset,
+                          className: 'mem-rail-label',
+                          'data-current': String(preset === length),
+                          style: { '--pos': pos },
+                        }, formatLengthValue(preset)),
                       ),
                     ),
                   )
@@ -1045,6 +1118,11 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'mem-rail-unit' }, t('length.unit')),
               ),
             ),
+            // The bubble carries the number only; this line says what it means.
+            h('span', { className: 'mem-length-current' }, t('length.current', {
+              n: length.toLocaleString(),
+              tokens: Math.round(length / 2.2).toLocaleString(),
+            })),
             h(
               Note,
               { kind: savingLength ? 'warn' : lengthNote?.kind },
@@ -1481,18 +1559,22 @@ window.__ModuleLoader__.load({
                       role: 'option',
                       'aria-selected': selected?.memory_id === item.memory_id,
                       className: 'mem-item',
+                      // The whole text stays reachable: the row is clipped to
+                      // one line, so the tooltip is where the full entry lives.
+                      title: item.summary,
                       onClick: () => edit(item),
                     },
-                    h('span', null, item.summary),
+                    // One line per entry: the text is abridged and the meta is
+                    // one short phrase, so every row is the same height and the
+                    // list can be scanned instead of read.
+                    h('span', { className: 'mem-item-text' }, item.summary),
                     h(
                       'span',
                       { className: 'mem-item-meta' },
-                      h('span', { className: 'mem-mono' }, item.memory_id),
-                      item.event_type ? h('span', null, item.event_type) : null,
-                      item.state
-                        ? h('span', null, t(item.state === 'archived' ? 'memories.archived' : 'memories.active'))
-                        : null,
                       h('span', null, formatAge(item.created_at)),
+                      item.state === 'archived'
+                        ? h('span', { className: 'mem-chip mem-chip-idle' }, t('memories.archived'))
+                        : null,
                     ),
                   ),
                 ),
@@ -1504,7 +1586,10 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'mem-row' },
                   h('span', { className: 'mem-mono mem-hint' }, selected.memory_id),
                   h('span', { className: 'mem-spacer' }),
+                  // The list rows show one line only, so the details the rows
+                  // no longer print (project, type, creation time) live here.
                   h('span', { className: 'mem-chip' }, selected.project_id ?? '—'),
+                  selected.event_type ? h('span', { className: 'mem-chip' }, selected.event_type) : null,
                   h('span', { className: 'mem-chip' }, formatTime(selected.created_at)),
                 ),
                 h('label', { className: 'mem-field' },
