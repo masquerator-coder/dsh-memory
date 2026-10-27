@@ -1510,28 +1510,31 @@ const ANCHOR_HEADER = [
 export const DEFAULTS = Object.freeze({ ...DEFAULTS_INNER })
 
 /**
- * The skill index block: what this project already knows how to do.
+ * The global skill index block: what this machine already knows how to do.
  * `{{skill_index}}` is replaced with the Python-rendered Level-1 lines.
+ *
+ * Project skills are deliberately absent: they are files in the checkout and
+ * the host's own skill catalog lists them, so repeating them here would spend
+ * the same tokens twice and make one skill look like two.
  */
 const SKILL_INDEX_HEADER = [
-  '## 技能（本项目的程序性记忆）',
-  '下面是本项目已保存的可用技能，一行一个，只有触发条件与作用，不含步骤：',
+  '## 技能（记忆库里的全局技能）',
+  '下面是记忆库中组织/系统级的技能，一行一个，只有触发条件与作用，不含步骤：',
   '',
   '{{skill_index}}',
   '',
   '执行某个技能前先 `skill_get` 读完整步骤；正文细节不要凭索引里的摘要臆测。',
+  '本项目的技能是仓库里的文件（`.agents/skills/<name>/SKILL.md`），由 DSH 技能目录另行列出、可用 `skill` 工具加载，这里不重复列出。',
 ].join('\n')
 
 /**
- * Shown when the project has no skills yet.
+ * Shown when the store holds no global skill yet.
  *
- * The "check for a duplicate first" half moved here from the authoring rule:
- * the host already publishes its own skill catalog ("do not infer until
- * loaded"), and this line is what the model reads next, so it must not invite
- * creating one — it must point at the same dedupe step as the rule below.
+ * Same dedupe-first rule as the authoring rule below: this line is what the
+ * model reads next, so it must not invite creating one.
  */
 const SKILL_INDEX_EMPTY =
-  '（本项目还没有技能。确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`；只探索过的做法先不存。）'
+  '（记忆库里还没有全局技能。项目技能写在 `.agents/skills/`，由 DSH 技能目录列出；确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`。）'
 
 /**
  * When saving a procedure is allowed.
@@ -1541,11 +1544,11 @@ const SKILL_INDEX_EMPTY =
  * "tested and reusable", not "plausible".
  */
 const SKILL_AUTHORING_RULE = [
-  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。 同时满足下面全部条件才值得存：',
+  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**；项目技能写成本项目 `.agents/skills/<name>/SKILL.md`（`name` 用 kebab-case ASCII，中文放 title），全局技能留在记忆库。 同时满足下面全部条件才值得存：',
   '- 这次任务中，这套步骤**真的被执行过并验证成功**（不是设想、不是只读过代码）；',
   '- 同类任务**大概率会再来**，步骤基本可复用；',
   '- 步骤里有**具体动作与顺序**（改了哪个模块、跑了什么命令、按什么顺序验证），不是“仔细阅读代码”这类空话；',
-  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。 不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。 项目技能建议控制在 24 个左右；接近这个数量时优先合并或退役旧技能，不要为了腾位置乱建。 这个数字是建议值；真正的硬性上限由记忆库配置决定，超过时会直接拒绝写入。 技能存在本项目里，不写入记忆库：它们不会出现在 `memory_search` / `memory_recall` / 摘要里，要查看技能用 `skill_list`。',
+  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。 不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。 项目技能建议控制在 24 个左右，超过写入会被拒绝；接近上限时先合并或 `skill_retire`，不要为了腾位置乱建。 技能文件会进版本库，那是知识不是日志：一次性调试步骤不要写进去。',
 ].join('\n')
 
 /** Said after the session already saved one skill. */
@@ -1557,9 +1560,8 @@ const SKILL_AUTHORING_PACED = [
 /**
  * How many project skills the prompt asks the model to aim for.
  *
- * Deliberately far below what the store accepts: `l4.max_active_per_project`
- * (200 by default) is the enforced ceiling and rejects with `capacity`, while
- * this is guidance about attention. `SKILL_AUTHORING_RULE` carries the number
- * as plain text, so it must not present it as a hard limit, or the model
- * reports a cap that nothing enforces.
+ * The write path enforces the same number over the bundles in
+ * `.agents/skills` (`memory_system/project_skills.py` `DEFAULT_LIMIT`) and
+ * rejects the write, so this prompt text and the enforced ceiling agree. Keep
+ * them in step: a prompt that promises a limit nothing enforces is a bug.
  */

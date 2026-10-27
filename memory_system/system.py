@@ -34,7 +34,7 @@ from .l4 import Disclosure, ScopeView, Skill, SkillDefinition
 from .maintenance import Maintenance, TaskReport
 from .maturity import MaturityEvidence, TrajectoryStep, TrajectoryStore
 from .retrieval import Retriever, SearchOptions, SearchResult
-from .skills import CapacityError, SkillContext, SkillMatch, SkillRegistry
+from .skills import SkillContext, SkillMatch, SkillRegistry
 from .storage import Store, to_iso, utcnow
 from .text import prewarm
 
@@ -463,70 +463,6 @@ class MemorySystem:
             self.archive.mark_similar(hit, skill.skill_id)
         result["skill"] = skill.to_dict()
         return result
-
-    def add_project_skill(
-        self,
-        *,
-        project_id: str,
-        definition: SkillDefinition | dict[str, Any],
-        name: str | None = None,
-        max_active: int | None = None,
-    ) -> dict[str, Any]:
-        """Create a project-scope skill the model authored, already active.
-
-        This is the only skill write the agent itself has: a project-scope
-        skill it wrote, usable in this project from the next turn. Everything
-        else about the lifecycle stays where it was — org/sys promotion is
-        still a user decision, and retirement still belongs to the scans.
-
-        Two guards keep creation from becoming noise, because this path has no
-        maturity gate:
-
-        * **An identical procedure is not a second skill.** A definition whose
-          search text already matches a visible skill collapses to that skill
-          (``reused``) instead of minting a near-duplicate.
-        * **A ceiling needs a decision.** Once ``max_active`` active skills
-          exist in the project, the caller is told which one to retire or
-          merge rather than evicting one behind the user's back (design §6.4:
-          no silent eviction of a skill).
-        """
-        from .l4 import coerce_definition
-
-        definition_obj = coerce_definition(definition)
-        view = self.view(project_id)
-        existing = self.skills.find_similar(
-            definition_obj.search_text(), threshold=self.config.l4.merge_similarity, view=view
-        )
-        if existing:
-            skill, similarity = existing[0]
-            return {
-                "created": False,
-                "reused": True,
-                "similarity": round(similarity, 3),
-                "skill": skill.to_dict(),
-            }
-        cap = self.config.l4.max_active_per_project if max_active is None else int(max_active)
-        active = [
-            s
-            for s in self.skills.visible(view, include_cold=True)
-            if s.scope_kind == "project" and s.scope_ref == project_id and s.status == "active"
-        ]
-        if len(active) >= cap:
-            raise CapacityError(
-                f"项目 {project_id} 已有 {len(active)} 个 active 技能（上限 {cap}）；"
-                "先退役或合并一个技能，再添加新的"
-            )
-        skill = self.skills.create(
-            view=view,
-            definition=definition_obj,
-            name=name or definition_obj.title,
-            scope_kind="project",
-            ns="user",
-            status="active",
-            unaudited=True,
-            activation_reason="agent_authored",
-        )
-        return {"created": True, "reused": False, "skill": skill.to_dict()}
 
     def load_skill(self, *, project_id: str, skill: str) -> str:
         """Level-3 disclosure: the full definition text."""

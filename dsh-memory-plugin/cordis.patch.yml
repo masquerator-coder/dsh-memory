@@ -23,10 +23,12 @@
         autoSummaryDelayMs: 15000
         # Inject the memory anchor block into the system prompt.
         systemPromptAnchor: true
-        # Inject the project's L4 skill index (one line per available skill).
+        # Inject the resident index of *global* (org/sys) skills: one line each.
+        # Project skills are files in `.agents/skills` and are listed by DSH's
+        # own skill catalog instead, so they are not repeated here.
         skillIndex: true
         # Tell the model when it may save a tested, reusable procedure as a
-        # project-scope skill via `skill_create`.
+        # project-scope skill file via `skill_create`.
         skillAuthoring: true
         # Model steps between memory reminders; 0 disables the heartbeat.
         # The reminder lives inside the system prompt, so every time it appears

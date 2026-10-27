@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from . import project_skills
 from .config import MemoryConfig
 from .errors import ConflictError, MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
@@ -728,9 +729,47 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
 
 # ── L4: project skills ──────────────────────────────────────────────────
 #
-# Project-scope only. Nothing here may see or touch another project's skills:
-# the scope isolation of the design is enforced by the registry, and these
-# commands never widen it (``org``/``sys`` stays a user decision).
+# A project's skills are files inside its own checkout (``.agents/skills``), so
+# DSH's native skill catalog discovers them and a human reads the same file;
+# only *global* (org/sys) skills stay in the database. The root comes from this
+# session's cwd, so nothing here can see another project's bundles, and
+# ``org``/``sys`` promotion stays a user decision.
+#
+# The asymmetry is deliberate: ``skill.index`` lists global skills only, since
+# the host already renders project skills in its own catalog and repeating them
+# here would put every one in the prompt twice. ``skill.list`` still reports
+# them — "before creating, check what exists" has to see all of them.
+
+
+def _skill_scope(payload: dict[str, Any]) -> tuple[str, Path]:
+    """This session's project id and the checkout that owns its skill bundles."""
+    project = _project(payload)
+    root = resolve_project_root(payload.get("cwd"))
+    if not root:
+        raise BridgeError(
+            "bad_request",
+            "cwd is required: project skills live in <projectRoot>/.agents/skills",
+        )
+    return project, Path(root)
+
+
+def _skill_home(memory: MemorySystem) -> Path:
+    """The directory holding the database; the run ledger sits beside it."""
+    return Path(str(memory.config.db_path)).parent
+
+
+def _file_definition(skill: project_skills.ProjectSkill) -> dict[str, Any]:
+    """A bundle rendered into the definition shape the host already parses."""
+    return {
+        "title": skill.title,
+        "description": skill.description,
+        "when_to_use": skill.when_to_use,
+        "triggers": list(skill.triggers),
+        "requires_tools": list(skill.requires_tools),
+        "steps": list(skill.steps),
+        "success_criteria": skill.success_criteria,
+        "fallback": skill.fallback,
+    }
 
 
 def _skill_actor(payload: dict[str, Any]) -> str:
@@ -769,26 +808,25 @@ def _skill_misc_flags(skill: Skill) -> dict[str, Any]:
 
 @command("skill.index")
 def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """The resident index: one line per visible skill, no steps (design §6.5).
+    """The resident index: one line per visible *global* skill (design §6.5).
 
     Read-only. The host renders this into the system prompt, so it must cost
     one query and must never create, retire or re-tier anything.
     """
     project = _project(payload)
     view = memory.view(project)
-    # ``level1_index`` is the hot tier, which only ``refresh_tiers`` fills, and
-    # that runs off the request path. A project whose skills were never scored
-    # would then show an empty index while `skill.list` showed the skills, so
-    # the wrapper falls back to every visible skill and lets the attention
-    # budget, not the tier column, decide what fits.
-    lines = memory.skills.level1_index(view)
-    if not lines:
-        lines = [render_index_line(s) for s in memory.skills.visible(view, include_cold=True)]
-    # The hot path above is already budgeted by ``refresh_tiers``; the fallback
-    # lists everything visible, so without this cut a project with a hundred
-    # skills pushed every one of them into the system prompt. The design's rule
-    # is to degrade, never to overflow, and ``BudgetPlanner`` applies the same
-    # limit on the hot path -- so the two paths cost the same.
+    # Project skills are files now and reach the model through the host's own
+    # skill catalog, so this index carries the global ones only. Listing a
+    # project skill in both places would spend the same tokens twice and make
+    # the model believe two skills exist.
+    lines = [
+        render_index_line(s)
+        for s in memory.skills.visible(view, include_cold=True)
+        if s.scope_kind != "project"
+    ]
+    # The design's rule is to degrade, never to overflow: a store with a
+    # hundred global skills would otherwise push every one of them into the
+    # system prompt.
     budget = memory.config.l4.index_budget_tokens
     kept: list[str] = []
     used = 0
@@ -808,30 +846,43 @@ def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
 
 @command("skill.list")
 def cmd_skill_list(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Every skill this project can see, project scope first."""
-    project = _project(payload)
-    skills = memory.skills.visible(memory.view(project), include_cold=True)
+    """Everything this project can see: bundles on disk first, then the store.
+
+    Reading the bundles here — rather than trusting the model to remember what
+    it created — is what makes "check before creating" see exactly the set the
+    host's skill catalog will show. Store rows are still reported: an ``org``/
+    ``sys`` skill lives there, and a project row written before this layout
+    stays reachable until it is migrated to a file.
+    """
+    project, root = _skill_scope(payload)
+    files = project_skills.discover(root)
+    view = memory.view(project)
+    items = [s.to_dict(project_id=project) for s in files]
+    items += [
+        {**s.to_dict(), "source": "db", **_skill_misc_flags(s)}
+        for s in memory.skills.visible(view, include_cold=True)
+    ]
     return {
         "project_id": project,
-        "items": [{**s.to_dict(), **_skill_misc_flags(s)} for s in skills],
-        "stats": memory.skills.stats(memory.view(project)),
+        "items": items,
+        "file_skills": len(files),
+        "skill_root": str(project_skills.skill_root(root)),
+        "stats": memory.skills.stats(view),
     }
 
 
 @command("skill.create")
 def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Create a project-scope skill.
+    """Write a project-scope skill into this checkout's ``.agents/skills``.
 
     ``model_authored`` marks the write as the agent saving a procedure it just
-    used: unaudited, active immediately. A user-authored skill keeps the old
-    review path (``candidate`` by default) unless it asks for ``active``.
+    used; the file is active immediately because the catalog has no notion of
+    a draft. Only project scope is writable from a session — ``org``/``sys``
+    promotion stays a user decision.
     """
-    project = _project(payload)
-    root = resolve_project_root(payload.get("cwd"))
-    memory.ensure_project(project, root_path=root)
+    project, root = _skill_scope(payload)
+    memory.ensure_project(project, root_path=str(root))
     definition = _skill_definition(payload)
-    name = payload.get("name")
-    name = str(name).strip() if name else None
     scope_kind = str(payload.get("scope_kind") or "project")
     if scope_kind != "project":
         raise BridgeError(
@@ -839,58 +890,85 @@ def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str,
             f"scope_kind {scope_kind!r} is not writable from a session; only 'project' skills "
             "can be created here (org/sys promotion stays a user decision)",
         )
-    if _bool(payload.get("model_authored")):
-        if payload.get("max_active") is None:
-            result = memory.add_project_skill(project_id=project, definition=definition, name=name)
-        else:
-            result = memory.add_project_skill(
-                project_id=project,
-                definition=definition,
-                name=name,
-                max_active=int(payload["max_active"]),
-            )
-    else:
-        status = str(payload.get("status") or "candidate")
-        if status not in ("candidate", "draft", "active"):
-            raise BridgeError("bad_request", f"status {status!r} is not one of candidate/draft/active")
-        result = memory.add_skill(
-            project_id=project,
-            definition=definition,
-            name=name or definition.title,
-            status=status,
-        )
-        result = {"created": status == "active", "reused": False, "skill": result["skill"]}
-    return {"project_id": project, "actor": _skill_actor(payload), **_jsonable(result)}
+    limit = payload.get("max_active")
+    created = project_skills.create(
+        root,
+        definition,
+        name=str(payload.get("name") or ""),
+        limit=int(limit) if limit is not None else project_skills.DEFAULT_LIMIT,
+    )
+    return {
+        "project_id": project,
+        "actor": _skill_actor(payload),
+        "created": True,
+        "reused": False,
+        "skill": created.to_dict(project_id=project),
+    }
 
 
 @command("skill.get")
 def cmd_skill_get(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     """Level-3 disclosure: the full definition of one visible skill."""
-    project = _project(payload)
+    project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
-    skill = memory.skills.find(name_or_id, memory.view(project))
+    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
+    if bundle is not None:
+        return {
+            "project_id": project,
+            "source": "file",
+            "skill": bundle.to_dict(project_id=project),
+            "definition": _file_definition(bundle),
+            "markdown": bundle.body,
+        }
+    view = memory.view(project)
+    skill = memory.skills.find(name_or_id, view)
     return {
         "project_id": project,
+        "source": "db",
         "skill": skill.to_dict(),
         "definition": skill.definition.to_dict(),
-        "markdown": memory.skills.level3_definition(memory.view(project), skill.skill_id),
+        "markdown": memory.skills.level3_definition(view, skill.skill_id),
     }
 
 
 @command("skill.run")
 def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Record one execution of a skill (feeds success rate and retirement)."""
-    project = _project(payload)
+    """Record one execution of a skill (feeds the success rate in ``skill.list``).
+
+    A project skill's record is appended to ``<memoryHome>/l4_runs`` instead of
+    the database: the evidence follows the skill, and the repository stays free
+    of a log that changes on every run. ``partial`` counts as not-yet-success
+    unless the caller says otherwise.
+    """
+    project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
     outcome = str(payload.get("outcome") or "success")
     success = payload.get("success")
+    if success is None:
+        success = outcome == "success"
+    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
+    if bundle is not None:
+        return {
+            "project_id": project,
+            "source": "file",
+            **project_skills.append_run(
+                _skill_home(memory),
+                project,
+                bundle.name,
+                outcome=outcome,
+                success=_bool(success),
+                error=payload.get("error"),
+                deviation=payload.get("deviation"),
+            ),
+        }
     return {
         "project_id": project,
+        "source": "db",
         **memory.record_skill_run(
             project_id=project,
             skill=name_or_id,
             outcome=outcome,
-            success=None if success is None else _bool(success),
+            success=_bool(success),
             error=payload.get("error"),
             deviation=payload.get("deviation"),
         ),
@@ -899,20 +977,34 @@ def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, An
 
 @command("skill.retire")
 def cmd_skill_retire(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Retire a skill this project owns. Retired rows are kept, never deleted."""
-    project = _project(payload)
+    """Retire a project skill by moving its bundle out of the scanned root.
+
+    Nothing is deleted: ``.agents/skills/.retired/<name>`` keeps the file, and
+    discovery is one level deep, so the catalog stops showing it. A store row
+    (org/sys) is retired the old way, and only the user may do that.
+    """
+    project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
+    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
+    if bundle is not None:
+        retired = project_skills.retire(root, bundle.name)
+        return {
+            "project_id": project,
+            "source": "file",
+            "skill": {**retired.to_dict(project_id=project), "status": "retired"},
+        }
     view = memory.view(project)
     skill = memory.skills.find(name_or_id, view)
-    mine = skill.scope_kind == "project" and skill.scope_ref == project
-    if not mine and _skill_actor(payload) != "user":
+    if _skill_actor(payload) != "user":
         raise BridgeError(
             "bad_request",
-            f"{skill.qualified_name} is not a skill of project {project}; "
+            f"{skill.qualified_name} is not a project skill of {project}; "
             "only the user can retire an org/sys skill",
         )
-    retired = memory.skills.retire(skill.skill_id, reason=str(payload.get("reason") or "tool request"))
-    return {"project_id": project, "skill": retired.to_dict()}
+    retired_skill = memory.skills.retire(
+        skill.skill_id, reason=str(payload.get("reason") or "tool request")
+    )
+    return {"project_id": project, "source": "db", "skill": retired_skill.to_dict()}
 
 
 # ── backup / restore ────────────────────────────────────────────────────

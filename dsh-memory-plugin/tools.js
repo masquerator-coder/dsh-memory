@@ -389,8 +389,14 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_create',
       description:
-        '把一个刚被验证过的程序性做法存成**本项目**的技能（步骤 + 触发词），下次遇到同类任务时它会出现在技能索引里。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。',
+        '把一个刚被验证过的程序性做法存成**本项目**的技能：写入 `<项目根>/.agents/skills/<name>/SKILL.md`，即 DSH 技能目录扫描的位置，下一回合起模型目录（`available_skills`）会列出它，人和别的工具也读同一个文件。`name` 必填，必须是小写 kebab-case ASCII（如 `locate-failing-test`），中文标题放 `title`。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。',
       parameters: {
+        name: {
+          type: 'string',
+          required: true,
+          description:
+            '技能标识，同时是目录名：小写 kebab-case ASCII，如 `locate-failing-test`。中文会被 DSH 丢弃，所有中文放 title/description。',
+        },
         title: { type: 'string', required: true, description: '技能名，简短可区分，如「定位失败的测试」。' },
         description: { type: 'string', required: true, description: '一句话说明这个技能做什么，不超过 30 字。' },
         when_to_use: { type: 'string', required: true, description: '什么时候该用：具体条件，不要只写「需要时」。' },
@@ -436,7 +442,9 @@ export function buildTools({ call, projectFor, generateDigest }) {
           'skill.create',
           {
             project_id: await requireProject(exec),
+            cwd: cwdOf(exec),
             model_authored: true,
+            name: args.name,
             definition: {
               title: args.title,
               description: args.description,
@@ -451,42 +459,44 @@ export function buildTools({ call, projectFor, generateDigest }) {
           exec?.signal,
         )
         const skill = result?.skill ?? {}
-        if (result?.reused) {
-          // The registry refuses near-duplicates: say so instead of claiming a
-          // new skill, because the model's next move is to update that one.
-          return textOutput(
-            `已存在相似技能 \`${skill.qualified_name}\`（相似度 ${result.similarity}），未新建。`,
-          )
-        }
         return textOutput(
-          `已创建项目技能 \`${skill.qualified_name}\`（${skill.step_count} 步）。下一个回合起它会出现在技能索引里；执行后可用 skill_run 记录结果，做法过时用 skill_retire 退役。`,
+          `已创建项目技能 \`${skill.qualified_name}\`（${skill.step_count} 步），写入 \`${skill.path}\`。下一回合起 DSH 技能目录会列出它，可用 \`skill\` 工具加载；执行后同 skill_run 记录结果，做法过时用 skill_retire 退役。`,
         )
       },
     },
     {
       name: 'skill_list',
       description:
-        '列出当前项目可用的技能：项目技能 + 组织/系统级技能，含状态与触发词。新建技能前先用它确认没有同类技能。',
+        '列出当前项目可用的技能：项目技能（`.agents/skills` 里的文件）+ 组织/系统级技能（记忆库）。新建技能前先用它确认没有同类技能。',
       parameters: {},
       output: TEXT_OUTPUT,
       isConcurrencySafe: () => true,
       async execute(_args, exec) {
-        const result = await call('skill.list', { project_id: await requireProject(exec) }, exec?.signal)
+        const result = await call(
+          'skill.list',
+          { project_id: await requireProject(exec), cwd: cwdOf(exec) },
+          exec?.signal,
+        )
         return textOutput(formatSkillList(result))
       },
     },
     {
       name: 'skill_get',
-      description: '读取一个技能的完整定义（全部步骤、前置条件、成功标准）。索引里只有一行摘要，执行前需要细节时调用。',
+      description:
+        '读取一个技能的完整定义（全部步骤、前置条件、成功标准）。索引里只有一行摘要，执行前需要细节时调用；项目技能直接返回 `SKILL.md` 正文。',
       parameters: {
-        skill: { type: 'string', required: true, description: '技能名（如「定位失败的测试」）或 skill_id。' },
+        skill: {
+          type: 'string',
+          required: true,
+          description: '技能名（项目技能用它的 kebab-case name，如 `locate-failing-test`）或 skill_id。',
+        },
       },
       output: TEXT_OUTPUT,
       isConcurrencySafe: () => true,
       async execute(args, exec) {
         const result = await call(
           'skill.get',
-          { project_id: await requireProject(exec), skill: args.skill },
+          { project_id: await requireProject(exec), cwd: cwdOf(exec), skill: args.skill },
           exec?.signal,
         )
         return textOutput(result?.markdown || `未找到技能 ${args.skill}。`)
@@ -495,7 +505,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_run',
       description:
-        '记录一次技能执行的结果。技能被真正按步骤用过之后调用，用于成功率与自动退役；只是看一眼技能不要调用。',
+        '记录一次技能执行的结果。技能被真正按步骤用过之后调用，用于成功率；只是看一眼技能不要调用。项目技能的执行记录追加到记忆库目录下的 `l4_runs`，不进仓库。',
       parameters: {
         skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
         outcome: { type: 'string', description: 'success / failure / partial，默认 success。' },
@@ -508,6 +518,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
           'skill.run',
           {
             project_id: await requireProject(exec),
+            cwd: cwdOf(exec),
             skill: args.skill,
             outcome: args.outcome || 'success',
             error: args.error,
@@ -523,7 +534,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_retire',
       description:
-        '退役一个**本项目**的技能：做法过时、被更好的做法替代、或用户明确说不要时使用。退役是软删除，记录保留可恢复；org/sys 级技能只有用户能退役。',
+        '退役一个**本项目**的技能：做法过时、被更好的做法替代、或用户明确说不要时使用。项目技能是把目录移到 `.agents/skills/.retired/`，文件保留可恢复；org/sys 级技能只有用户能退役。',
       parameters: {
         skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
         reason: { type: 'string', description: '退役原因。' },
@@ -534,6 +545,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
           'skill.retire',
           {
             project_id: await requireProject(exec),
+            cwd: cwdOf(exec),
             skill: args.skill,
             reason: args.reason || 'tool request',
             model_authored: true,

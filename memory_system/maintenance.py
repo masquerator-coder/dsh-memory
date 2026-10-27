@@ -218,6 +218,11 @@ class Maintenance:
             "proposed": len(proposals),
             "ids": [p.promotion_id for p in proposals],
             "expired": expired,
+            # Both scanners read project skills out of the store, and project
+            # skills are bundles in the checkout now — so a zero here is the
+            # expected value, not a sign the scan is broken. Promoting a
+            # project skill is a user decision made by hand.
+            "note": "project skills are file-backed; promotion input is user-driven",
         }
 
     def _project_ids_with_trajectories(self) -> list[str]:

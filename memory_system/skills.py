@@ -45,7 +45,6 @@ from .l4 import (
     qualified,
     render_detail,
     render_full,
-    render_index_line,
     scope_predicate,
 )
 from .storage import Store, json_dumps, json_loads, to_iso, utcnow
@@ -782,10 +781,6 @@ class SkillRegistry:
             ),
         )
         return launch_id
-
-    def level1_index(self, view: ScopeView) -> list[str]:
-        """Just the resident index lines (usable on its own as a system-prompt block)."""
-        return [render_index_line(s) for s in self.hot_index(view)]
 
     def level2_detail(self, view: ScopeView, skill_id: str) -> str:
         skill = self.find(skill_id, view)
