@@ -132,7 +132,7 @@ console.log('recent work is bounded and conditional')
   check(anchor.includes('本项目最近的工作'), 'a project with memories shows them')
   const section = anchor.slice(
     anchor.indexOf('**本项目最近的工作**'),
-    anchor.indexOf('**收尾时写**'),
+    anchor.indexOf('**记忆写入**'),
   ).trim()
   check(section.length <= RECENT_BUDGET + 120, `the section stays near its budget (${section.length} chars)`)
   check(section.includes('更早的用'), 'a cut list points at memory_search instead of pretending to be complete')
@@ -143,7 +143,7 @@ console.log('recent work is bounded and conditional')
   const { anchor } = await assemble({ memories })
   const section = anchor.slice(
     anchor.indexOf('**本项目最近的工作**'),
-    anchor.indexOf('**收尾时写**'),
+    anchor.indexOf('**记忆写入**'),
   )
   check(!section.includes('更早的用'), 'a complete list points at DSH_MEMORY.md only')
 }

@@ -37,7 +37,7 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
 代码里**没有** `session/created` / `session/start` 处理器。插件加载时只做注册：
 
 - 注册 12 个工具：7 个 `memory_*` 记忆工具，加 5 个 `skill_*` 项目技能工具（`index.js:21-36`）。
-- 注册两个系统提示词 section：记忆锚点（`index.js:676-770`）与技能索引（`index.js:772-864`）。
+- 注册两个系统提示词 section：记忆锚点（`index.js:754-922`）与技能索引（`index.js:924-1016`）。
 - 注册 `session/event`、`session/disposed`、`agent/request` 处理器。
 - 创建 `BridgeClient`，但**此时不启动子进程**；第一次真正调用时才 spawn（`bridge.js:198-242`）。
 
@@ -53,7 +53,7 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
   `（还没有可用的记忆摘要。）`
 - 计数行**只含摘要规模、时间、用户画像规模**，不含摘要正文（`summary.py:807-826`）；正文由 `{{recent_work}}` 单独提供：当前项目最新 `memory.list` 条目，最多 8 条、合计 ≤400 字（`RECENT_CHARS` / `RECENT_LIMIT`），超出时尾注指向 `memory_search`，没有记忆的项目整节省略。
 
-锚点里的写入/读取职责说明只写工具定义装不下的部分——收尾时写、回答前读、两条工具链的顺序（`memory_recall` → 换说法用 `memory_search`；`skill_list` 查重 → `skill_create` → 执行前 `skill_get`）；工具名与参数不在此重复（`index.js` 末尾 `ANCHOR_HEADER`）。
+锚点里的写入/读取职责说明只写工具定义装不下的部分——写入分四件事（不会自动保存、遇到什么值得记、一条一件事、什么不该存），召回分五件事（先用 `memory_recall`、换说法用 `memory_search`、摘要与 `DSH_MEMORY.md` 只记工程动作、画像只读、`memory_forget` 是软删除）；工具名与参数不在此重复（`index.js:1378-1402` `ANCHOR_HEADER`）。技能侧的同一条原则写在 `index.js:1438-1444` `SKILL_AUTHORING_RULE`：门槛、反例、技能数建议值（字面量，取自 `MODEL_SKILL_CAP`）、技能不进记忆库，四段合成一条。
 
 #### （2）第一次工具调用才注册项目
 
@@ -300,8 +300,8 @@ score = similarity * (0.2 + 0.8 * R)
 
 | 环节 | 谁做 | 位置 |
 |---|---|---|
-| 告诉模型「什么时候值得存」 | 插件，拼在系统提示词尾部 | `index.js:1229-1272`（`SKILL_INDEX_HEADER` / `SKILL_AUTHORING_RULE` / `SKILL_AUTHORING_PACED`） |
-| 展示项目已有技能 | 插件异步读 `skill.index`，按 `cwd` 缓存 30 秒 | `index.js:772-864` |
+| 告诉模型「什么时候值得存」 | 插件，拼在系统提示词尾部 | `index.js:1397-1444`（`SKILL_INDEX_HEADER` / `SKILL_AUTHORING_RULE` / `SKILL_AUTHORING_PACED`） |
+| 展示项目已有技能 | 插件异步读 `skill.index`，按 `cwd` 缓存 30 秒 | `index.js:924-1016` |
 | 保存 / 查看 / 记录执行 / 退役 | 模型调用 `skill_*` 工具 | `tools.js:381-540` |
 | 去重、容量、落库 | Python 核心 | `system.py:467-529`（`add_project_skill`）、`bridge.py:716-888` |
 
@@ -434,8 +434,8 @@ python -m memory_system memory.recall '{\"home\":\"C:\\\\temp\\\\mem\",\"cwd\":\
 | 关注点 | 位置 |
 |---|---|
 | 插件默认配置 / 工具清单 | `dsh-memory-plugin/index.js:21-72` |
-| 锚点注入与 15 秒缓存 | `dsh-memory-plugin/index.js:676-770` |
-| 技能索引注入与 30 秒缓存 / 写入职责 | `dsh-memory-plugin/index.js:772-864, 1229-1272` |
+| 锚点注入与 15 秒缓存 | `dsh-memory-plugin/index.js:754-922` |
+| 技能索引注入与 30 秒缓存 / 写入职责 | `dsh-memory-plugin/index.js:924-1016, 1397-1444` |
 | 心跳计数与提醒 | `dsh-memory-plugin/index.js:284-320, 679-685` |
 | 自动摘要防抖 / 去重 | `dsh-memory-plugin/index.js:255-282, 482-588` |
 | 会话结束补写 | `dsh-memory-plugin/index.js:322-380` |

@@ -991,7 +991,7 @@ export function apply(ctx, rawConfig) {
             created === 0
               ? SKILL_AUTHORING_RULE
               : SKILL_AUTHORING_PACED.replace('{{count}}', String(created))
-          parts.push(`${pace}\n${SKILL_AUTHORING_CAP.replace('{{cap}}', String(MODEL_SKILL_CAP))}`)
+          parts.push(pace)
         }
       }
       return `\n\n${parts.join('\n\n')}`
@@ -1383,9 +1383,22 @@ const ANCHOR_HEADER = [
   '',
   '{{recent_work}}',
   '',
-  '**收尾时写**：库不会自动抄录对话，**只有调用 `memory_add` 才会写入**（另有会话结束时的一次补漏）。任务收尾或提交前，把值得留下的经验、决策与理由、踩过的坑、操作规则写成一条，`summary` 一句话说清关键实体与结论（含文件、命令、项目名）——一句话，太长会挤占这里的篇幅；不存闲聊、代码里能直接读到的、一次性中间步骤，用户偏好照记原话。偏好与教训**不进摘要、也不进画像**，只能靠 `memory_add` + 检索留住。',
+  '### 记忆的写入与召回',
   '',
-  '**回答前读**：用户提到"之前说过""上次""我们的约定"时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造；换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。摘要与 `DSH_MEMORY.md` 只记工程动作，经验、决策、偏好、坑只在检索里。用户画像只能读，由用户自己在设置页维护。`memory_forget` 是软删除：做完告知用户"已归档、可恢复"，别说成彻底删除。',
+  '**记忆写入**：',
+  '',
+  '- 记忆不会自动保存，**只有你主动调用 `memory_add` 才会写入**。会话结束时另有一次模型补漏，再多一层兜底；别把希望放在它上面。',
+  '- 当你遇到有价值的经验、教训、决策与理由、操作规则、用户偏好等，总结成一句话，说清关键实体与结论（含文件、命令、项目名），调用 `memory_add` 存入记忆库。',
+  '- 每条记忆尽量简洁、原子，复杂的事情拆成多条记忆。',
+  '- 不存闲聊、代码里能直接读到的、一次性中间步骤，用户偏好照记原话。',
+  '',
+  '**记忆召回**：',
+  '',
+  '- 问题需要过往经验时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造。',
+  '- 换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。',
+  '- 摘要与 `DSH_MEMORY.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
+  '- 用户画像只能读，由用户自己在设置页维护。',
+  '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
@@ -1423,13 +1436,11 @@ const SKILL_INDEX_EMPTY =
  * "tested and reusable", not "plausible".
  */
 const SKILL_AUTHORING_RULE = [
-  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。',
-  '同时满足下面全部条件才值得存：',
+  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。 同时满足下面全部条件才值得存：',
   '- 这次任务中，这套步骤**真的被执行过并验证成功**（不是设想、不是只读过代码）；',
   '- 同类任务**大概率会再来**，步骤基本可复用；',
   '- 步骤里有**具体动作与顺序**（改了哪个模块、跑了什么命令、按什么顺序验证），不是“仔细阅读代码”这类空话；',
-  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。',
-  '不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。',
+  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。 不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。 项目技能建议控制在 24 个左右；接近这个数量时优先合并或退役旧技能，不要为了腾位置乱建。 这个数字是建议值；真正的硬性上限由记忆库配置决定，超过时会直接拒绝写入。 技能存在本项目里，不写入记忆库：它们不会出现在 `memory_search` / `memory_recall` / 摘要里，要查看技能用 `skill_list`。',
 ].join('\n')
 
 /** Said after the session already saved one skill. */
@@ -1443,11 +1454,7 @@ const SKILL_AUTHORING_PACED = [
  *
  * Deliberately far below what the store accepts: `l4.max_active_per_project`
  * (200 by default) is the enforced ceiling and rejects with `capacity`, while
- * this is guidance about attention. The text below must not present it as a
- * hard limit, or the model reports a cap that nothing enforces.
+ * this is guidance about attention. `SKILL_AUTHORING_RULE` carries the number
+ * as plain text, so it must not present it as a hard limit, or the model
+ * reports a cap that nothing enforces.
  */
-const SKILL_AUTHORING_CAP = [
-  '项目技能建议控制在 {{cap}} 个左右；接近这个数量时优先合并或退役旧技能，不要为了腾位置乱建。',
-  '这个数字是建议值；真正的硬性上限由记忆库配置决定，超过时会直接拒绝写入。',
-  '技能存在本项目里，不写入记忆库：它们不会出现在 `memory_search` / `memory_recall` / 摘要里，要查看技能用 `skill_list`。',
-].join('\n')
