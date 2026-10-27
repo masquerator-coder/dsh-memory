@@ -15,6 +15,7 @@ from memory_system.summary import (
     AUTO_MODE,
     BACKUP_MARKER,
     DEFAULT_LENGTH,
+    DIGEST_PROJECT_LABEL_MAX,
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
@@ -23,6 +24,7 @@ from memory_system.summary import (
     DigestService,
     Materials,
     MemoryNotepad,
+    _digest_label,
     coerce_length,
     export_markdown,
     nearest_preset,
@@ -152,7 +154,56 @@ def test_prompt_scales_detail_with_the_budget(service: DigestService):
     detailed = service.plan(length=3_000)
     assert "约 300 个字符" in concise.system
     assert "约 3000 个字符" in detailed.system
+    # The budget is a whole-document cap, so the project count must not read as
+    # a multiplier: each band says how many items *in total* to keep per project.
+    assert "全文总字数" in detailed.system
     assert "≤800" in detailed.system and ">2000" in detailed.system
+
+
+def test_project_heading_stays_small_against_the_budget():
+    """Path-shaped project ids must not eat a small budget's fixed overhead."""
+    long_pid = "c-users-fuqia-documents-aiworkspace-blender-render-pipeline"
+    materials = Materials(
+        project_ids=[long_pid],
+        episodes=[
+            {
+                "created_at": "2026-01-01T01:00:00+00:00",
+                "project_id": long_pid,
+                "event_type": "fix",
+                "importance": 0.8,
+                "summary": "fixed the camera alignment",
+                "outcome": "success",
+            }
+        ],
+    )
+    body = materials.render(max_chars=20_000)
+    heading = next(line for line in body.splitlines() if line.startswith("## "))
+    label = heading.split("（")[0].removeprefix("## 项目：")
+    # The label shortens; the id stays verbatim so the model can echo the
+    # heading as instructed and still name the project unambiguously.
+    assert long_pid not in label
+    assert len(label) <= DIGEST_PROJECT_LABEL_MAX
+    assert f"`{long_pid}`" in heading
+    assert "fixed the camera alignment" in body
+
+
+def test_digest_label_keeps_a_short_name_verbatim():
+    assert _digest_label("dsh-memory") == "dsh-memory"
+    assert _digest_label("C:\\Users\\fuqia\\Documents\\OSpace") == "OSpace"
+    assert len(_digest_label("a" * 40)) == DIGEST_PROJECT_LABEL_MAX
+
+
+def test_short_labels_stay_distinct_for_path_shaped_ids():
+    """Truncating the tail would collapse every project onto one label."""
+    ids = [
+        "c-users-fuqia-documents-aiworkspace-blender",
+        "c-users-fuqia-documents-aiworkspace-ai",
+        "c-users-fuqia-documents-aiworkspace-im-workspace",
+        "c-users-fuqia-documents-workspace-08-1-26-27-1",
+    ]
+    labels = [_digest_label(pid) for pid in ids]
+    assert len(set(labels)) == len(labels)
+    assert all(len(label) <= DIGEST_PROJECT_LABEL_MAX for label in labels)
 
 
 def test_commit_rejects_empty_and_records_errors(service: DigestService):

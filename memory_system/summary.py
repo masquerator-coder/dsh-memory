@@ -53,7 +53,7 @@ from .text import estimate_tokens
 
 # ══ constants ═══════════════════════════════════════════════════════════
 
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 LENGTH_PRESETS: tuple[int, ...] = (300, 500, 800, 1_000, 1_500, 2_000, 3_000)
 LENGTH_MIN = LENGTH_PRESETS[0]
 LENGTH_MAX = LENGTH_PRESETS[-1]
@@ -79,6 +79,15 @@ LEGACY_SCOPES: tuple[str, ...] = ("project",)
 PROJECT_SUMMARY_FILE = "DSH_MEMORY.md"
 PROJECT_SUMMARY_MARKER = "<!-- dsh-memory:project-summary -->"
 PROJECT_SUMMARY_MAX_ITEMS = 300
+# A work log names a project by its label, not by its checkout path: the
+# headings are fixed overhead against the digest budget, and a Windows path
+# slug runs to ~50 characters on its own.
+DIGEST_PROJECT_LABEL_MAX = 24
+# A path-shaped project name repeats the checkout prefix (``c-users-fuqia-
+# documents-aiworkspace-blender``), so keeping only the tail would still read as
+# a prefix and make every project look alike. The distinguishing part sits at
+# the end of the name, which is why the short label is the head-and-tail form.
+DIGEST_LABEL_HEAD_CHARS = 6
 # Preferences and raw user messages are not "work done"; the user profile and
 # recall already cover them. Keeping them out of the work log also keeps the
 # model from turning the global digest into a list of lessons.
@@ -298,7 +307,7 @@ class Materials:
         for pid in order:
             if left <= 0 or remaining <= 0:
                 break
-            label = self.project_names.get(pid) or pid
+            label = _digest_label(self.project_names.get(pid) or pid)
             title = f"## 项目：{label}（`{pid}`）"
             share = remaining // left
             keep: list[str] = []
@@ -315,6 +324,24 @@ class Materials:
                 remaining -= used
             left -= 1
         return "\n\n".join(out)
+
+
+def _digest_label(name: str) -> str:
+    """A short project label for the digest heading's fixed overhead.
+
+    A project is usually named after its path (``c-users-fuqia-documents-...``),
+    which makes the heading longer than the work under it. A name that already
+    fits is kept verbatim, including its last path segment. A longer one keeps
+    the *end* of its last segment, which is the distinguishing part, behind a
+    bounded head: dropping only the tail would leave a shared prefix and make
+    different projects render under the same label.
+    """
+    last = [part for part in name.replace("\\", "/").split("/") if part]
+    label = last[-1].strip() if last else name.strip()
+    if len(label) <= DIGEST_PROJECT_LABEL_MAX:
+        return label
+    keep = DIGEST_PROJECT_LABEL_MAX - DIGEST_LABEL_HEAD_CHARS - 1
+    return f"{label[:DIGEST_LABEL_HEAD_CHARS]}…{label[-keep:]}"
 
 
 def _work_line(episode: dict[str, Any]) -> str:
@@ -395,11 +422,12 @@ SYSTEM_PROMPT = """你是「DSH 记忆系统」的全局工作摘要生成器。
 7. 中文材料用中文写；标识符、路径、命令保留原文，不要翻译。
 8. 建议结构：每个项目下用 `-` 列出工作项；没有工作记录的项目直接省略。
 
-长度预算：约 {target_chars} 个字符。按预算决定详细程度：
-- 预算小（≤800 字）：每个项目只写 1-3 条最重要的工作，一句话一条。
-- 预算中等（≤2000 字）：每个项目写 3-8 条，保留关键文件/模块/命令/结果。
+长度预算：约 {target_chars} 个字符，这是**全文总字数**，不是每个项目的字数。项目标题也计入预算。
+按预算决定每个项目保留多少条：
+- 预算小（≤800 字）：项目多时每个项目只写 1 条最重要的工作；写不下就只保留项目标题，甚至省略该项目。
+- 预算中等（≤2000 字）：每个项目写 1-4 条，保留关键文件/模块/命令/结果。
 - 预算大（>2000 字）：可以展开到更多工作项和细节。
-不要为了填满预算而编造，也不要超出预算；材料多时按“最近 + 重要”取舍。"""
+先计算固定开销（项目数 × 标题长度），剩余字数再分给各项目的条目。不要为了填满预算而编造，也不要超出预算；材料多时按“最近 + 重要”取舍。"""
 
 USER_TEMPLATE = """记忆范围：全部项目
 生成时间：{now}
