@@ -153,7 +153,8 @@ window.__ModuleLoader__.load({
       "memories.next": "下一页",
       "memories.selectHint": "从左侧选择一条记忆查看详情",
       "memories.summaryRequired": "记忆内容不能为空",
-      "memories.hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。",
+      "memories.hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。列表默认显示全部项目的记忆；取消勾选「全部项目」只看当前项目。",
+      "memories.unscoped": "当前没有活动会话的工作目录，无法判定“当前项目”，因此列表为空；取消勾选「全部项目」可查看全部记忆。",
       "memories.loadFailed": "读取记忆失败：{message}",
       "memories.opFailed": "操作失败：{message}",
       "memories.pageOf": "第 {page} / {pages} 页",
@@ -317,7 +318,8 @@ window.__ModuleLoader__.load({
       "memories.next": "Next",
       "memories.selectHint": "Pick an entry on the left to see its details",
       "memories.summaryRequired": "Memory content cannot be empty",
-      "memories.hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone).",
+      "memories.hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone). The list spans every project by default; uncheck “All projects” to narrow it to the current one.",
+      "memories.unscoped": "No live session names a working directory, so “this project” cannot be decided and the list is empty; uncheck “All projects” to see every memory.",
       "memories.loadFailed": "Could not load memories: {message}",
       "memories.opFailed": "Action failed: {message}",
       "memories.pageOf": "Page {page} / {pages}",
@@ -1272,7 +1274,12 @@ window.__ModuleLoader__.load({
       const [query, setQuery] = useState('')
       const [state, setState] = useState('')
       const [eventType, setEventType] = useState('')
-      const [allProjects, setAllProjects] = useState(false)
+      // Default on: this list is the memory store, and scoping it to whatever
+      // project the host resolved made a fresh project's two entries look like
+      // they had replaced five from another project. Narrowing is one click.
+      const [allProjects, setAllProjects] = useState(true)
+      /** Project the listing is narrowed to, or null when it spans the store. */
+      const [scope, setScope] = useState(null)
       const [selected, setSelected] = useState(null)
       const [busy, setBusy] = useState(false)
       const [note, setNote] = useState(null)
@@ -1293,7 +1300,15 @@ window.__ModuleLoader__.load({
           })
           setItems(result?.items ?? [])
           setTotal(result?.total ?? 0)
-          setNote(null)
+          setScope(result?.scoped_to_project ? (result?.project_id ?? null) : null)
+          // Asked to narrow to a project the host could not resolve: the bridge answers
+          // for the literal project `unknown`, so say why the count is empty
+          // instead of letting it read as "my memories are gone".
+          setNote(
+            !allProjects && result && result.scoped_to_project === false
+              ? { kind: 'info', text: t('memories.unscoped') }
+              : null,
+          )
         } catch (error) {
           setNote({ kind: 'error', text: t('memories.loadFailed', { message: error.message }) })
         } finally {
@@ -1380,7 +1395,10 @@ window.__ModuleLoader__.load({
           title: t('memories.title'),
           onClose,
           footer: [
-            h('span', { key: 'count', className: 'mem-hint' }, t('memories.count', { total })),
+            h('span', { key: 'count', className: 'mem-hint' },
+              t('memories.count', { total }),
+              scope ? ` · ${scope}` : '',
+            ),
             h('span', { key: 'spacer', className: 'mem-spacer' }),
             h('div', { key: 'pager', className: 'mem-pager' },
               h('button', { type: 'button', className: 'mem-btn', disabled: busy || offset === 0, onClick: () => setOffset(Math.max(0, offset - limit)) }, t('memories.prev')),

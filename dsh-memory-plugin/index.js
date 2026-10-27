@@ -1274,7 +1274,7 @@ export function apply(ctx, rawConfig) {
       if (action === 'get') {
         return await call('memory.get', { memory_id: body.memory_id })
       }
-      return await call('memory.list', {
+      const listing = await call('memory.list', {
         project_id: body?.all_projects ? undefined : projectId,
         all_projects: body?.all_projects === true,
         query: body?.query,
@@ -1284,6 +1284,21 @@ export function apply(ctx, rawConfig) {
         offset: Math.max(Number(body?.offset) || 0, 0),
         include_superseded: body?.include_superseded === true,
       })
+      // With "all projects" off, the listing is scoped to whatever project the
+      // host resolved. When no live session names a working directory the
+      // bridge falls back to the literal project `unknown`, which holds nothing —
+      // and a page that then printed "2 entries" looked exactly like two
+      // memories had replaced five from another project. Say so instead, so the
+      // page can label the scope and offer the unscoped view.
+      if (body?.all_projects !== true) {
+        const named = body?.project_id || projectId
+        return {
+          ...listing,
+          scoped_to_project: Boolean(named),
+          ...(named ? {} : { scope_note: 'no-live-session' }),
+        }
+      }
+      return { ...listing, scoped_to_project: false }
     })
 
     route('/dsh-memory/backup', async (body) => {

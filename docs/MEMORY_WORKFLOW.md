@@ -209,7 +209,7 @@ L3 写时校验顺序（`l3.py:512-619`）：
 | 首次工具调用 | 模型 | `projects` 注册项目 + 创建 `DSH_MEMORY.md` | 是（projects） |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
 | 检索 | 模型 | `memory_recall` → 融合排序 + 强化命中的行 | 是（access_count） |
-| 审阅 | 模型/设置页 | `memory_search` / `memory.list` | 否 |
+| 审阅 | 模型/设置页 | `memory_search` / `memory.list`（设置页默认不按项目过滤；勾选状态由前端 `all_projects` 决定） | 否 |
 | 用户要求遗忘 | 模型/设置页 | 软归档 + `forgotten_at` | 是 |
 | 每 N 个 `step/start` | 插件 | 提示词尾部追加“记忆提醒” | 否 |
 | `turn/end` | 插件 | 15 秒防抖后自动生成全局摘要 | 是（memory_digests） |
