@@ -197,7 +197,9 @@ class VectorIndex:
                 total = self.count(kind)
                 if total <= 0:
                     return []
-                fetch = max(k * 8, 64)
+                # The window never needs to exceed the table: one pass over
+                # every row already contains any allowed row that exists.
+                fetch = min(max(k * 8, 64), total, MAX_KNN_K)
                 while True:
                     rows = self.conn.execute(
                         f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
@@ -206,7 +208,14 @@ class VectorIndex:
                     filtered = [r for r in rows if r["rowid"] in allowed_rowids]
                     if len(filtered) >= k or len(rows) < fetch:
                         break
-                    if fetch >= MAX_KNN_K:
+                    # `fetch >= total` is the termination case the backend
+                    # limit guard missed: when the table is smaller than the
+                    # backend cap and the scope holds fewer than k rows, the
+                    # next window rounds down to `total` — the same value as
+                    # this pass. The loop then asked the same question forever
+                    # and the write (or recall) never answered. A scope smaller
+                    # than k cannot be satisfied, so return what it has.
+                    if fetch >= MAX_KNN_K or fetch >= total:
                         break
                     fetch = min(fetch * 2, MAX_KNN_K, total)
                 filtered = filtered[:k]

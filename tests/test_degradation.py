@@ -153,6 +153,55 @@ def test_knn_window_never_exceeds_the_backend_limit():
         conn.close()
 
 
+def test_knn_scope_smaller_than_k_terminates_below_the_backend_limit():
+    """A scope smaller than ``k`` must terminate, not spin, below 4096 rows.
+
+    The window doubles until it satisfies ``k`` or exhausts the table, but
+    when the table is smaller than the backend cap, ``min(fetch * 2,
+    MAX_KNN_K, total)`` can round back down to ``total`` — the very window
+    just queried. With 65 vectors and one allowed row, ``fetch`` reached 64,
+    then 65, then stayed at 65 forever: ``memory_add`` and ``recall`` for a
+    small project hung until the host's bridge timed out.
+    """
+    import queue
+    import sqlite3
+    import threading
+
+    from memory_system.embedding import _l2_normalize
+    from memory_system.vectors import VectorIndex
+
+    pytest.importorskip("sqlite_vec")
+
+    # The worker thread is what makes a hang visible without wedging pytest;
+    # the store itself opens its connection cross-thread too.
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    index = VectorIndex(conn, dim=3, enabled=True)
+    query = _l2_normalize([1.0, 0.0, 0.0])
+    for j in range(1, 121):
+        index.upsert("l2", j, _l2_normalize([1.0, j * 0.001, 0.0]))
+    result: queue.Queue = queue.Queue()
+
+    def run() -> None:
+        try:
+            result.put(("ok", index.knn("l2", query, k=5, allowed_rowids={7})))
+        except BaseException as exc:  # noqa: BLE001 - report it to the test thread
+            result.put(("error", exc))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        kind, value = result.get(timeout=10)
+    except queue.Empty:
+        pytest.fail("knn did not return: the over-fetch window stopped growing")
+    finally:
+        conn.close()
+
+    assert kind == "ok", value
+    assert [rid for rid, _ in value] == [7]
+
+
 def test_exact_scan_fallback(monkeypatch):
     from memory_system.vectors import VectorIndex
 
