@@ -19,6 +19,7 @@ from memory_system.summary import (
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
+    META_UPDATED,
     PROJECT_SUMMARY_FILE,
     PROJECT_SUMMARY_MARKER,
     DigestService,
@@ -214,6 +215,27 @@ def test_commit_rejects_empty_and_records_errors(service: DigestService):
     assert broken.error == "boom"
     # Failed generations are not offered as "the latest digest".
     assert service.latest() is None
+
+
+def test_failed_commit_leaves_the_updated_marker_alone(service: DigestService):
+    """The marker must describe the digest the prompt shows, not the last try.
+
+    A failed run still records its error row (that is the history), but moving
+    ``memory.summary.updated_at`` for empty content made the settings page and
+    `/health` report a digest that was never written.
+    """
+    good = service.commit(text="## state\nreal work")
+    stamped = service.store.get_meta(META_UPDATED)
+    assert stamped == good.created_at
+
+    failed = service.commit(text="", error="模型调用失败：400")
+    assert failed.status == "error"
+    assert service.store.get_meta(META_UPDATED) == stamped
+    assert service.latest().digest_id == good.digest_id
+
+    # An empty generation is not "updated" either.
+    service.commit(text="   ")
+    assert service.store.get_meta(META_UPDATED) == stamped
 
 
 def test_only_global_digests_are_generated_but_legacy_project_rows_read(service: DigestService, project: str):

@@ -12,10 +12,6 @@
         memoryHome: ''
         # Freeze the project id instead of deriving it from the session cwd.
         projectOverride: ''
-        # Snapshot conversation turns into episodic memory. Off: memory is
-        # written by the model through `memory_add`, never harvested from
-        # session traffic.
-        captureTurns: false
         # Generate a fresh digest automatically once the turn settles and the
         # harness goes idle. Always on; there is no user-facing switch.
         autoSummary: true
@@ -23,13 +19,11 @@
         autoSummaryDelayMs: 15000
         # Inject the memory anchor block into the system prompt.
         systemPromptAnchor: true
-        # Inject the resident index of *global* (org/sys) skills: one line each.
-        # Project skills are files in `.agents/skills` and are listed by DSH's
-        # own skill catalog instead, so they are not repeated here.
-        skillIndex: true
-        # Tell the model when it may save a tested, reusable procedure as a
-        # project-scope skill file via `skill_create`.
-        skillAuthoring: true
+        # How often (ms) to ask the Python side for the due maintenance tasks:
+        # decay refreshes the cached memory states, plus consolidation,
+        # communities, archive scan and promotions. The tasks keep their own
+        # cadence, so an early tick is one cheap no-op; 0 disables the tick.
+        maintenanceIntervalMs: 600000
         # Model steps between memory reminders; 0 disables the heartbeat.
         # The reminder lives inside the system prompt, so every time it appears
         # or changes the whole resident prefix stops matching the provider's

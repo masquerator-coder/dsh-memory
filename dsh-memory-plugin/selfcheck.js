@@ -9,9 +9,10 @@
  *    reminder text says so;
  * 2. the recent-work section appears only for a project that has memories,
  *    stays inside its character budget, and disappears without one;
- * 3. the skill index's empty state points at dedupe before authoring;
- * 4. digest generation reaches a model even when no session in this process has
- *    used one yet, via the deployment default model.
+ * 3. digest generation reaches a model even when no session in this process has
+ *    used one yet, via the deployment default model — and carries the session
+ *    id, without which providers that route per conversation reject the call;
+ * 4. a maintenance tick asks the Python side for the due background tasks.
  *
  * Exits non-zero on the first failed expectation.
  */
@@ -23,7 +24,7 @@ import { apply } from './index.js'
  * The bridge must never start from a self-check.
  *
  * `assemble` stubs `BridgeClient.prototype.call`, but the plugin also starts
- * fire-and-forget reads (anchor refresh, skill index) that can land after a
+ * fire-and-forget reads (the anchor refresh) that can land after a
  * scenario's stub is restored. Those used to spawn the real Python child, and
  * any write path among them (a digest commit) lands in the user's real memory
  * database. Blocking the spawn for the whole process turns such a leak into a
@@ -53,8 +54,8 @@ function check(condition, label) {
 
 /**
  * Render the prompt sections for one scenario, and expose what `apply` mounted.
- * @param {{memories?: Array<{summary: string}>, events?: Array<{type: string, data?: any}>, llm?: any, defaultModel?: any, run?: (assembled: any) => Promise<void>}} scenario - inputs.
- * @returns {Promise<{anchor: string, skills: string}>} rendered text per section.
+ * @param {{memories?: Array<{summary: string}>, events?: Array<{type: string, data?: any}>, llm?: any, defaultModel?: any, calls?: Array<{command: string, payload: any}>, config?: object, run?: (assembled: any) => Promise<void>}} scenario - inputs.
+ * @returns {Promise<{anchor: string}>} rendered text per section.
  */
 async function assemble(scenario) {
   const sections = new Map()
@@ -103,6 +104,7 @@ async function assemble(scenario) {
   // spawn itself is blocked process-wide at the top of this file, so a read
   // that escapes this window fails instead of touching the real store.
   BridgeClient.prototype.call = async (command, payload = {}) => {
+    scenario.calls?.push({ command, payload })
     if (command === 'projects') return { project_id: 'selfcheck-project' }
     if (command === 'digest.anchor') {
       return { text: '@@dsh-memory 1\n@@', summary: {}, profile: null }
@@ -134,14 +136,13 @@ async function assemble(scenario) {
     if (command === 'memory.list') {
       return { items: payload.state === 'active' ? (scenario.memories ?? []) : [] }
     }
-    if (command === 'skill.index') return { index: [] }
     return {}
   }
 
   try {
     // The shipped default is 0 (off); these checks exercise the feature, so
     // every scenario runs with a 20-step window.
-    apply(stub, { heartbeatSteps: 20 })
+    apply(stub, { heartbeatSteps: 20, ...(scenario.config ?? {}) })
     const emit = (event) => {
       for (const entry of listeners) {
         if (entry.event === 'session/event') entry.listener({ id: 's1', header: { cwd: CWD } }, event)
@@ -165,7 +166,6 @@ async function assemble(scenario) {
     const assembled = {
       anchorFirst,
       anchor: render(),
-      skills: sections.get('dsh-memory:skills')(context),
       render,
       emit,
       request,
@@ -188,13 +188,13 @@ async function assemble(scenario) {
 
 /**
  * A stub `llm` service that records the route of every stream it serves.
- * @param {Array<{provider: string, model: string}>} calls - route log to append to.
+ * @param {Array<{provider: string, model: string, sessionId?: string}>} calls - route log to append to.
  * @returns {{stream: (request: any) => AsyncGenerator<any>}} the stub service.
  */
 function recordingLlm(calls) {
   return {
     async *stream(request) {
-      calls.push({ provider: request.provider, model: request.model })
+      calls.push({ provider: request.provider, model: request.model, sessionId: request.sessionId })
       yield { type: 'text-delta', text: '## 示例摘要\n默认模型写出的摘要正文。' }
       yield { type: 'finish', reason: { kind: 'stop' } }
     },
@@ -259,12 +259,6 @@ console.log('recent work is bounded and conditional')
   check(!anchor.includes('本项目最近的工作'), 'a project with no memories omits the section entirely')
 }
 
-console.log('skill index empty state')
-{
-  const { skills } = await assemble({})
-  check(skills.includes('skill_list'), 'the empty state asks for a dedupe check first')
-}
-
 console.log('digest generation finds a model without a session route')
 {
   // A freshly started host: the settings page is open, no message has been
@@ -283,6 +277,9 @@ console.log('digest generation finds a model without a session route')
     calls[0]?.provider === 'deepseek-official' && calls[0]?.model === 'deepseek-flash',
     'the fallback uses the deployment default model',
   )
+  // The opencode-go relay answers 400 without x-opencode-session, which the
+  // host derives from this option; leaving it out made every digest fail.
+  check(calls[0]?.sessionId === 's1', 'the model call carries the session id')
   check(!String(result?.text ?? '').includes('失败'), 'the digest is committed instead of failing')
 }
 {
@@ -312,6 +309,29 @@ console.log('digest generation finds a model without a session route')
   })
   check(calls.length === 0, 'no model is called when no route is resolvable')
   check(String(result?.text ?? '').includes('失败'), 'the dead end is still reported as a failure')
+}
+
+console.log('a maintenance tick asks for the due tasks')
+{
+  // The cadence belongs to the Python side (`maintenance.run` runs only what is
+  // due), so the host only has to keep asking. One short tick proves the wiring.
+  const calls = []
+  await assemble({
+    calls,
+    config: { maintenanceIntervalMs: 30 },
+    async run() {
+      await new Promise((resolve) => setTimeout(resolve, 130))
+    },
+  })
+  const ticks = calls.filter((entry) => entry.command === 'maintenance.run')
+  check(ticks.length > 0, 'the tick asks the bridge to run the due tasks')
+  check(
+    ticks.every((entry) => {
+      const payload = entry.payload ?? {}
+      return payload.tasks === undefined && payload.force === undefined && payload.project_ids === undefined
+    }),
+    'the host leaves the task cadence to the Python side',
+  )
 }
 
 if (failures > 0) {

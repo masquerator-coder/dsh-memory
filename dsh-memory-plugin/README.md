@@ -5,7 +5,7 @@ DSH 记忆插件：把 `D:\Coding\dsh-memory\memory_system` 的长期记忆接�
 插件本身**不含任何记忆逻辑**。全局摘要生成、按预算控制详细程度、用户画像、条目编辑、
 Markdown 备份与项目根摘要文件全部由 `memory_system` 实现，插件只做三件事：
 
-1. 把记忆锚点（全局规模/时间 + **本项目最近工作**）与**本项目技能索引**注入系统提示词；
+1. 把记忆锚点（全局规模/时间 + **本项目最近工作**）注入系统提示词；
 2. 在回合结束、会话结束时驱动**一份覆盖全部项目的全局工作摘要**；
 3. 在设置页提供「记忆」入口，用来调参、看摘要、改画像、编辑条目、备份恢复。
 
@@ -65,13 +65,11 @@ patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪�
 | `memorySystemRoot` | `''` | 含 `memory_system` 包的仓库根目录，会加入子进程 `PYTHONPATH`；留空则按插件自身位置推导（`bridge.js` 的上一级目录），不绑定某台机器 |
 | `memoryHome` | `''` | 记忆库目录，留空为 `~/.dsh/memory`（或 `$DSH_HOME/memory`） |
 | `projectOverride` | `''` | 固定项目 id，不再按会话工作目录推导 |
-| `captureTurns` | `false` | **当前版本未读取，无实际效果**：插件不会自动采集会话。记忆只由模型通过 `memory_add` 主动写入，会话结束时再由一次模型调用补漏。保留该键只为兼容旧配置 |
-| `autoSummary` | `true` | 回合结束、空闲后自动生成全局摘要；常开，界面不提供开关。摘要是**读**记忆，不受 `captureTurns` 影响 |
+| `autoSummary` | `true` | 回合结束、空闲后自动生成全局摘要；常开，界面不提供开关。摘要是**读**记忆，不受写入路径影响。生成用的模型调用带宿主会话 id（`llm.stream({sessionId})`），因为按会话路由的提供方缺这个头会直接 400 |
 | `autoSummaryDelayMs` | `15000` | 回合结束到生成摘要之间的空闲间隔 |
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
-| `skillIndex` | `true` | 是否注入 `~/.agents/skills` 里的**全局**技能索引（一行一个技能，30 秒缓存）；项目技能由 DSH 技能目录另行列出 |
-| `skillAuthoring` | `true` | 是否在提示词里告诉模型何时可以 `skill_create`（写 `.agents/skills`）；默认每个会话最多新建 1 个 |
 | `heartbeatSteps` | `0` | 距上次 `memory_add` 经过多少个模型步（`step/start`，一次模型调用算一步）后，在系统提示词里出现一次记忆提醒，随后重新计数；`0` 关闭（默认）。提醒会改写常驻提示词，开启即意味着周期性前缀缓存失效 |
+| `maintenanceIntervalMs` | `600000` | 每隔多久调用一次 `maintenance.run`（衰减/合并/社区/归档扫描/晋升）；任务按 `MaintenanceConfig` 的节奏自限，早到的 tick 只是一次空调用；`0` 关闭 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型，检查还有没有未写入的记忆 |
 | `requestTimeoutMs` | `60000` | 单次桥接调用超时；超时会重启子进程，避免响应错位 |
 | `embeddingPreset` | `''` | 传给 `MemoryConfig` 的向量化预设 |

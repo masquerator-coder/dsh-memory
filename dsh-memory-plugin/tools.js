@@ -377,7 +377,14 @@ export function buildTools({ call, projectFor, generateDigest }) {
       parameters: {},
       output: TEXT_OUTPUT,
       async execute(_args, exec) {
-        const record = await generateDigest({ cwd: cwdOf(exec), signal: exec?.signal, reason: 'manual' })
+        // The session id rides along because providers that route per
+        // conversation reject a call without it (see `collectText` in index.js).
+        const record = await generateDigest({
+          cwd: cwdOf(exec),
+          signal: exec?.signal,
+          reason: 'manual',
+          sessionId: sessionIdOf(exec),
+        })
         const digest = record?.digest
         if (!digest) return textOutput('摘要生成未返回结果。')
         if (digest.status === 'error') return textOutput(`摘要生成失败：${digest.error ?? '未知错误'}`)

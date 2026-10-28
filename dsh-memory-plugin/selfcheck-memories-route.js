@@ -1,6 +1,7 @@
 /**
- * End-to-end check of the `/dsh-memory/memories` route: what the settings page
- * receives when a new project becomes the live session.
+ * End-to-end check of the `/dsh-memory/memories` and `/dsh-memory/health`
+ * routes: what the settings page receives when a new project becomes the live
+ * session, and what an operator sees when digest generation has been failing.
  *
  * Drives the real `apply` with stub host services (including a `webServer`
  * that records the registered route) and a stubbed bridge whose `memory.list`
@@ -32,6 +33,17 @@ const STORE = {
 
 const ROUTES = new Map()
 const calls = []
+
+/** What `/health` reads: one failed attempt, then a clean one. */
+let HISTORY = [
+  {
+    digest_id: 'dg_bad',
+    status: 'error',
+    reason: 'auto',
+    error: '模型调用失败：400: MissingSessionID',
+    created_at: '2026-10-28T08:41:30+00:00',
+  },
+]
 
 const stub = {
   get(name) {
@@ -71,19 +83,31 @@ BridgeClient.prototype.call = async (command, payload = {}) => {
       : Object.values(STORE).flat()
     return { items, total: items.length, project_id: project ?? null }
   }
+  if (command === 'status') {
+    return {
+      home: 'C:/mem/memory.db',
+      project_id: 'c-work-alpha',
+      memories: 7,
+      // `status.digest` is the latest *successful* digest: health must not use
+      // it to answer "did the last run work?".
+      digest: { digest_id: 'dg_ok', status: 'ok' },
+      stats: { maintenance: { due: ['decay'] } },
+    }
+  }
+  if (command === 'digest.history') return { items: HISTORY }
   return {}
 }
 
 apply(stub, {})
 
 /** Minimal Node request/response pair, enough for `jsonRoute`. */
-async function route(payload) {
-  const handler = ROUTES.get('/dsh-memory/memories')
-  if (!handler) throw new Error('the memories route was not registered')
+async function routeTo(path, payload) {
+  const handler = ROUTES.get(path)
+  if (!handler) throw new Error(`the ${path} route was not registered`)
   const listeners = new Map()
   const req = {
     method: 'POST',
-    url: '/dsh-memory/memories',
+    url: path,
     headers: { host: '127.0.0.1:58586' },
     socket: { remoteAddress: '127.0.0.1' },
     on(event, fn) {
@@ -111,6 +135,9 @@ async function route(payload) {
   return envelope.result
 }
 
+/** POST to the memories route. */
+const route = (payload) => routeTo('/dsh-memory/memories', payload)
+
 console.log('scoped request still lists one project')
 {
   const result = await route({ all_projects: false, project_id: 'c-work-alpha', limit: 20, offset: 0 })
@@ -136,6 +163,22 @@ console.log('a scoped request the host cannot resolve is announced, not silent')
   check(calls.length > before, 'the bridge was still called')
   check(result.scoped_to_project === false, 'the response is not presented as a project listing')
   check(result.scope_note === 'no-live-session', `it explains why (got ${JSON.stringify(result.scope_note)})`)
+}
+
+console.log('health reports a failed digest instead of a blanket ok')
+{
+  const result = await routeTo('/dsh-memory/health', {})
+  check(result.ok === false, 'a failed digest attempt makes health unhealthy')
+  check(result.problems?.[0]?.kind === 'digest', 'the problem names the digest')
+  check(result.digest?.last_attempt?.status === 'error', 'the last attempt is reported, not the latest success')
+  check(result.digest?.latest?.digest_id === 'dg_ok', 'the latest successful digest is still visible')
+  check(result.maintenance?.due?.[0] === 'decay', 'due maintenance tasks are surfaced')
+}
+{
+  HISTORY = [{ digest_id: 'dg_ok', status: 'ok', reason: 'manual', created_at: '2026-10-28T09:00:00+00:00' }]
+  const result = await routeTo('/dsh-memory/health', {})
+  check(result.ok === true, 'a clean last attempt keeps health ok')
+  check((result.problems ?? []).length === 0, 'and reports no problems')
 }
 
 if (failures > 0) {

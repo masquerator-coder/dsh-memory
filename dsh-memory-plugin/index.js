@@ -36,14 +36,8 @@ export const TOOL_NAMES = [
 /** Prompt section order: after the built-in tool docs, before the persona. */
 const ANCHOR_ORDER = 9500
 
-/** L4 index order: right after the memory anchor, still before the persona. */
-const SKILL_INDEX_ORDER = 9510
-
 /** How long an anchor stays usable before it is refreshed. */
 const ANCHOR_REFRESH_MS = 15_000
-
-/** How long the project's skill index stays usable before it is re-read. */
-const SKILL_REFRESH_MS = 30_000
 
 /**
  * How much recent work the anchor shows for the current project.
@@ -57,40 +51,26 @@ const RECENT_CHARS = 400
 /** How many newest memories the anchor considers before the character cut. */
 const RECENT_LIMIT = 8
 
-/**
- * Skills one project may hold before the model must retire or merge one.
- *
- * The design's ceiling is 200, which is the right bound for a long-lived
- * registry but far past what a model should ever create through a tool call:
- * every project-scope skill competes for the Level-1 index and the model's
- * attention. Two dozen is already generous for "worth keeping procedures".
- */
-const MODEL_SKILL_CAP = 24
-
 /** Default configuration; the row's YAML may override any field. */
 const DEFAULTS_INNER = {
   pythonPath: '',
   memorySystemRoot: '',
   memoryHome: '',
   projectOverride: '',
-  // Memory is written by the model through `memory_add`, never harvested from
-  // session traffic: the host injects many synthetic user-role messages
-  // (runtime context, skill catalog, compaction checkpoints), and capturing
-  // them as if they were the human's words poisons recall.
-  captureTurns: false,
   // Automatic digests are always on; the switch was removed from the UI.
   autoSummary: true,
   autoSummaryDelayMs: 15000,
   systemPromptAnchor: true,
-  // Project-scope L4 skills: the resident index block, and whether the model
-  // is told when it may save a procedure as a new skill.
-  skillIndex: true,
-  skillAuthoring: true,
   // Model steps between memory reminders; 0 disables the heartbeat. Off by
   // default: the reminder rides the system prompt, so each appearance is a
   // prefix-cache miss for every session in flight, and the session-end check
   // already covers what would otherwise be lost.
   heartbeatSteps: 0,
+  // How often the host asks the Python side to run the due maintenance tasks
+  // (decay, consolidation, communities, archive scan, promotions). The tasks
+  // keep their own cadence; this only decides how often the question is asked,
+  // and 0 turns the tick off.
+  maintenanceIntervalMs: 600000,
   // Ask the model once, at session teardown, for anything still unwritten.
   sessionEndCheck: true,
   requestTimeoutMs: 60000,
@@ -106,7 +86,7 @@ const DEFAULTS_INNER = {
  * count where zero would mean "no timeout" or "run on every step", so zero
  * stays invalid for those.
  */
-const ZERO_IS_MEANINGFUL = new Set(['heartbeatSteps'])
+const ZERO_IS_MEANINGFUL = new Set(['heartbeatSteps', 'maintenanceIntervalMs'])
 
 /**
  * Normalize raw row configuration.
@@ -147,11 +127,6 @@ export const OPTIONAL_SERVICES = ['connection']
 
 /** @deprecated Use {@link HOST_SERVICES}; kept so existing imports still work. */
 export const inject = HOST_SERVICES
-
-/** Working directory of the agent behind a tool or assembly context. */
-function cwdOf(context) {
-  return context?.agent?.session?.header?.cwd
-}
 
 /** Session id of the agent behind a tool context. */
 function sessionIdOf(context) {
@@ -308,7 +283,12 @@ export function apply(ctx, rawConfig) {
     if (existing) clearTimeout(existing)
     const timer = setTimeout(() => {
       autoTimers.delete(id)
-      generateDigest({ cwd: session?.header?.cwd, signal: undefined, reason: 'auto' }).catch((error) => {
+      generateDigest({
+        cwd: session?.header?.cwd,
+        signal: undefined,
+        reason: 'auto',
+        sessionId: session?.id,
+      }).catch((error) => {
         logger.warn(`[dsh-memory] automatic digest failed: ${error?.message ?? error}`)
       })
     }, config.autoSummaryDelayMs)
@@ -320,6 +300,48 @@ export function apply(ctx, rawConfig) {
     for (const timer of autoTimers.values()) clearTimeout(timer)
     autoTimers.clear()
   }, 'dsh-memory.auto-summary-timers')
+
+  // ── background maintenance ────────────────────────────────────────────
+  //
+  // The Python side owns the cadence: `maintenance.run` executes only what is
+  // due, so a tick that lands early costs one bridge round trip. Without any
+  // caller the `state` column never moves and the list keeps calling decayed
+  // entries "active" while recall (which computes retention live) cannot
+  // return them.
+
+  if (config.maintenanceIntervalMs > 0) {
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer
+    let stopped = false
+
+    /** Ask for one maintenance pass, then schedule the next. */
+    const tick = async () => {
+      if (stopped) return
+      try {
+        const result = await call('maintenance.run', {})
+        const ran = (result?.reports ?? []).filter((report) => report?.ran)
+        if (ran.length > 0) {
+          logger.info(`[dsh-memory] maintenance ran: ${ran.map((report) => report.name).join(', ')}`)
+        }
+      } catch (error) {
+        // Maintenance is housekeeping: a failed pass warns and waits for the
+        // next tick instead of retrying in a tight loop or failing a turn.
+        logger.warn(`[dsh-memory] maintenance pass failed: ${error?.message ?? error}`)
+      } finally {
+        if (!stopped) {
+          timer = setTimeout(tick, config.maintenanceIntervalMs)
+          if (typeof timer.unref === 'function') timer.unref()
+        }
+      }
+    }
+
+    timer = setTimeout(tick, config.maintenanceIntervalMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    ctx.effect(() => () => {
+      stopped = true
+      clearTimeout(timer)
+    }, 'dsh-memory.maintenance-tick')
+  }
 
   /**
    * Model steps taken since the last `memory_add`, per session id.
@@ -351,7 +373,46 @@ export function apply(ctx, rawConfig) {
     if (sessionId) stepsSinceWrite.set(sessionId, 0)
   }
 
+  /**
+   * The last session id this process saw.
+   *
+   * Host-side model calls (digest generation, the session-end review) happen
+   * outside any session, and some providers route per session: the
+   * `opencode-go` relay rejects a request without `x-opencode-session` with a
+   * 400. `llm.stream` takes a `sessionId` for exactly that reason, so every
+   * host-side call carries the one this process observed last.
+   */
+  let lastSessionId
+
+  /** @param {string | undefined} sessionId - a session this process observed. */
+  function noteSession(sessionId) {
+    if (typeof sessionId === 'string' && sessionId) lastSessionId = sessionId
+  }
+
+  /**
+   * The session id a host-side model call should borrow.
+   *
+   * The last observed session wins; the live session list is only the fallback
+   * for a process that has not seen an event yet. It is a provider routing
+   * hint, never a claim about which session the work belongs to.
+   * @returns {string | undefined} a session id, if this process knows one.
+   */
+  function hostSessionId() {
+    if (lastSessionId) return lastSessionId
+    try {
+      const sessions = ctx.get?.('sessions')?.list?.() ?? []
+      for (const session of sessions) {
+        if (typeof session?.id === 'string' && session.id) return session.id
+      }
+    } catch {
+      // An unreadable session list is the same as none: the call is still worth
+      // attempting, and the provider's own error says what was missing.
+    }
+    return undefined
+  }
+
   ctx.on('session/event', (session, event) => {
+    noteSession(session?.id)
     const type = event?.type
     if (type === 'step/start') {
       // One step is one model call. Counting `turn/start` instead made a
@@ -406,6 +467,7 @@ export function apply(ctx, rawConfig) {
         { role: 'user', content: transcript },
       ],
       undefined,
+      session?.id,
     )
     for (const item of parseMemories(reply)) {
       await call('memory.remember', {
@@ -420,6 +482,7 @@ export function apply(ctx, rawConfig) {
   }
 
   ctx.on('session/disposed', (session) => {
+    noteSession(session?.id)
     void reviewSessionEnd(session).catch((error) => {
       if (error?.code === 'DISPOSED') return
       logger.warn(`[dsh-memory] session-end memory check failed: ${error?.message ?? error}`)
@@ -440,28 +503,39 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Pick the most recently active session's working directory.
+   * The working directory a host-side request should act on.
+   *
+   * `lastCwd` is rewritten by every prompt assembly (`rememberCwd`), so it names
+   * the session the user is actually typing in. The session list is only a
+   * cold-start fallback: its entries carry `createdAt` and no activity stamp, so
+   * ranking by the absent `updatedAt` compared `NaN` and kept whatever order
+   * the list happened to be in — which is how the settings page could resolve
+   * another project's working directory.
    * @returns {string | undefined} a working directory, if any.
    */
   function liveCwd() {
+    if (lastCwd.value) return lastCwd.value
     const sessions = ctx.get?.('sessions')
     const list = sessions?.list?.() ?? []
-    if (list.length > 0) {
-      const ranked = [...list].sort((a, b) => Number(b?.updatedAt ?? b?.updated_at ?? 0) - Number(a?.updatedAt ?? a?.updated_at ?? 0))
-      for (const session of ranked) {
-        const cwd = session?.header?.cwd
-        if (typeof cwd === 'string' && cwd) {
-          rememberCwd(cwd)
-          return cwd
-        }
+    /** @param {any} session - one session record. @returns {number} creation time. */
+    const stamp = (session) => {
+      const raw = session?.header?.createdAt ?? session?.createdAt ?? 0
+      const value = typeof raw === 'number' ? raw : Date.parse(String(raw))
+      return Number.isFinite(value) ? value : 0
+    }
+    for (const session of [...list].sort((a, b) => stamp(b) - stamp(a))) {
+      const cwd = session?.header?.cwd
+      if (typeof cwd === 'string' && cwd) {
+        rememberCwd(cwd)
+        return cwd
       }
     }
-    return lastCwd.value || undefined
+    return undefined
   }
 
   /**
    * Resolve the working directory a host-side request should act on: the one
-   * the caller named, else the latest live session's, else the last seen one.
+   * the caller named, else the last assembled session's.
    * @param {string | undefined} cwd - caller-supplied working directory.
    * @returns {string | undefined} working directory.
    */
@@ -531,9 +605,10 @@ export function apply(ctx, rawConfig) {
    * @param {{ provider: string, model: string }} route - model route.
    * @param {Array<{ role: string, content: string }>} turns - conversation.
    * @param {AbortSignal | undefined} signal - cancellation.
+   * @param {string | undefined} sessionId - session to borrow for provider routing.
    * @returns {Promise<string>} the concatenated assistant text.
    */
-  async function collectText(llm, route, turns, signal) {
+  async function collectText(llm, route, turns, signal, sessionId) {
     const messages = turns.map((turn, index) => ({
       id: `dsh-memory-${index}`,
       role: turn.role,
@@ -542,10 +617,14 @@ export function apply(ctx, rawConfig) {
     }))
     let text = ''
     let failure
+    // `sessionId` is not bookkeeping: providers that route per conversation
+    // (the opencode-go relay, for one) reject a request without their session
+    // header with a 400, which is exactly how every digest run used to fail.
     for await (const chunk of llm.stream({
       provider: route.provider,
       model: route.model,
       messages,
+      ...(sessionId ? { sessionId } : {}),
       signal,
     })) {
       if (chunk.type === 'text-delta') text += chunk.text
@@ -596,9 +675,10 @@ export function apply(ctx, rawConfig) {
    * @param {AbortSignal} [options.signal] - cancellation.
    * @param {string} [options.reason] - `manual` or `auto`.
    * @param {number} [options.length] - override the stored budget.
+   * @param {string} [options.sessionId] - session the run belongs to, when known.
    * @returns {Promise<any>} `{ digest }` as committed.
    */
-  async function generateDigest({ cwd, signal, reason = 'manual', length } = {}) {
+  async function generateDigest({ cwd, signal, reason = 'manual', length, sessionId } = {}) {
     cwd = resolveCwd(cwd)
     // Resolving the project also registers its root path, which is what lets
     // the Python side refresh that project's DSH_MEMORY.md. It is never a
@@ -627,7 +707,7 @@ export function apply(ctx, rawConfig) {
         // The earlier run failed; fall through and try once more.
       }
     }
-    const task = runDigest({ cwd, projectId, signal, reason, length })
+    const task = runDigest({ cwd, projectId, signal, reason, length, sessionId })
     digestInFlight.set(key, task)
     try {
       return await task
@@ -663,7 +743,7 @@ export function apply(ctx, rawConfig) {
    * @param {object} options - generation options.
    * @returns {Promise<any>} `{ digest }` as committed.
    */
-  async function runDigest({ cwd, projectId, signal, reason, length }) {
+  async function runDigest({ cwd, projectId, signal, reason, length, sessionId }) {
     const plan = await call('digest.plan', { cwd, project_id: projectId, length }, signal)
     // An automatic run that would read exactly the materials the last digest
     // was built from produces the same summary again at full model cost. It
@@ -681,6 +761,9 @@ export function apply(ctx, rawConfig) {
     const llm = ctx.get?.('llm')
     // Session route first, deployment default model second: see `hostRoute`.
     const route = hostRoute()
+    // A host-side call belongs to no session, but several providers route on
+    // one; borrow the newest session this process knows (see `hostSessionId`).
+    const ownerSession = sessionId ?? hostSessionId()
     let text = ''
     let error
     let generator = 'host-llm'
@@ -704,6 +787,7 @@ export function apply(ctx, rawConfig) {
             { role: 'user', content: plan.user },
           ],
           signal,
+          ownerSession,
         )
       } catch (failure) {
         if (failure?.code === 'ABORTED') throw failure
@@ -757,46 +841,8 @@ export function apply(ctx, rawConfig) {
             },
           }
         : definition
-    // Skill creation has the same shape of seam: the per-session guard in the
-    // prompt only needs to know that the model tried to save a procedure.
-    const registered =
-      wrapped.name === 'skill_create'
-        ? {
-            ...wrapped,
-            async execute(args, exec) {
-              try {
-                return await wrapped.execute(args, exec)
-              } finally {
-                noteSkillCreate(sessionIdOf(exec))
-              }
-            },
-          }
-        : wrapped
-    ctx.effect(() => ctx.tools.register(registered), `dsh-memory.tool(${registered.name})`)
+    ctx.effect(() => ctx.tools.register(wrapped), `dsh-memory.tool(${wrapped.name})`)
   }
-
-  // ── L4: project skills ───────────────────────────────────────────────
-
-  /**
-   * Skills created from this process.
-   *
-   * Deliberately in-memory and deliberately not a record of what exists: the
-   * project's skills are whatever the next `skill.index` reads back from the
-   * store. This only paces the model ("one new skill per session, more only
-   * when the user asks"), so losing it on restart costs nothing.
-   */
-  const skillsCreated = new Map()
-
-  /**
-   * Count one skill the model just tried to save.
-   * @param {string | undefined} sessionId - the creating session.
-   */
-  function noteSkillCreate(sessionId) {
-    if (!sessionId) return
-    skillsCreated.set(sessionId, (skillsCreated.get(sessionId) ?? 0) + 1)
-  }
-
-  ctx.effect(() => () => skillsCreated.clear(), 'dsh-memory.skill-state')
 
   // ── system prompt anchor ──────────────────────────────────────────────
 
@@ -1087,100 +1133,6 @@ export function apply(ctx, rawConfig) {
     void readAnchorLine()
   }
 
-  // ── L4: skill index section ───────────────────────────────────────────
-
-  if (config.skillIndex || config.skillAuthoring) {
-    /**
-     * Index text per working directory, refreshed off the assembly path.
-     *
-     * Same trade as the memory anchor: assembly is synchronous, so a stale-by-
-     * seconds index beats a prompt that waits on the Python child. The slot is
-     * stamped with the moment the refresh *started*, so a long read cannot
-     * make the cache look fresh for longer than it is.
-     */
-    const skillCaches = new Map()
-
-    /** @param {string} cwd - session working directory, '' when unknown. */
-    function skillSlot(cwd) {
-      const key = cwd || ''
-      let slot = skillCaches.get(key)
-      if (!slot) {
-        slot = { at: 0, text: '', pending: false }
-        skillCaches.set(key, slot)
-      }
-      return slot
-    }
-
-    /**
-     * Start a read of this project's skill index when the cached one aged.
-     * @param {string | undefined} cwd - session working directory.
-     */
-    function refreshSkillIndex(cwd) {
-      const slot = skillSlot(cwd || '')
-      if (slot.pending) return
-      if (slot.at > 0 && Date.now() - slot.at < SKILL_REFRESH_MS) return
-      slot.at = Date.now()
-      slot.pending = true
-      void (async () => {
-        try {
-          const projectId = await projectFor(cwd)
-          if (!projectId) return
-          const result = await call('skill.index', { project_id: projectId })
-          const lines = Array.isArray(result?.index) ? result.index : []
-          slot.text = lines.join('\n')
-        } catch (error) {
-          logger.warn(`[dsh-memory] skill index refresh failed: ${error?.message ?? error}`)
-        } finally {
-          slot.pending = false
-        }
-      })()
-    }
-
-    /**
-     * The guidance for one assembly: what the project can already do, and when
-     * saving a new procedure is allowed.
-     * @param {string | undefined} sessionId - the assembling session.
-     * @param {string | undefined} cwd - the session's working directory.
-     * @returns {string} the skill block, or '' when there is nothing to say.
-     */
-    function skillBlock(sessionId, cwd) {
-      const slot = skillCaches.get(cwd ?? '')
-      const index = slot?.text?.trim() ?? ''
-      const created = skillsCreated.get(sessionId ?? '') ?? 0
-      const parts = []
-      if (config.skillIndex) {
-        parts.push(SKILL_INDEX_HEADER.replace('{{skill_index}}', index || SKILL_INDEX_EMPTY))
-        // `0` is not a literal cap: the first skill of a session is the one
-        // most likely to be worth keeping, and the user can ask for more.
-        if (config.skillAuthoring) {
-          const pace =
-            created === 0
-              ? SKILL_AUTHORING_RULE
-              : SKILL_AUTHORING_PACED.replace('{{count}}', String(created))
-          parts.push(pace)
-        }
-      }
-      return `\n\n${parts.join('\n\n')}`
-    }
-
-    ctx.effect(
-      () =>
-        ctx.systemPrompt.section({
-          name: 'dsh-memory:skills',
-          order: SKILL_INDEX_ORDER,
-          interpolate: false,
-          text: (context) => {
-            const session = context?.agent?.session
-            const cwd = session?.header?.cwd
-            rememberCwd(cwd)
-            refreshSkillIndex(cwd)
-            return skillBlock(session?.id, cwd)
-          },
-        }),
-      'dsh-memory.skill-section',
-    )
-  }
-
   // ── HTTP surface for the settings page ─────────────────────────────────
 
   /**
@@ -1422,15 +1374,18 @@ export function apply(ctx, rawConfig) {
           return { ...view, generated: record?.digest ?? null }
         }
         case 'delete': {
+          // Not surfaced in the page, which offers no button for it: it exists
+          // so an operator can drop a digest row (a failed attempt, say)
+          // without opening the database.
           const deleted = await call('digest.delete', { digest_id: body?.digest_id })
           // Dropping the digest changes the anchor body; do not leave the old
           // count line resident until the TTL expires.
           await refreshAnchorNow()
           return deleted
         }
-        case 'history':
-          return await call('digest.history', {})
         default:
+          // `digest.view` already returns the history alongside the content, so
+          // there is no separate `history` action to keep in sync.
           return await call('digest.view', {})
       }
     })
@@ -1521,14 +1476,51 @@ export function apply(ctx, rawConfig) {
       const started = Date.now()
       try {
         const status = await call('status', {})
+        // A failed digest run does not make the bridge unhealthy, and the page
+        // never asks, so this route is the one place it surfaces. History is
+        // read newest-first and keeps error rows — `status.digest` is only the
+        // latest *successful* digest, which is exactly the wrong question here.
+        let lastAttempt = null
+        try {
+          const history = await call('digest.history', { limit: 1 })
+          lastAttempt = Array.isArray(history?.items) ? (history.items[0] ?? null) : null
+        } catch {
+          // Diagnostics only: a history read failure is not a health failure.
+        }
+        const problems = []
+        if (lastAttempt?.status === 'error') {
+          problems.push({
+            kind: 'digest',
+            message: lastAttempt.error || '摘要生成失败',
+            digest_id: lastAttempt.digest_id,
+            created_at: lastAttempt.created_at,
+          })
+        }
+        const due = status?.stats?.maintenance?.due
         return {
-          ok: true,
+          // Reachability plus "the last digest attempt did not fail". A caller
+          // that only wants the former reads `latencyMs`/`home`.
+          ok: problems.length === 0,
           latencyMs: Date.now() - started,
           home: status?.home,
           project: status?.project_id,
           settings: status?.settings,
           memories: status?.memories,
           probe: status?.probe,
+          digest: {
+            latest: status?.digest ?? null,
+            last_attempt: lastAttempt
+              ? {
+                  digest_id: lastAttempt.digest_id,
+                  status: lastAttempt.status,
+                  reason: lastAttempt.reason,
+                  created_at: lastAttempt.created_at,
+                  error: lastAttempt.error ?? null,
+                }
+              : null,
+          },
+          maintenance: { due: Array.isArray(due) ? due : [] },
+          problems,
         }
       } catch (error) {
         return {
@@ -1596,62 +1588,3 @@ const ANCHOR_HEADER = [
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
 export const DEFAULTS = Object.freeze({ ...DEFAULTS_INNER })
-
-/**
- * The public skill index block: what this machine already knows how to do.
- * `{{skill_index}}` is replaced with the Python-rendered Level-1 lines.
- *
- * Project skills are deliberately absent: they are files in the checkout and
- * the host's own skill catalog lists them, so repeating them here would spend
- * the same tokens twice and make one skill look like two.
- */
-const SKILL_INDEX_HEADER = [
-  '## 技能（公共技能：`~/.agents/skills`）',
-  '下面是本机公共技能目录里的技能，一行一个，只有触发条件与作用，不含步骤：',
-  '',
-  '{{skill_index}}',
-  '',
-  '执行某个技能前先 `skill_get` 读完整步骤；正文细节不要凭索引里的摘要臆测。',
-  '本项目的技能是仓库里的文件（`.agents/skills/<name>/SKILL.md`），由 DSH 技能目录另行列出、可用 `skill` 工具加载，这里不重复列出。',
-].join('\n')
-
-/**
- * Shown when there is no public skill yet.
- *
- * Same dedupe-first rule as the authoring rule below: this line is what the
- * model reads next, so it must not invite creating one.
- */
-const SKILL_INDEX_EMPTY =
-  '（`~/.agents/skills` 里还没有公共技能。项目技能写在 `.agents/skills/`，由 DSH 技能目录列出；确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`。要存成公共技能必须先征得用户同意。）'
-
-/**
- * When saving a procedure is allowed.
- *
- * This is the whole anti-noise policy: the cost of a bad skill is not disk, it
- * is the model reading and trusting a wrong procedure next time, so the bar is
- * "tested and reusable", not "plausible".
- */
-const SKILL_AUTHORING_RULE = [
-  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。默认存成本项目技能：`.agents/skills/<name>/SKILL.md`（`name` 用 kebab-case ASCII，中文放 title）。如果这套做法对**本机所有项目**都通用，可以存成公共技能：`scope="global"`，写入 `~/.agents/skills/<name>/SKILL.md`。 同时满足下面全部条件才值得存：',
-  '- 这次任务中，这套步骤**真的被执行过并验证成功**（不是设想、不是只读过代码）；',
-  '- 同类任务**大概率会再来**，步骤基本可复用；',
-  '- 步骤里有**具体动作与顺序**（改了哪个模块、跑了什么命令、按什么顺序验证），不是“仔细阅读代码”这类空话；',
-  '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。 不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。 项目技能建议控制在 24 个左右，超过写入会被拒绝；接近上限时先合并或 `skill_retire`，不要为了腾位置乱建。 技能文件会进版本库，那是知识不是日志：一次性调试步骤不要写进去。',
-  '',
-  '**公共技能必须先问用户**：公共技能写进 `~/.agents/skills`，对本机所有项目可见，属于用户的全局能力。在生成/保存公共技能之前，**必须先向用户说明准备保存的技能名、用途与步骤，并直接询问“是否要创建这个公共技能”**；只有用户明确同意后，才能调用 `skill_create` 并传 `scope="global"`、`user_approved=true`。用户没有明确同意、只是没有反对、或让你“记一下”时，都不要创建公共技能；可以改存项目技能，或先问清楚。',
-].join('\n')
-
-/** Said after the session already saved one skill. */
-const SKILL_AUTHORING_PACED = [
-  '**技能写入职责**：本会话已经创建或尝试过 {{count}} 个技能。除非用户明确要求，**不要再新建**；',
-  '确有需要时，先 `skill_list` 确认没有同类技能，并优先考虑把可复用的部分补进已有技能。',
-].join('\n')
-
-/**
- * How many project skills the prompt asks the model to aim for.
- *
- * The write path enforces the same number over the bundles in
- * `.agents/skills` (`memory_system/project_skills.py` `DEFAULT_LIMIT`) and
- * rejects the write, so this prompt text and the enforced ceiling agree. Keep
- * them in step: a prompt that promises a limit nothing enforces is a bug.
- */

@@ -8,6 +8,7 @@ agree with what the exporter actually writes.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -568,3 +569,71 @@ def test_unknown_memory_id_reports_not_found(capture_home, command, payload):
     assert reply["ok"] is False
     assert reply["error"]["code"] == "not_found", reply["error"]
     assert "not found" in reply["error"]["message"]
+
+
+# ── maintenance ─────────────────────────────────────────────────────────
+#
+# ``run_maintenance`` used to be reachable only from tests, so the ``state``
+# column never moved in a real installation: recall recomputed retention live
+# and stayed correct, while the list kept calling decayed entries "active".
+
+
+def _maintenance(home: str, **payload) -> dict:
+    reply = handle(
+        {
+            "id": "t",
+            "command": "maintenance.run",
+            "payload": {"home": home, **payload},
+        }
+    )
+    assert reply["ok"], reply.get("error")
+    return reply["result"]
+
+
+def test_maintenance_run_runs_every_task_then_respects_the_cadence(capture_home):
+    forced = _maintenance(capture_home, force=True)
+    assert {report["name"] for report in forced["reports"]} == {
+        "decay",
+        "consolidate",
+        "communities",
+        "archive_scan",
+        "promotions",
+    }
+    assert all(report["ran"] for report in forced["reports"]), forced["reports"]
+    assert forced["due"] == []
+
+    # Nothing is due immediately after a forced pass, so the host tick is cheap.
+    quiet = _maintenance(capture_home)
+    assert quiet["reports"] == []
+    assert quiet["due"] == []
+
+
+def test_decay_pass_refreshes_the_cached_state(capture_home):
+    reply = handle(
+        {
+            "id": "t",
+            "command": "memory.remember",
+            "payload": {"home": capture_home, "project_id": "p", "summary": "会被衰减的一条"},
+        }
+    )
+    assert reply["ok"], reply.get("error")
+
+    aged = "2000-01-01T00:00:00+00:00"
+    with sqlite3.connect(Path(capture_home) / "memory.db") as con:
+        con.execute("UPDATE l2_episodes SET created_at = ?, last_access = ?", (aged, aged))
+
+    _maintenance(capture_home, tasks=["decay"], force=True)
+
+    def listed(state: str) -> int:
+        result = handle(
+            {
+                "id": "t",
+                "command": "memory.list",
+                "payload": {"home": capture_home, "project_id": "p", "state": state},
+            }
+        )
+        assert result["ok"], result.get("error")
+        return result["result"]["total"]
+
+    assert listed("active") == 0
+    assert listed("archived") == 1

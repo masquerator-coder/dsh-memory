@@ -423,6 +423,36 @@ def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any
     }
 
 
+# ── maintenance ─────────────────────────────────────────────────────────
+#
+# The host owns the cadence: every call is cheap when nothing is due, and the
+# tasks themselves are idempotent and bounded (``maintenance.py:14-18``). This
+# command exists because ``run_maintenance`` used to be reachable from tests
+# only, so ``decay`` never refreshed ``state`` in a real installation: recall
+# computed retention live and stayed correct, while the list kept reporting
+# entries as active that could no longer be recalled.
+
+
+@command("maintenance.run")
+def cmd_maintenance_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the due background tasks; ``force`` ignores the cadence.
+
+    Reports come back task by task, so a caller can tell "not due" from
+    "failed" instead of guessing from a total.
+    """
+    raw_tasks = payload.get("tasks")
+    raw_projects = payload.get("project_ids")
+    reports = memory.run_maintenance(
+        project_ids=[str(p) for p in raw_projects] if isinstance(raw_projects, list) and raw_projects else None,
+        tasks=[str(t) for t in raw_tasks] if isinstance(raw_tasks, list) and raw_tasks else None,
+        force=_bool(payload.get("force")),
+    )
+    return {
+        "reports": [report.to_dict() for report in reports],
+        "due": memory.maintenance.status()["due"],
+    }
+
+
 # ── settings ────────────────────────────────────────────────────────────
 
 
@@ -764,10 +794,11 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
 # is what makes "when was this skill saved, and from which project" answerable
 # without turning the store into a second source of truth.
 #
-# ``skill.index`` lists global skills only: the host already renders project
-# skills in its own catalog and repeating them here would put every one in the
-# prompt twice. ``skill.list`` still reports both — "before creating, check
-# what exists" has to see all of them.
+# ``skill.index`` lists global skills only: the host's native skill catalog
+# already renders project skills, and ``skill.list`` still reports both —
+# "before creating, check what exists" has to see all of them. The plugin no
+# longer injects this index into the system prompt; it remains a read-only
+# bridge view for clients that want the one-line catalog.
 #
 # Creating a global skill is a user decision. The model must ask first and
 # retry with ``user_approved=true``; the payload flag is the only thing that
@@ -876,10 +907,10 @@ def record_skill_created(
 
 @command("skill.index")
 def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """The resident index: one line per global skill file (design §6.5).
+    """The one-line catalog: one line per global skill file (design §6.5).
 
-    Read-only. The host renders this into the system prompt, so it must cost
-    one directory scan and must never create, retire or re-tier anything.
+    Read-only. Callers that want a compact catalog use this; it must cost one
+    directory scan and must never create, retire or re-tier anything.
     """
     project = _project(payload)
     files = project_skills.discover_at(_global_root())

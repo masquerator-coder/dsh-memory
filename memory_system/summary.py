@@ -675,7 +675,13 @@ class DigestService:
         )
         with self.store.transaction():
             self._insert_digest(record)
-            self.store.set_meta(META_UPDATED, record.created_at)
+            # Only a digest that became the visible one may move the marker.
+            # An error row (a failed model call) or an empty one is kept for
+            # history, but stamping "updated" for content the prompt does not
+            # show made the settings page and `/health` claim a digest was
+            # regenerated when the attempt had actually failed.
+            if status == "ok":
+                self.store.set_meta(META_UPDATED, record.created_at)
         # Project files are derived from L2, not from the digest text, so they
         # stay useful even when model generation failed.
         self.write_project_summaries()
