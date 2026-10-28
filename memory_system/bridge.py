@@ -44,7 +44,7 @@ from .config import MemoryConfig
 from .errors import ConflictError, MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
 from .l3 import FactInput
-from .l4 import Skill, SkillDefinition, render_index_line
+from .l4 import SkillDefinition
 from .summary import (
     AUTO_MODE,
     DEFAULT_LENGTH,
@@ -60,7 +60,7 @@ from .summary import (
     export_markdown,
 )
 from .system import MemorySystem
-from .text import estimate_tokens
+from .text import clip_words, estimate_tokens
 
 BRIDGE_VERSION = 1
 
@@ -751,18 +751,29 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
     }
 
 
-# ── L4: project skills ──────────────────────────────────────────────────
+# ── L4: file-backed skills ──────────────────────────────────────────────
 #
-# A project's skills are files inside its own checkout (``.agents/skills``), so
-# DSH's native skill catalog discovers them and a human reads the same file;
-# only *global* (org/sys) skills stay in the database. The root comes from this
-# session's cwd, so nothing here can see another project's bundles, and
-# ``org``/``sys`` promotion stays a user decision.
+# Procedural memory is stored as skill bundles, not as ``l4_skills`` rows:
 #
-# The asymmetry is deliberate: ``skill.index`` lists global skills only, since
-# the host already renders project skills in its own catalog and repeating them
-# here would put every one in the prompt twice. ``skill.list`` still reports
-# them — "before creating, check what exists" has to see all of them.
+#   <projectRoot>/.agents/skills/<name>/SKILL.md   project-local procedure
+#   <home>/.agents/skills/<name>/SKILL.md          user-wide (global) procedure
+#
+# DSH's native skill catalog discovers both, so the model loads one with the
+# ``skill`` tool and a human reads the same file. The memory database keeps a
+# single *record* per creation (an L2 episode via ``memory.remember``), which
+# is what makes "when was this skill saved, and from which project" answerable
+# without turning the store into a second source of truth.
+#
+# ``skill.index`` lists global skills only: the host already renders project
+# skills in its own catalog and repeating them here would put every one in the
+# prompt twice. ``skill.list`` still reports both — "before creating, check
+# what exists" has to see all of them.
+#
+# Creating a global skill is a user decision. The model must ask first and
+# retry with ``user_approved=true``; the payload flag is the only thing that
+# binds the write to an actual "yes".
+
+GLOBAL_SCOPE = "global"
 
 
 def _skill_scope(payload: dict[str, Any]) -> tuple[str, Path]:
@@ -775,6 +786,11 @@ def _skill_scope(payload: dict[str, Any]) -> tuple[str, Path]:
             "cwd is required: project skills live in <projectRoot>/.agents/skills",
         )
     return project, Path(root)
+
+
+def _global_root() -> Path:
+    """The user-wide skill root: ``~/.agents/skills`` unless overridden."""
+    return project_skills.global_skill_root()
 
 
 def _skill_home(memory: MemorySystem) -> Path:
@@ -817,40 +833,59 @@ def _skill_definition(payload: dict[str, Any]) -> SkillDefinition:
     return SkillDefinition.from_dict(raw)
 
 
-def _skill_misc_flags(skill: Skill) -> dict[str, Any]:
-    """Non-visibility bookkeeping a hand-over needs to act on."""
-    return {
-        "tier": skill.tier,
-        "description": skill.definition.description,
-        "when_to_use": skill.definition.when_to_use,
-        "triggers": list(skill.definition.triggers),
-        "intent_labels": list(skill.definition.intent_labels),
-        "requires_tools": list(skill.definition.requires_tools),
-        "steps": [f"{s.tool}: {s.action}" if s.tool else s.action for s in skill.definition.steps],
-    }
+def _file_index_line(skill: project_skills.ProjectSkill) -> str:
+    """Level-1 line for a file-backed global skill (no steps)."""
+    trigger = "|".join(skill.triggers[:2])
+    description = clip_words(skill.description, 15)
+    return f"- user:global:{skill.name} · {trigger} · {description}"
+
+
+def record_skill_created(
+    memory: MemorySystem,
+    *,
+    project_id: str,
+    skill: project_skills.ProjectSkill,
+    scope: str,
+) -> str | None:
+    """Keep one memory record per generated skill.
+
+    This is deliberately an L2 episode, not an ``l4_skills`` row: the skill's
+    definition lives in ``SKILL.md`` and the record answers "what was saved,
+    where, and from which project" without duplicating the procedure.
+    """
+    label = "公共" if scope == GLOBAL_SCOPE else "项目"
+    try:
+        result = memory.remember(
+            project_id=project_id,
+            summary=f"创建{label}技能「{skill.title}」（{skill.name}，{skill.step_count} 步）",
+            event_type="skill",
+            importance=0.6,
+            meta={
+                "kind": "skill",
+                "scope": scope,
+                "name": skill.name,
+                "title": skill.title,
+                "path": str(skill.path),
+            },
+            content_key=f"skill:{scope}:{skill.name}",
+        )
+    except Exception:  # noqa: BLE001 - a record failure must not undo the file
+        return None
+    return str((result or {}).get("memory_id") or "") or None
 
 
 @command("skill.index")
 def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """The resident index: one line per visible *global* skill (design §6.5).
+    """The resident index: one line per global skill file (design §6.5).
 
     Read-only. The host renders this into the system prompt, so it must cost
-    one query and must never create, retire or re-tier anything.
+    one directory scan and must never create, retire or re-tier anything.
     """
     project = _project(payload)
-    view = memory.view(project)
-    # Project skills are files now and reach the model through the host's own
-    # skill catalog, so this index carries the global ones only. Listing a
-    # project skill in both places would spend the same tokens twice and make
-    # the model believe two skills exist.
-    lines = [
-        render_index_line(s)
-        for s in memory.skills.visible(view, include_cold=True)
-        if s.scope_kind != "project"
-    ]
-    # The design's rule is to degrade, never to overflow: a store with a
-    # hundred global skills would otherwise push every one of them into the
-    # system prompt.
+    files = project_skills.discover_at(_global_root())
+    lines = [_file_index_line(s) for s in files if s.problem is None]
+    # The design's rule is to degrade, never to overflow: a home directory with
+    # a hundred skills would otherwise push every one of them into the prompt.
     budget = memory.config.l4.index_budget_tokens
     kept: list[str] = []
     used = 0
@@ -864,94 +899,106 @@ def cmd_skill_index(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, 
         "project_id": project,
         "index": kept,
         "dropped": len(lines) - len(kept),
-        "stats": memory.skills.stats(view),
+        "global_root": str(_global_root()),
+        "stats": {"global_files": len(files)},
     }
 
 
 @command("skill.list")
 def cmd_skill_list(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Everything this project can see: bundles on disk first, then the store.
-
-    Reading the bundles here — rather than trusting the model to remember what
-    it created — is what makes "check before creating" see exactly the set the
-    host's skill catalog will show. Store rows are still reported: an ``org``/
-    ``sys`` skill lives there, and a project row written before this layout
-    stays reachable until it is migrated to a file.
-    """
+    """Everything this project can see: project bundles + global bundles."""
     project, root = _skill_scope(payload)
-    files = project_skills.discover(root)
-    view = memory.view(project)
-    items = [s.to_dict(project_id=project) for s in files]
-    items += [
-        {**s.to_dict(), "source": "db", **_skill_misc_flags(s)}
-        for s in memory.skills.visible(view, include_cold=True)
-    ]
+    project_files = project_skills.discover(root)
+    global_files = project_skills.discover_at(_global_root())
+    items = [s.to_dict(project_id=project, scope="project") for s in project_files]
+    items += [s.to_dict(scope=GLOBAL_SCOPE) for s in global_files]
     return {
         "project_id": project,
         "items": items,
-        "file_skills": len(files),
+        "file_skills": len(project_files),
+        "global_skills": len(global_files),
         "skill_root": str(project_skills.skill_root(root)),
-        "stats": memory.skills.stats(view),
+        "global_root": str(_global_root()),
     }
 
 
 @command("skill.create")
 def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Write a project-scope skill into this checkout's ``.agents/skills``.
+    """Write a skill bundle: project-local by default, global on request.
 
-    ``model_authored`` marks the write as the agent saving a procedure it just
-    used; the file is active immediately because the catalog has no notion of
-    a draft. Only project scope is writable from a session — ``org``/``sys``
-    promotion stays a user decision.
+    Global skills need ``user_approved=true``. That flag is not a formality:
+    a global skill is visible to every project on the machine, so the model
+    must ask the user first and pass the flag only after an explicit yes.
     """
     project, root = _skill_scope(payload)
     memory.ensure_project(project, root_path=str(root))
     definition = _skill_definition(payload)
-    scope_kind = str(payload.get("scope_kind") or "project")
-    if scope_kind != "project":
+    scope = str(payload.get("scope") or payload.get("scope_kind") or "project").strip().lower()
+    if scope in ("org", "sys"):
         raise BridgeError(
             "bad_request",
-            f"scope_kind {scope_kind!r} is not writable from a session; only 'project' skills "
-            "can be created here (org/sys promotion stays a user decision)",
+            "org/sys scopes are gone: global procedural memory is a file. "
+            "Use scope='global' with the user's explicit approval.",
+        )
+    if scope not in ("project", GLOBAL_SCOPE):
+        raise BridgeError(
+            "bad_request",
+            f"scope {scope!r} is not writable; use 'project' or 'global'",
+        )
+    if (
+        scope == GLOBAL_SCOPE
+        and _skill_actor(payload) == "model"
+        and payload.get("user_approved") is not True
+    ):
+        raise BridgeError(
+            "bad_request",
+            "创建公共技能需要用户明确同意：先询问用户是否要保存为公共技能，"
+            "得到同意后再带 user_approved=true 重试；不要自行假定同意。",
         )
     limit = payload.get("max_active")
-    created = project_skills.create(
-        root,
+    target_root = _global_root() if scope == GLOBAL_SCOPE else project_skills.skill_root(root)
+    created = project_skills.create_at(
+        target_root,
         definition,
         name=str(payload.get("name") or ""),
         limit=int(limit) if limit is not None else project_skills.DEFAULT_LIMIT,
+        scope=scope,
     )
+    record_id = record_skill_created(memory, project_id=project, skill=created, scope=scope)
     return {
         "project_id": project,
         "actor": _skill_actor(payload),
+        "scope": scope,
         "created": True,
         "reused": False,
-        "skill": created.to_dict(project_id=project),
+        "record_id": record_id,
+        "skill": created.to_dict(project_id=project, scope=scope),
     }
 
 
 @command("skill.get")
 def cmd_skill_get(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Level-3 disclosure: the full definition of one visible skill."""
+    """Level-3 disclosure: the full definition of a project or global skill."""
     project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
-    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
-    if bundle is not None:
-        return {
-            "project_id": project,
-            "source": "file",
-            "skill": bundle.to_dict(project_id=project),
-            "definition": _file_definition(bundle),
-            "markdown": bundle.body,
-        }
-    view = memory.view(project)
-    skill = memory.skills.find(name_or_id, view)
+    bundle = project_skills.resolve(
+        project_skills.discover(root), name_or_id, project_id=project
+    )
+    scope = "project"
+    if bundle is None:
+        bundle = project_skills.resolve(
+            project_skills.discover_at(_global_root()), name_or_id
+        )
+        scope = GLOBAL_SCOPE
+    if bundle is None:
+        raise NotFoundError(f"skill {name_or_id} not found")
     return {
         "project_id": project,
-        "source": "db",
-        "skill": skill.to_dict(),
-        "definition": skill.definition.to_dict(),
-        "markdown": memory.skills.level3_definition(view, skill.skill_id),
+        "source": "file",
+        "scope": scope,
+        "skill": bundle.to_dict(project_id=project, scope=scope),
+        "definition": _file_definition(bundle),
+        "markdown": bundle.body,
     }
 
 
@@ -959,10 +1006,10 @@ def cmd_skill_get(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, An
 def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     """Record one execution of a skill (feeds the success rate in ``skill.list``).
 
-    A project skill's record is appended to ``<memoryHome>/l4_runs`` instead of
-    the database: the evidence follows the skill, and the repository stays free
-    of a log that changes on every run. ``partial`` counts as not-yet-success
-    unless the caller says otherwise.
+    Evidence is appended to ``<memoryHome>/l4_runs`` instead of the database:
+    the evidence follows the skill, and the repository stays free of a log that
+    changes on every run. Global skills record under the reserved scope key
+    ``_global``.
     """
     project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
@@ -970,27 +1017,27 @@ def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, An
     success = payload.get("success")
     if success is None:
         success = outcome == "success"
-    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
-    if bundle is not None:
-        return {
-            "project_id": project,
-            "source": "file",
-            **project_skills.append_run(
-                _skill_home(memory),
-                project,
-                bundle.name,
-                outcome=outcome,
-                success=_bool(success),
-                error=payload.get("error"),
-                deviation=payload.get("deviation"),
-            ),
-        }
+    bundle = project_skills.resolve(
+        project_skills.discover(root), name_or_id, project_id=project
+    )
+    scope = "project"
+    ledger_scope = project
+    if bundle is None:
+        bundle = project_skills.resolve(
+            project_skills.discover_at(_global_root()), name_or_id
+        )
+        scope = GLOBAL_SCOPE
+        ledger_scope = "_global"
+    if bundle is None:
+        raise NotFoundError(f"skill {name_or_id} not found")
     return {
         "project_id": project,
-        "source": "db",
-        **memory.record_skill_run(
-            project_id=project,
-            skill=name_or_id,
+        "source": "file",
+        "scope": scope,
+        **project_skills.append_run(
+            _skill_home(memory),
+            ledger_scope,
+            bundle.name,
             outcome=outcome,
             success=_bool(success),
             error=payload.get("error"),
@@ -1001,34 +1048,43 @@ def cmd_skill_run(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, An
 
 @command("skill.retire")
 def cmd_skill_retire(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
-    """Retire a project skill by moving its bundle out of the scanned root.
+    """Retire a skill by moving its bundle out of the scanned root.
 
-    Nothing is deleted: ``.agents/skills/.retired/<name>`` keeps the file, and
-    discovery is one level deep, so the catalog stops showing it. A store row
-    (org/sys) is retired the old way, and only the user may do that.
+    Nothing is deleted: ``.retired/<name>`` keeps the file, and discovery is
+    one level deep, so the catalog stops showing it. A global skill is public
+    to every project, so retiring one needs the same user approval as creating
+    one.
     """
     project, root = _skill_scope(payload)
     name_or_id = _skill_name(payload)
-    bundle = project_skills.resolve(project_skills.discover(root), name_or_id, project_id=project)
-    if bundle is not None:
-        retired = project_skills.retire(root, bundle.name)
-        return {
-            "project_id": project,
-            "source": "file",
-            "skill": {**retired.to_dict(project_id=project), "status": "retired"},
-        }
-    view = memory.view(project)
-    skill = memory.skills.find(name_or_id, view)
-    if _skill_actor(payload) != "user":
+    bundle = project_skills.resolve(
+        project_skills.discover(root), name_or_id, project_id=project
+    )
+    scope = "project"
+    if bundle is None:
+        bundle = project_skills.resolve(
+            project_skills.discover_at(_global_root()), name_or_id
+        )
+        scope = GLOBAL_SCOPE
+    if bundle is None:
+        raise NotFoundError(f"skill {name_or_id} not found")
+    if (
+        scope == GLOBAL_SCOPE
+        and _skill_actor(payload) == "model"
+        and payload.get("user_approved") is not True
+    ):
         raise BridgeError(
             "bad_request",
-            f"{skill.qualified_name} is not a project skill of {project}; "
-            "only the user can retire an org/sys skill",
+            "退役公共技能需要用户明确同意：先询问用户，得到同意后再带 user_approved=true 重试。",
         )
-    retired_skill = memory.skills.retire(
-        skill.skill_id, reason=str(payload.get("reason") or "tool request")
-    )
-    return {"project_id": project, "source": "db", "skill": retired_skill.to_dict()}
+    target_root = _global_root() if scope == GLOBAL_SCOPE else project_skills.skill_root(root)
+    retired = project_skills.retire_at(target_root, bundle.name, scope=scope)
+    return {
+        "project_id": project,
+        "source": "file",
+        "scope": scope,
+        "skill": {**retired.to_dict(project_id=project, scope=scope), "status": "retired"},
+    }
 
 
 # ── backup / restore ────────────────────────────────────────────────────

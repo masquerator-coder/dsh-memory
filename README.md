@@ -4,7 +4,7 @@
 
 | 部分 | 位置 | 职责 |
 |---|---|---|
-| Python 核心 | `memory_system/` | 存储、衰减、检索、图谱校验、摘要、画像、备份、L4（全局技能在库里，项目技能是仓库里的文件）。单文件 SQLite，无必需第三方依赖 |
+| Python 核心 | `memory_system/` | 存储、衰减、检索、图谱校验、摘要、画像、备份、L4（项目技能与全局技能都是文件）。单文件 SQLite，无必需第三方依赖 |
 | DSH 插件 | `dsh-memory-plugin/` | 把核心接入 DeepSeek Harness：12 个模型工具、系统提示词锚点与全局技能索引、会话事件、摘要的模型调用、设置页路由 |
 
 插件本身不实现记忆逻辑，所有读写都通过子进程 + 行分隔 JSON 协议交给 Python 核心。因此 Python 侧可以脱离 DSH 单独使用和测试。
@@ -80,11 +80,12 @@ DSH 宿主进程（JS 插件）                   Python 子进程（memory_syst
 ──────────────────────────               ─────────────────────────────
 apply(ctx)：注册 12 个工具 / 锚点 / 技能索引 / 事件 / 路由
 系统提示词装配 ──digest.anchor──────────▶ 读摘要元信息 + 用户画像规模
-系统提示词装配 ──skill.index───────────▶ 读记忆库里**全局**技能的一行索引
+系统提示词装配 ──skill.index───────────▶ 读 `~/.agents/skills` 里**全局**技能的一行索引
                                             （本项目技能由 DSH 自己的技能目录列出）
 memory_add ────memory.remember──────────▶ L2 事件 + L3 事实（同一事务）
                                             └─▶ 重写 <repo>/DSH_MEMORY.md
 skill_create ──skill.create─────────────▶ <repo>/.agents/skills/<name>/SKILL.md
+                                            或 ~/.agents/skills/<name>/SKILL.md（需用户同意）
 turn/end ──15s 防抖──▶ digest.plan ──▶ 宿主 llm.stream ──▶ digest.commit
 session/disposed ──reviewSessionEnd─────▶ memory.remember(source=dsh-session-end)
 设置页 /dsh-memory/* ───────────────────▶ 同一 SQLite 的读写接口
@@ -94,7 +95,7 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 2. **首次提示词装配**：异步请求 `digest.anchor`、当前项目的 `memory.list` 与 `skill.index`，分别按 `cwd` 缓存 15 秒 / 30 秒。首次没有缓存，模型看到的是占位文本。锚点含摘要规模、时间、画像规模，以及**本项目最近 8 条以内、合计不超过 400 字的工作摘要**（`RECENT_CHARS`），**不含全文**；没有记忆的项目不出现这一节。技能索引只有「一行一个技能」的触发词与作用，**不含步骤**。
 3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并立即生成该项目的 `DSH_MEMORY.md`。
 4. **读写**：模型通过 `memory_add` 主动写入记忆；通过 `memory_recall` / `memory_search` / `memory_digest_read` / `memory_profile_read` 读取。**当前版本不会自动抄录对话。**
-5. **技能**：模型通过 `skill_create` 把**验证过、可复用**的做法写成**本项目仓库里的文件**（`.agents/skills/<name>/SKILL.md`），DSH 自己的技能目录会列出它、用 `skill` 工具加载；`skill_list` / `skill_get` 查看，`skill_run` 记录执行结果，`skill_retire` 把目录移进 `.retired/`。见下文「L4 程序性技能」。
+5. **技能**：模型通过 `skill_create` 把**验证过、可复用**的做法写成技能文件——默认是**本项目仓库里的文件**（`.agents/skills/<name>/SKILL.md`），用户明确同意后也可写全局的 `~/.agents/skills/<name>/SKILL.md`。DSH 自己的技能目录会列出它们、用 `skill` 工具加载；`skill_list` / `skill_get` 查看，`skill_run` 记录执行结果，`skill_retire` 把目录移进 `.retired/`。见下文「L4 程序性技能」。
 6. **心跳（默认关闭）**：自上次写入起每经过 `heartbeatSteps` 个**模型步**（`step/start`，一个模型步 = 一次模型调用）在提示词尾部出现一次记忆提醒，随后重新计数；`0` 关闭。提醒文本在系统提示词里，所以它每出现/消失一次都会让前缀缓存失效，默认关。
 7. **回合结束**：`turn/end` 后等待 `autoSummaryDelayMs`（默认 15 秒）。同一会话再次结束会取消并重排定时器；全局摘要同时只允许一个生成任务。
 8. **会话销毁**：若本会话有真实对话且有可用模型路由，再调用一次模型检查遗漏，最多补写 10 条，来源标记为 `dsh-session-end`；失败只记 warning，不阻塞销毁。
@@ -107,8 +108,8 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | 首次提示词装配 | 系统提示词 | 异步刷新锚点、本项目最近工作与技能索引，首屏显示「正在读取记忆摘要…」 | 否 |
 | 首次工具调用 | 模型 | 注册项目 + 创建 `DSH_MEMORY.md` | 是 |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
-| 模型判断做法可复用 | 模型 | `skill_create` → 写 `<repo>/.agents/skills/<name>/SKILL.md` | 否（写仓库文件） |
-| 技能被真正用过 | 模型 | `skill_run` → `l4_runs/<项目>/<name>.jsonl` 执行记录与成功率 | 否（写台账） |
+| 模型判断做法可复用 | 模型 | `skill_create` → 写 `<repo>/.agents/skills/...`；用户同意后也可写 `~/.agents/skills/...` | 是（L2 审计记录） |
+| 技能被真正用过 | 模型 | `skill_run` → `<memoryHome>/l4_runs/<项目>/<name>.jsonl` 执行记录与成功率（全局技能记在 `_global`） | 否（写台账） |
 | 检索 | 模型 | `memory_recall` → 融合排序并强化命中项 | 是（`access_count`） |
 | 审阅 | 模型 / 设置页 | `memory_search` / `memory.list` / `skill_list` | 否 |
 | 用户要求遗忘 | 模型 / 设置页 | 软归档 + `forgotten_at`；技能退役是把目录移进 `.retired/` | 部分（技能只动文件） |
@@ -128,11 +129,11 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | `memory_profile_read` | 读取用户自己维护的画像 |
 | `memory_digest_read` | 读取全局摘要全文 |
 | `memory_digest_generate` | 调用一次模型，重新生成全局摘要 |
-| `skill_create` | 把一个验证过的做法写成**本项目**技能文件（`.agents/skills/<name>/SKILL.md`，`name` 要求 kebab-case） |
-| `skill_list` | 列出本项目可见的技能（磁盘上的项目技能 + 记忆库里的组织/系统级技能） |
-| `skill_get` | 读取一个技能的完整定义（项目技能直接返回 `SKILL.md` 正文） |
-| `skill_run` | 记录一次技能执行结果（项目技能写入 `l4_runs` 台账与成功率） |
-| `skill_retire` | 退役一个本项目技能（把目录移进 `.agents/skills/.retired/`，可恢复） |
+| `skill_create` | 把一个验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`（必须先问用户，同意后带 `user_approved=true`） |
+| `skill_list` | 列出本项目可见的技能（磁盘上的项目技能 + `~/.agents/skills` 里的全局技能） |
+| `skill_get` | 读取一个技能的完整定义（项目技能与全局技能都直接返回 `SKILL.md` 正文） |
+| `skill_run` | 记录一次技能执行结果（写入 `<memoryHome>/l4_runs` 台账与成功率） |
+| `skill_retire` | 退役一个技能（把目录移进同级 `.retired/`，可恢复；全局技能需要用户同意） |
 
 没有“写画像”的工具：画像只能由用户在设置页编辑。
 
@@ -150,12 +151,14 @@ score = similarity × (0.2 + 0.8 × R)
 
 **L3 语义图谱。** 每条事实在**写入时**校验：关系白名单（`causes` / `contradicts` / `depends_on` / `is_a` / `located_in` / `owns` / `part_of` / `related_to` / `uses` / `works_at`）、置信度下限、端点非空、证据中的 episode 必须存在、类型 domain/range、重复只强化、无环关系检测、基数冲突按策略处理。事实带两条时间轴（世界何时如此 vs 我们何时得知），并指回作为证据的 L2 条目。
 
-**L4 程序性技能。** 分两处存：
+**L4 程序性技能。** 项目技能和全局技能都是文件，区别只在目录：
 
-- **项目技能 = 仓库里的文件**：`<项目根>/.agents/skills/<name>/SKILL.md`。这是 DSH 自己的技能目录（`project-agents`，rank 200；`.dsh/skills` 是 rank 100），所以**模型用原生 `skill` 工具加载它，人和别的工具读同一个文件**，技能随仓库进版本库。会话里能做的是创建（`skill_create`）、查看（`skill_list` / `skill_get`）、记录执行（`skill_run`）、退役（`skill_retire`）。
-- **全局技能 = 记忆库里的 `l4_skills` 行**（`org` / `sys` 作用域）。org / sys 级晋升是**用户决策**，会话与桥接命令都不提供。
+- **项目技能 = 仓库里的文件**：`<项目根>/.agents/skills/<name>/SKILL.md`。这是 DSH 自己的技能目录（`project-agents`，rank 200；`.dsh/skills` 是 rank 100），所以**模型用原生 `skill` 工具加载它，人和别的工具读同一个文件**，技能随仓库进版本库。
+- **全局技能 = 用户级文件**：`~/.agents/skills/<name>/SKILL.md`（可用 `DSH_MEMORY_GLOBAL_SKILLS` 覆盖，测试用）。所有项目共享，DSH 的原生技能目录同样会扫描它。创建全局技能是**用户决策**：模型必须先问用户，得到明确同意后才带 `user_approved=true` 调 `skill_create scope=global`；`org` / `sys` 两个数据库作用域已移除。
 
-插件在系统提示词里注入的索引只列**全局**技能，一行一个：`- <qualified_name> · <触发词> · <15 字描述>`，不含步骤；执行前用 `skill_get` 取完整定义。项目技能**不在这里重复**——DSH 的技能目录已经把它们列在 `available_skills` 里，重复列一遍会让同一个技能在提示词里出现两次。
+无论项目还是全局，成功创建后都会在记忆库留**一条 L2 记录**（`content_key=skill:<scope>:<name>`），回答“什么时候、从哪个项目存了这个技能”；技能定义本身只存在于 `SKILL.md`，库里不再有 `l4_skills` 行。会话里能做的是创建（`skill_create`）、查看（`skill_list` / `skill_get`）、记录执行（`skill_run`）、退役（`skill_retire`）。
+
+插件在系统提示词里注入的索引只列**全局**技能，一行一个：`- user:global:<name> · <触发词> · <15 字描述>`，不含步骤；执行前用 `skill_get` 取完整定义。项目技能**不在这里重复**——DSH 的技能目录已经把它们列在 `available_skills` 里，重复列一遍会让同一个技能在提示词里出现两次。
 
 `SKILL.md` 的 frontmatter 是给 DSH 解析的：`name`（kebab-case ASCII，同时是目录名）、`description`（进 `available_skills` 的那一行）、可选的 `whenToUse`；中文标题、触发词、前置工具、时间戳放在 `metadata` 里（DSH 原样保留、不解释）。
 
@@ -170,16 +173,18 @@ score = similarity × (0.2 + 0.8 × R)
 
 反例（都不要存）：一次性任务、临时调试步骤、能从代码/文档直接读到的内容、用户偏好（属于 `memory_add`）、还没确认有效的做法。插件还会记录本会话已经建过几个技能，建过之后提示词改为「除非用户明确要求，不要再新建」。
 
-文件路径上有两道护栏（`memory_system/project_skills.py`）：
+项目技能和全局技能共用两道文件护栏（`memory_system/project_skills.py`）：
 
 | 护栏 | 行为 |
 |---|---|
 | 名字合法 | `name` 必须是 `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`——DSH 对别的拼写是**静默丢弃**，所以在写入前就报错 |
 | 不覆盖、不淘汰 | 同名目录已存在直接拒绝（先 `skill_get` 看一眼，确需替换先 `skill_retire`）；active 技能达到上限（默认 24）拒绝写入，而不是悄悄退役一个 |
 
+全局技能多一道同意护栏：模型创建或退役公共技能时，桥接要求 `user_approved=true`；模型必须先询问用户，得到明确同意后才能带上这个标记。
+
 写入是原子的（`SKILL.md.tmp` → `os.replace`），失败不留半成品目录。执行记录**不进仓库**：追加到 `<memoryHome>/l4_runs/<项目>/<name>.jsonl`，否则 `git status` 会被日志污染。
 
-技能**不进入 L2/L3/摘要**：它们不在 `memory_search` / `memory_recall` / 全局摘要里，只在 DSH 的技能目录、`skill_list` 和那份文件里。
+技能**定义**不进入 L2/L3/摘要：它们不在 `memory_search` / `memory_recall` / 全局摘要里，只在 DSH 的技能目录、`skill_list` 和文件本身。创建动作会留一条 L2 审计记录（何时、从哪个项目、存到哪个文件），但它不参与检索排序或摘要生成。
 
 ### 检索路径
 
@@ -208,7 +213,7 @@ score = similarity × (0.2 + 0.8 × R)
 - 基础：`meta`、`projects`、`events`、`anchors`
 - L2：`l2_episodes`、`l2_fts`（FTS5）、`vec_l2`（sqlite-vec `vec0`）
 - L3：`l3_entities`、`l3_edges`、`l3_changes`、`l3_change_sources`、`l3_communities`、`l3_entities_fts`、`vec_l3_entity`
-- L4：`l4_skills`、`l4_runs`、`l4_trajectories`、`l4_candidates`、`l4_archive`、`l4_promotions` 及对应向量表（**项目技能不在其中**：它们是 `<repo>/.agents/skills` 下的文件，执行记录在 `<memoryHome>/l4_runs`）
+- L4：`l4_skills`（仅程序化 API 与旧库迁移使用，模型生成路径不再写入）、`l4_runs`、`l4_trajectories`、`l4_candidates`、`l4_archive`、`l4_promotions` 及对应向量表（**模型生成的技能不在其中**：项目技能是 `<repo>/.agents/skills` 下的文件，全局技能是 `~/.agents/skills` 下的文件，执行记录在 `<memoryHome>/l4_runs`）
 - 摘要：`memory_digests`
 
 `meta` 保存 `schema_version`、`embedding_dim`、`embedding_fingerprint`、摘要长度、用户画像、维护时间戳等。实测默认指纹为 `hash:256:True`。没有 `sqlite-vec` 时自动退化为普通表精确扫描，功能完整、只是更慢。
@@ -286,8 +291,8 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 2. **不自动采集对话。** `captureTurns` 是死配置（`index.js` 定义后从未读取）。唯一由模型触发的写入是 `memory_add`；会话结束检查是额外补写。`memory.capture` 命令存在，但插件没有调用。
 3. **锚点有 15 秒缓存，但写入会主动失效。** 摘要生成、画像保存、摘要删除都会立刻重读锚点，下一次装配就能看到新值；普通会话仍按 15 秒 TTL 刷新。冷启动（进程刚起或插件刚重载）的首个装配显示「正在读取记忆摘要…」，读完即替换，不再声称「还没有摘要」。
 4. **心跳按模型步计数，且只在默认关闭时无成本。** 监听 `step/start`（一次模型调用）：一个跑 30 次工具调用的长回合算 30 步。开启后每满一个窗口才出现一次并重新计数；关掉（`0`）则不进入提示词。
-5. **后台维护没有调度者。** 插件不调用 `run_maintenance`，所以 `decay` / `consolidate` / `communities` / `archive_scan` / `promotions` 不会自动运行。召回实时计算 R 仍然正确，但 `state` 列和统计会滞后。全局技能的分层（Hot/Warm/Cold）同样不会自动刷新；项目技能没有分层概念（它们是文件）。
-6. **L4 的项目技能在文件里，全局技能在库里。** 会话与桥接命令只能创建 project 技能（写文件）；org / sys 晋升、跨项目备份归档（`SkillArchive`）与轨迹归纳（`maturity`）仍需调用 Python API，插件没有暴露。`promotions` 的两个扫描器读的是库里的 project 行，因此现在恒为空——`maintenance` 的 `promotions` 结果会带一句 `note` 说明这一点。
+5. **后台维护没有调度者。** 插件不调用 `run_maintenance`，所以 `decay` / `consolidate` / `communities` / `archive_scan` / `promotions` 不会自动运行。召回实时计算 R 仍然正确，但 `state` 列和统计会滞后。技能都是文件，没有 Hot/Warm/Cold 分层。
+6. **L4 的项目技能与全局技能都在文件里。** 项目技能写 `<repo>/.agents/skills`，全局技能写 `~/.agents/skills`；创建/退役全局技能需要用户明确同意。跨项目备份归档（`SkillArchive`）与轨迹归纳（`maturity`）仍需调用 Python API，插件没有暴露。`promotions` 的两个扫描器读的是库里的 project 行，因此模型写入文件后通常为空——`maintenance` 的 `promotions` 结果会带一句 `note` 说明这一点。
 7. **`status.home` 返回数据库文件路径**，不是目录。
 
 更完整的逐行分析与实测记录见 [`docs/MEMORY_WORKFLOW.md`](docs/MEMORY_WORKFLOW.md)。

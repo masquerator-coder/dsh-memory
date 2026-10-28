@@ -30,13 +30,13 @@ from typing import Any, Iterable, Literal, Sequence
 from .errors import BudgetError, ValidationError
 from .text import clip_words, estimate_tokens
 
-ScopeKind = Literal["project", "org", "sys"]
+ScopeKind = Literal["project", "global", "org", "sys"]
 Status = Literal["candidate", "draft", "active", "retired"]
 Tier = Literal["hot", "warm", "cold"]
 Enforcement = Literal["soft", "hard"]
 Namespace = Literal["sys", "user", "ext"]
 
-SCOPE_RANK = {"project": 3, "org": 2, "sys": 1}
+SCOPE_RANK = {"project": 3, "global": 2, "org": 2, "sys": 1}
 MAX_DESCRIPTION_CHARS = 15  # CJK characters, per the writing standard
 
 

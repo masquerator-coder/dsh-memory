@@ -12,6 +12,7 @@ from memory_system import (
     Step,
     TrajectoryStep,
 )
+from memory_system import project_skills
 from memory_system.errors import ValidationError
 from memory_system.l4 import BudgetPlanner, ScopeView, render_index_line
 
@@ -36,51 +37,41 @@ def make_definition(**overrides) -> SkillDefinition:
 # ── scope algebra ───────────────────────────────────────────────────────
 
 
-def test_scope_visibility_project_org_sys(memory: MemorySystem, project: str):
+def test_global_scopes_are_file_backed(memory: MemorySystem, project: str):
+    """org/sys rows are gone: the store only holds project-scope skills."""
     memory.ensure_project("proj-b", org_id="acme")
-    memory.ensure_project("proj-c", org_id="other")
     memory.add_skill(project_id=project, definition=make_definition(), name="proj-skill")
-    memory.skills.create(view=memory.view(project), definition=make_definition(title="Org 技能"),
-                         name="org-skill", scope_kind="org", status="active")
-    memory.skills.create(view=memory.view(project), definition=make_definition(title="Sys 技能"),
-                         name="sys-skill", scope_kind="sys", ns="sys", status="active")
-    a = {s.name for s in memory.skills.visible(memory.view(project))}
-    b = {s.name for s in memory.skills.visible(memory.view("proj-b"))}
-    c = {s.name for s in memory.skills.visible(memory.view("proj-c"))}
-    assert {"proj-skill", "org-skill", "sys-skill"} <= a
-    assert "proj-skill" not in b and "org-skill" in b
-    assert c == {"sys-skill"}
+    for scope_kind, ns in (("org", "user"), ("sys", "sys")):
+        with pytest.raises(ValidationError, match="file-backed"):
+            memory.skills.create(
+                view=memory.view(project),
+                definition=make_definition(),
+                name=f"{scope_kind}-skill",
+                scope_kind=scope_kind,
+                ns=ns,
+                status="active",
+            )
+    assert {s.name for s in memory.skills.visible(memory.view(project))} == {"proj-skill"}
+    assert "proj-skill" not in {s.name for s in memory.skills.visible(memory.view("proj-b"))}
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_skills WHERE scope_kind IN ('org', 'sys')"
+    ) == 0
 
 
-def test_project_shadows_org(memory: MemorySystem, project: str):
-    memory.skills.create(view=memory.view(project), definition=make_definition(description="组织版"),
-                         name="same-name", scope_kind="org")
-    memory.add_skill(project_id=project, definition=make_definition(description="项目版"), name="same-name")
-    visible = {s.name: s for s in memory.skills.visible(memory.view(project))}
-    assert visible["same-name"].definition.description == "项目版"
-
-
-def test_hard_sys_skill_not_shadowed(memory: MemorySystem, project: str):
-    memory.skills.create(view=memory.view(project),
-                         definition=make_definition(description="强制安全规则", enforcement="hard"),
-                         name="safety", scope_kind="sys", ns="sys", status="active")
-    memory.add_skill(project_id=project, definition=make_definition(description="绕过安全"), name="safety")
-    visible = {s.name: s for s in memory.skills.visible(memory.view(project))}
-    assert visible["safety"].definition.description == "强制安全规则"
-    # Bare-name resolution (the load_skill / record_run path) obeys the same rule.
-    found = memory.skills.find("safety", view=memory.view(project))
-    assert found.definition.description == "强制安全规则"
-
-
-def test_hard_sys_skill_never_falls_cold(memory: MemorySystem, project: str):
-    """A hard sys rule the model has never executed still must be disclosed:
-    `prepare_turn`/`match` drop cold skills, so a cold safety rule would be
-    enforced by nobody."""
-    memory.skills.create(view=memory.view(project),
-                         definition=make_definition(description="强制安全规则", enforcement="hard"),
-                         name="safety", scope_kind="sys", ns="sys", status="active")
-    memory.skills.refresh_tiers(memory.view(project))
-    assert memory.skills.get(memory.skills.find("safety", view=memory.view(project)).skill_id).tier == "warm"
+def test_global_bundles_are_not_visible_rows(memory: MemorySystem, project: str):
+    """A global skill is a SKILL.md bundle, not a row in the visibility graph."""
+    bundle = project_skills.create_at(
+        project_skills.global_skill_root(),
+        make_definition(title="Global 技能"),
+        name="global-skill",
+        scope="global",
+    )
+    assert bundle.path.is_file()
+    assert bundle.scope == "global"
+    assert "global-skill" not in {s.name for s in memory.skills.visible(memory.view(project))}
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_skills WHERE scope_kind IN ('org', 'sys')"
+    ) == 0
 
 
 # ── validation and capacity ─────────────────────────────────────────────
@@ -365,18 +356,25 @@ def test_promotion_requires_user_decision(memory: MemorySystem, project: str):
     memory.add_skill(project_id="proj-b", definition=make_definition(), name="dep-upgrade")
     proposals = memory.promotions.propose()
     assert proposals
+    root = project_skills.global_skill_root()
     # Nothing moves before a human decides.
-    org_skills = [s for s in memory.store.query(
-        "SELECT qualified_name FROM l4_skills WHERE scope_kind='org'")]
-    assert org_skills == []
-    memory.decide_promotion(proposals[0].promotion_id, accept=True, project_id=project)
-    org_names = [r["qualified_name"] for r in memory.store.query(
-        "SELECT qualified_name FROM l4_skills WHERE scope_kind='org'")]
-    assert len(org_names) == 1
-    # A project that never had the skill now inherits it from the org scope.
-    memory.ensure_project("proj-new", org_id="acme")
-    inherited = {s.name for s in memory.skills.visible(memory.view("proj-new"))}
-    assert "dep-upgrade" in inherited
+    assert project_skills.discover_at(root) == []
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_skills WHERE scope_kind IN ('org', 'sys')"
+    ) == 0
+    decision = memory.decide_promotion(
+        proposals[0].promotion_id, accept=True, project_id=project
+    )
+    assert decision["skill"]["scope"] == "global"
+    # Accepting writes one global bundle, named from the ASCII intent label.
+    files = project_skills.discover_at(root)
+    assert [s.name for s in files] == ["dependency-upgrade"]
+    assert files[0].scope == "global"
+    assert files[0].title == "依赖升级流程"
+    # The bundle is the source of truth; no global row was created.
+    assert memory.store.scalar(
+        "SELECT count(*) FROM l4_skills WHERE scope_kind IN ('org', 'sys')"
+    ) == 0
 
 
 def test_rejection_is_remembered(memory: MemorySystem, project: str):
@@ -386,14 +384,15 @@ def test_rejection_is_remembered(memory: MemorySystem, project: str):
     proposals = memory.promotions.propose()
     memory.decide_promotion(proposals[0].promotion_id, accept=False, project_id=project, note="不需要")
     assert memory.promotions.propose() == []
+    assert project_skills.discover_at(project_skills.global_skill_root()) == []
 
 
 def test_rejecting_a_decided_promotion_is_refused(memory: MemorySystem, project: str):
     """A decision is history, not a mutable slot.
 
     ``reject`` used to UPDATE unconditionally, so rejecting an accepted
-    promotion flipped its status to 'rejected' while the org-level skill it had
-    created stayed live and visible -- the record then contradicted the graph.
+    promotion flipped its status to 'rejected' while the global skill it had
+    created stayed live -- the record then contradicted the files.
     """
     memory.ensure_project("proj-b", org_id="acme")
     memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
@@ -404,33 +403,50 @@ def test_rejecting_a_decided_promotion_is_refused(memory: MemorySystem, project:
     with pytest.raises(ValidationError):
         memory.promotions.reject(promotion_id, note="too late")
     assert memory.promotions.get(promotion_id).status == "accepted"
-    assert memory.store.scalar(
-        "SELECT count(*) FROM l4_skills WHERE scope_kind='org'"
-    ) == 1
+    assert len(project_skills.discover_at(project_skills.global_skill_root())) == 1
 
 
-def test_accept_is_atomic_with_the_decision(memory: MemorySystem, project: str, monkeypatch):
-    """Accepting creates a skill *and* records the decision.
+def test_accept_reuses_a_bundle_written_before_a_failed_decision(memory: MemorySystem, project: str):
+    """Accepting is retryable: the file is written first, then the decision.
 
-    They used to commit separately, so a failure between them left a live org
-    skill behind a still-``pending`` promotion: the next accept collided with
-    "already exists", and the stale pending row could still be rejected.
+    A crash between the two leaves the bundle behind with the promotion still
+    pending. Retrying must adopt that identical bundle instead of failing with
+    "already exists" and leaving the promotion stuck forever.
     """
     memory.ensure_project("proj-b", org_id="acme")
     memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
     memory.add_skill(project_id="proj-b", definition=make_definition(), name="dep-upgrade")
-    promotion_id = memory.promotions.propose()[0].promotion_id
+    promotion = memory.promotions.propose()[0]
+    root = project_skills.global_skill_root()
+    written = project_skills.create_at(
+        root, promotion.suggestion, name="dependency-upgrade", scope="global"
+    )
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("archive unavailable")
+    skill = memory.promotions.accept(promotion.promotion_id, view=memory.view(project))
 
-    monkeypatch.setattr(memory.promotions.archive, "snapshot", boom)
-    with pytest.raises(RuntimeError):
-        memory.promotions.accept(promotion_id, view=memory.view(project))
+    assert skill.qualified_name == "user:global:dependency-upgrade"
+    assert memory.promotions.get(promotion.promotion_id).status == "accepted"
+    assert len(project_skills.discover_at(root)) == 1
+    assert project_skills.load_at(root, written.name).title == "依赖升级流程"
 
-    # Neither half may survive on its own.
-    assert memory.store.scalar("SELECT count(*) FROM l4_skills WHERE scope_kind='org'") == 0
-    assert memory.promotions.get(promotion_id).status == "pending"
+
+def test_accept_refuses_a_conflicting_global_bundle(memory: MemorySystem, project: str):
+    """A same-named bundle with different content is a collision, not a retry."""
+    memory.ensure_project("proj-b", org_id="acme")
+    memory.add_skill(project_id=project, definition=make_definition(), name="dep-upgrade")
+    memory.add_skill(project_id="proj-b", definition=make_definition(), name="dep-upgrade")
+    promotion = memory.promotions.propose()[0]
+    root = project_skills.global_skill_root()
+    project_skills.create_at(
+        root,
+        make_definition(title="别的技能", description="完全不同的内容"),
+        name="dependency-upgrade",
+        scope="global",
+    )
+
+    with pytest.raises(ValidationError, match="different content"):
+        memory.promotions.accept(promotion.promotion_id, view=memory.view(project))
+    assert memory.promotions.get(promotion.promotion_id).status == "pending"
 
 
 def test_promotion_daily_cap(memory: MemorySystem, project: str):

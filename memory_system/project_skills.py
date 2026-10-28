@@ -1,18 +1,23 @@
-"""L4 — project skills kept in the repository as files.
+"""L4 — procedural skills kept as files.
 
-A project's procedural memory is knowledge about *this* repository, so it
-belongs next to the code instead of inside the machine-wide database::
+Procedural memory is knowledge about how to *do* something, so it belongs in
+the skill directories instead of inside the machine-wide database::
 
-    <projectRoot>/.agents/skills/<name>/SKILL.md
-    <projectRoot>/.agents/skills/.retired/<name>/        retired bundles
+    <projectRoot>/.agents/skills/<name>/SKILL.md   project-local skills
+    <home>/.agents/skills/<name>/SKILL.md          user-wide (global) skills
+    <root>/.agents/skills/.retired/<name>/         retired bundles
 
-The location is not arbitrary. DSH's own ``skill-filesystem`` provider scans
-``<projectRoot>/.dsh/skills`` (rank 100) and ``<projectRoot>/.agents/skills``
-(rank 200), turning each ``<name>/SKILL.md`` into a session skill: the agent
-loads one with the native ``skill`` tool, and a human — or another tool that
-understands the same convention — reads the very same file. Discovery is one
-level deep, so a retired bundle parked under ``.retired/`` is invisible
-without being deleted. The database keeps only *global* (org/sys) skills.
+The locations are not arbitrary. DSH's own ``skill-filesystem`` provider scans
+``<projectRoot>/.dsh/skills`` (rank 100), ``<projectRoot>/.agents/skills``
+(rank 200) and ``<home>/.agents/skills``, turning each ``<name>/SKILL.md`` into
+a session skill: the agent loads one with the native ``skill`` tool, and a
+human — or another tool that understands the same convention — reads the very
+same file. Discovery is one level deep, so a retired bundle parked under
+``.retired/`` is invisible without being deleted.
+
+The database keeps only a lightweight creation record (see
+:func:`memory_system.bridge.record_skill_created`); the definition itself is
+the file.
 
 Frontmatter is the contract with that provider: ``name`` (kebab-case),
 ``description``, optional ``whenToUse``. Everything else this system tracks —
@@ -39,13 +44,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import MemoryError, NotFoundError, ValidationError
-from .l4 import SkillDefinition, validate_definition
+from .l4 import SkillDefinition, Step, validate_definition
 from .storage import to_iso, utcnow
 
 SKILL_DIR = Path(".agents") / "skills"
 RETIRED_DIR = ".retired"
 SKILL_FILE = "SKILL.md"
 LEDGER_DIR = "l4_runs"
+#: Overrides the user-wide root in tests and non-default installations.
+GLOBAL_SKILLS_ENV = "DSH_MEMORY_GLOBAL_SKILLS"
 
 #: Project skills the authoring path will keep. Advice, not a hard store limit:
 #: every skill costs one line in the model's catalog.
@@ -69,6 +76,7 @@ class ProjectSkill:
     steps: list[dict[str, Any]] = field(default_factory=list)
     success_criteria: str | None = None
     fallback: str | None = None
+    scope: str = "project"
     created_at: str | None = None
     updated_at: str | None = None
     bundle: Path = Path()
@@ -77,14 +85,51 @@ class ProjectSkill:
     step_count: int = 0
     problem: str | None = None
 
-    def to_dict(self, *, project_id: str) -> dict[str, Any]:
+    def to_skill(self, *, scope_kind: str = "global", ns: str = "user", status: str = "active") -> Any:
+        """Build the runtime :class:`~memory_system.l4.Skill` for this bundle.
+
+        Used by the user-facing promotion path, which materializes a global
+        bundle and returns the same ``Skill`` shape the store-backed API uses.
+        """
+        from .l4 import Skill
+
+        return Skill(
+            skill_id=f"file:global:{self.name}",
+            qualified_name=f"user:global:{self.name}",
+            ns=ns,
+            scope_kind=scope_kind,
+            scope_ref=None,
+            status=status,
+            tier="file",
+            definition=SkillDefinition(
+                title=self.title,
+                description=self.description,
+                when_to_use=self.when_to_use,
+                triggers=list(self.triggers),
+                requires_tools=list(self.requires_tools),
+                steps=[Step.from_dict(step) for step in self.steps],
+                success_criteria=self.success_criteria,
+                fallback=self.fallback,
+            ),
+            created_at=self.created_at or "",
+            updated_at=self.updated_at or "",
+        )
+
+    def to_dict(self, *, project_id: str | None = None, scope: str | None = None) -> dict[str, Any]:
         """The shape ``skill.list`` / ``skill.get`` hand to the host."""
+        scope = scope or self.scope or "project"
+        if scope == "global":
+            skill_id = f"file:global:{self.name}"
+            qualified_name = f"user:global:{self.name}"
+        else:
+            skill_id = f"file:{project_id}:{self.name}"
+            qualified_name = f"user:project:{project_id}:{self.name}"
         return {
-            "skill_id": f"file:{project_id}:{self.name}",
-            "qualified_name": f"user:project:{project_id}:{self.name}",
+            "skill_id": skill_id,
+            "qualified_name": qualified_name,
             "name": self.name,
-            "scope": "project",
-            "scope_kind": "project",
+            "scope": scope,
+            "scope_kind": scope,
             "status": "active",
             "tier": "file",
             "title": self.title,
@@ -112,8 +157,30 @@ def skill_root(project_root: Path | str) -> Path:
     return Path(project_root) / SKILL_DIR
 
 
-def retired_root(project_root: Path | str) -> Path:
-    return skill_root(project_root) / RETIRED_DIR
+def global_skill_root(home: Path | str | None = None) -> Path:
+    """The user-wide root shared by every project on this machine.
+
+    ``~/.agents/skills`` is what DSH's skill provider scans for global skills.
+    Tests (and unusual installs) can point ``DSH_MEMORY_GLOBAL_SKILLS`` at a
+    scratch directory; an explicit ``home`` wins over the environment.
+    """
+    if home is not None:
+        return Path(home).expanduser() / SKILL_DIR
+    override = os.environ.get(GLOBAL_SKILLS_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / SKILL_DIR
+
+
+def retired_root(project_root: Path | str, *, scope: str = "project") -> Path:
+    return _root(project_root, scope) / RETIRED_DIR
+
+
+def _root(project_root: Path | str, scope: str) -> Path:
+    """The scanned root for one scope; ``project_root`` is a repo or user home."""
+    if scope == "global":
+        return global_skill_root(project_root)
+    return skill_root(project_root)
 
 
 def ledger_path(memory_home: Path | str, project_id: str, name: str) -> Path:
@@ -271,7 +338,14 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 # ══ rendering ═══════════════════════════════════════════════════════════
 
 
-def render_skill(definition: SkillDefinition, *, name: str, created_at: str, updated_at: str) -> str:
+def render_skill(
+    definition: SkillDefinition,
+    *,
+    name: str,
+    created_at: str,
+    updated_at: str,
+    scope: str = "project",
+) -> str:
     """The SKILL.md text for one definition."""
     lines = [
         "---",
@@ -283,6 +357,7 @@ def render_skill(definition: SkillDefinition, *, name: str, created_at: str, upd
         lines.append(f"whenToUse: {_emit_scalar(when)}")
     lines.append("metadata:")
     lines.append("  origin: dsh-memory")
+    lines.append(f"  scope: {_emit_scalar(scope)}")
     lines.append(f"  title: {_emit_scalar(definition.title)}")
     if definition.triggers:
         lines.append(f"  triggers: {_emit_list(definition.triggers)}")
@@ -342,6 +417,7 @@ def _to_skill(path: Path, data: dict[str, Any], body: str) -> ProjectSkill:
         when_to_use=str(data.get("whenToUse") or meta.get("when-to-use") or ""),
         triggers=[str(t) for t in (triggers or []) if str(t).strip()],
         requires_tools=[str(t) for t in (requires or []) if str(t).strip()],
+        scope=str(meta.get("scope") or data.get("scope") or "project"),
         success_criteria=meta.get("success-criteria"),
         fallback=meta.get("fallback"),
         created_at=meta.get("created-at"),
@@ -357,13 +433,18 @@ def _to_skill(path: Path, data: dict[str, Any], body: str) -> ProjectSkill:
 
 
 def discover(project_root: Path | str) -> list[ProjectSkill]:
-    """Every active bundle under ``.agents/skills``, sorted by name.
+    """Every active bundle under ``<project>/.agents/skills``, sorted by name."""
+    return discover_at(skill_root(project_root))
+
+
+def discover_at(root: Path | str) -> list[ProjectSkill]:
+    """Every active bundle under one already-resolved skill root.
 
     A bundle whose frontmatter cannot be read is returned with ``problem`` set
     instead of disappearing: the model can then say "this file is broken"
     rather than "there is no such skill".
     """
-    root = skill_root(project_root)
+    root = Path(root)
     if not root.is_dir():
         return []
     found: list[ProjectSkill] = []
@@ -407,6 +488,9 @@ def resolve(skills: Iterable[ProjectSkill], text: str, *, project_id: str | None
             str(skill.bundle),
             str(skill.path),
         }
+        if skill.scope == "global":
+            candidates.add(f"user:global:{skill.name}")
+            candidates.add(f"file:global:{skill.name}")
         if project_id:
             candidates.add(f"user:project:{project_id}:{skill.name}")
             candidates.add(f"file:{project_id}:{skill.name}")
@@ -435,21 +519,48 @@ def create(
     name: str,
     limit: int = DEFAULT_LIMIT,
     overwrite: bool = False,
+    scope: str = "project",
 ) -> ProjectSkill:
-    """Write one bundle. Raises instead of overwriting or evicting."""
+    """Write one bundle. Raises instead of overwriting or evicting.
+
+    ``project_root`` is the checkout for a project skill, or the user's home
+    directory for a global one (``~/.agents/skills``).
+    """
+    return create_at(
+        _root(project_root, scope),
+        definition,
+        name=name,
+        limit=limit,
+        overwrite=overwrite,
+        scope=scope,
+    )
+
+
+def create_at(
+    root: Path | str,
+    definition: SkillDefinition,
+    *,
+    name: str,
+    limit: int = DEFAULT_LIMIT,
+    overwrite: bool = False,
+    scope: str = "project",
+) -> ProjectSkill:
+    """Write one bundle directly under an already-resolved skill root."""
     name = validate_name(name)
     problems = validate_definition(definition)
     if problems:
         raise ValidationError("; ".join(problems))
-    skills = discover(project_root)
+    root = Path(root)
+    skills = discover_at(root)
     existing = next((s for s in skills if s.name == name), None)
     if existing is not None and not overwrite:
         raise ValidationError(
             f"技能 {name} 已存在：{existing.path}（先 skill_get 看它；确需替换先 skill_retire）"
         )
     if existing is None and len(skills) >= limit:
+        where = "公共技能目录" if scope == "global" else "本项目"
         raise ValidationError(
-            f"本项目已有 {len(skills)} 个 active 技能，达到上限 {limit}；先 skill_retire 或合并，再新建"
+            f"{where}已有 {len(skills)} 个 active 技能，达到上限 {limit}；先 skill_retire 或合并，再新建"
         )
     now = to_iso(utcnow())
     text = render_skill(
@@ -457,8 +568,9 @@ def create(
         name=name,
         created_at=existing.created_at if existing and existing.created_at else now,
         updated_at=now,
+        scope=scope,
     )
-    bundle = skill_root(project_root) / name
+    bundle = root / name
     created_dir = not bundle.exists()
     bundle.mkdir(parents=True, exist_ok=True)
     try:
@@ -470,26 +582,37 @@ def create(
             except OSError:  # pragma: no cover - directory already has files
                 pass
         raise MemoryError(f"无法写入技能文件 {bundle / SKILL_FILE}: {error}") from error
-    loaded = load(project_root, name)
+    loaded = load_at(root, name)
     if loaded is None:  # pragma: no cover - the file was written a moment ago
         raise MemoryError(f"技能文件写入后无法读回：{bundle / SKILL_FILE}")
     return loaded
 
 
-def load(project_root: Path | str, name: str) -> ProjectSkill | None:
+def load(project_root: Path | str, name: str, *, scope: str = "project") -> ProjectSkill | None:
     """Read one bundle by directory name."""
-    return resolve(discover(project_root), name)
+    return load_at(_root(project_root, scope), name)
 
 
-def retire(project_root: Path | str, name: str) -> ProjectSkill:
+def load_at(root: Path | str, name: str) -> ProjectSkill | None:
+    """Read one bundle directly under an already-resolved skill root."""
+    return resolve(discover_at(root), name)
+
+
+def retire(project_root: Path | str, name: str, *, scope: str = "project") -> ProjectSkill:
     """Move a bundle out of the scanned root; the files are kept, not deleted."""
-    skill = resolve(discover(project_root), name)
+    return retire_at(_root(project_root, scope), name, scope=scope)
+
+
+def retire_at(root: Path | str, name: str, *, scope: str = "project") -> ProjectSkill:
+    """Retire one bundle directly under an already-resolved skill root."""
+    skill = resolve(discover_at(root), name)
     if skill is None:
-        raise NotFoundError(f"project skill {name!r} not found")
-    target = retired_root(project_root) / skill.name
+        where = "global skill" if scope == "global" else "project skill"
+        raise NotFoundError(f"{where} {name!r} not found")
+    target = Path(root) / RETIRED_DIR / skill.name
     if target.exists():
         stamp = re.sub(r"[^0-9]", "", to_iso(utcnow()))[:14]
-        target = retired_root(project_root) / f"{skill.name}-{stamp}"
+        target = Path(root) / RETIRED_DIR / f"{skill.name}-{stamp}"
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(skill.bundle, target)
     return replace(skill, bundle=target, path=target / SKILL_FILE)

@@ -59,6 +59,8 @@ anchors.py  (接口)      l2.py       l3.py        l4.py         maintenance.py
 
 向量后端：优先 `sqlite-vec` 的 `vec0` 虚表；不可用时自动退化为纯 Python 精确扫描（`backend: "exact"`），功能完整、只是慢。已由 `tests/test_degradation.py::test_exact_scan_fallback` 覆盖。
 
+**例外：程序性技能是文件。** 模型生成的技能（项目级 `<repo>/.agents/skills`、全局级 `~/.agents/skills`）不进入这个库：DSH 的原生技能目录会把它们变成会话技能，人和别的工具读同一个文件，换 harness 也不失传。库里只留一条 L2 创建审计记录；`l4_skills` 表仅服务于程序化 API 与旧库迁移。
+
 嵌入维度在数据库首次创建时写入 `meta.embedding_dim`，此后换模型会直接报错而不是静默产生垃圾相似度 —— 换模型等于重建库。
 
 ---
@@ -154,7 +156,7 @@ promotions.propose() -> list[Promotion]
 
 **匹配打分**：`0.4·intent + 0.3·prereq + 0.2·semantic + 0.1·success`。前置不满足（工具不可用）时分数乘 0.45 —— 技能必须**可执行**才有资格被推荐。
 
-**作用域**：`project > org > sys`，同名时高优先覆盖低优先；但 `enforcement="hard"` 的 `sys` 技能**不可被覆盖**（安全规则不允许项目本地绕过）。这条保护覆盖两条会绕开 `visible()` 的旁路：`find()` 裸名解析同按 hard-sys 优先，不被同名项目本地孪生遮蔽；`refresh_tiers` 中从未执行过的硬性 sys 技能**永不落入冷层** —— `prepare_turn` 与 `match` 会丢弃冷层技能，安全规则一旦"休眠"就无人执行。
+**作用域**：记忆库里的技能行只用于 `project`（程序化 API）；模型/桥接路径的项目技能与全局技能都是 `.agents/skills` 文件，全局文件在 `~/.agents/skills`。`SkillRegistry.create` 拒绝新的 `org` / `sys` 写入，桥接层也不读写全局 `l4_skills` 行；旧行只保留给迁移。创建与退役全局技能都需要用户明确同意（`user_approved=true`）。
 
 **成熟度 ≠ 运行状态**：运行状态是 `candidate → active → retired`；"mature" 只表示轨迹证据满足五个条件（≥3 次成功、≥2 个会话、步骤一致性 ≥0.6、有前置条件、非单步）。步骤一致性在**同一 signature 的全部变体之间**计算（组内取众数 variant 作代表键）—— 变体是单条轨迹精确工具序列的哈希，按它分组等于每组与自身比较，不允许失败。成熟的轨迹变成 `candidate` 技能，**必须经用户审核**才 `active`。
 
@@ -208,7 +210,7 @@ DSH 插件拿不到任意会话原文，因此锚点**可存、可传，但系�
 
 ### D10 · 提升推荐由用户决定，系统只做记账
 
-`PromotionService` 每天最多 book N 条（默认 3），逾期失效，被拒绝的簇在静默期内不再重复打扰。系统**从不**自动创建 org 级技能。
+`PromotionService` 每天最多 book N 条（默认 3），逾期失效，被拒绝的簇在静默期内不再重复打扰。系统**从不**自动创建全局技能；用户接受后写入 `~/.agents/skills/<name>/SKILL.md`，并把决策记进 `l4_promotions`。
 
 ---
 

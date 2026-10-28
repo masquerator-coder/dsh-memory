@@ -224,7 +224,15 @@ class SkillRegistry:
         activation_reason: str | None = None,
     ) -> Skill:
         definition = coerce_definition(definition)
-        if scope_kind == "project" and scope_kind not in ("project", "org", "sys"):  # pragma: no cover
+        if scope_kind in ("org", "sys"):
+            # Global procedural memory is a SKILL.md bundle under
+            # ~/.agents/skills; the store keeps only the creation record.
+            # Writing a row here would create a second source of truth.
+            raise ValidationError(
+                "global (org/sys) skills are file-backed: create them with "
+                "skill.create scope=global and user approval, not here"
+            )
+        if scope_kind != "project":  # pragma: no cover
             raise ValidationError("bad scope")
         scope_ref = view.project_id if scope_kind == "project" else (
             view.org_id if scope_kind == "org" else None

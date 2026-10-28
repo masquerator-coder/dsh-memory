@@ -310,7 +310,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS l4_archive_fts USING fts5(
 CREATE TABLE IF NOT EXISTS l4_promotions (
     promotion_id       TEXT PRIMARY KEY,
     cluster_key        TEXT NOT NULL,
-    proposal_scope     TEXT NOT NULL DEFAULT 'org',
+    proposal_scope     TEXT NOT NULL DEFAULT 'global',
     suggestion         TEXT NOT NULL,
     rationale          TEXT NOT NULL,
     evidence           TEXT NOT NULL,

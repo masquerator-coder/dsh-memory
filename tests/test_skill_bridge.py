@@ -80,19 +80,16 @@ def fail(home: str, repo: str, command: str, **payload) -> dict:
     return reply["error"]
 
 
-def seed_org_skill(home: str) -> None:
-    """An org skill can only be created by the user-facing path, so seed one."""
-    from memory_system.bridge import Scope, open_memory
+def seed_global_skill() -> None:
+    """A global skill is a bundle in the user-wide skill root."""
+    from memory_system import project_skills
 
-    with open_memory(Scope.from_payload({"home": home})) as memory:
-        memory.ensure_project("proj-a", org_id="acme")
-        memory.skills.create(
-            view=memory.view("proj-a"),
-            definition=SkillDefinition.from_dict(DEFINITION),
-            name="org-rule",
-            scope_kind="org",
-            status="active",
-        )
+    project_skills.create_at(
+        project_skills.global_skill_root(),
+        SkillDefinition.from_dict(DEFINITION),
+        name="org-rule",
+        scope="global",
+    )
 
 
 # ── create ──────────────────────────────────────────────────────────────
@@ -149,7 +146,7 @@ def test_org_and_sys_scopes_are_refused(home: str, repo: str):
             home, repo, "skill.create", model_authored=True, definition=DEFINITION, name=NAME, scope_kind=scope
         )
         assert error["code"] == "bad_request"
-        assert "org/sys promotion stays a user decision" in error["message"]
+        assert "global procedural memory is a file" in error["message"]
     assert call(home, repo, "skill.list")["items"] == []
 
 
@@ -207,11 +204,63 @@ def test_index_lists_no_project_skill(home: str, repo: str):
 
 
 def test_index_still_lists_global_skills(home: str, repo: str):
-    seed_org_skill(home)
+    seed_global_skill()
     call(home, repo, "skill.create", model_authored=True, definition=DEFINITION, name=NAME)
     index = call(home, repo, "skill.index")["index"]
     assert len(index) == 1 and "org-rule" in index[0]
     assert NAME not in index[0]
+
+
+def test_global_create_needs_explicit_user_approval(home: str, repo: str):
+    error = fail(
+        home,
+        repo,
+        "skill.create",
+        model_authored=True,
+        definition=DEFINITION,
+        name=NAME,
+        scope="global",
+    )
+    assert error["code"] == "bad_request"
+    assert "需要用户明确同意" in error["message"]
+    # Nothing was written before the "yes".
+    from memory_system import project_skills
+
+    assert project_skills.discover_at(project_skills.global_skill_root()) == []
+
+
+def test_global_create_writes_the_user_skill_root(home: str, repo: str):
+    created = call(
+        home,
+        repo,
+        "skill.create",
+        model_authored=True,
+        definition=DEFINITION,
+        name=NAME,
+        scope="global",
+        user_approved=True,
+    )
+    assert created["scope"] == "global"
+    skill = created["skill"]
+    assert skill["qualified_name"] == f"user:global:{NAME}"
+    assert skill["source"] == "file"
+    from memory_system import project_skills
+
+    bundle = project_skills.global_skill_root() / NAME / "SKILL.md"
+    assert bundle.is_file() and skill["path"] == str(bundle)
+    # The memory store keeps one creation record, but no l4_skills row.
+    assert created["record_id"]
+    from memory_system.bridge import Scope, open_memory
+
+    with open_memory(Scope.from_payload({"home": home})) as memory:
+        assert memory.store.scalar("SELECT count(*) FROM l4_skills") == 0
+        assert memory.store.scalar(
+            "SELECT count(*) FROM l2_episodes WHERE content_key = ?",
+            (f"skill:global:{NAME}",),
+        ) == 1
+    assert call(home, repo, "skill.list")["global_skills"] == 1
+    assert any(item["scope"] == "global" for item in call(home, repo, "skill.list")["items"])
+    assert call(home, repo, "skill.index")["index"]
 
 
 # ── read / run / retire ─────────────────────────────────────────────────
@@ -257,10 +306,13 @@ def test_retire_moves_the_bundle_out_of_the_scanned_root(home: str, repo: str):
     assert not (Path(repo) / ".agents" / "skills" / NAME).exists()
 
 
-def test_model_cannot_retire_an_org_skill(home: str, repo: str):
-    seed_org_skill(home)
+def test_model_cannot_retire_a_global_skill_without_approval(home: str, repo: str):
+    seed_global_skill()
     error = fail(home, repo, "skill.retire", skill="org-rule", model_authored=True)
     assert error["code"] == "bad_request"
-    assert "only the user can retire" in error["message"]
-    # The user's own call still goes through.
-    assert call(home, repo, "skill.retire", skill="org-rule")["skill"]["status"] == "retired"
+    assert "需要用户明确同意" in error["message"]
+    # The user's own call (or a model call after the "yes") still goes through.
+    retired = call(
+        home, repo, "skill.retire", skill="org-rule", model_authored=True, user_approved=True
+    )
+    assert retired["scope"] == "global" and retired["skill"]["status"] == "retired"

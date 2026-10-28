@@ -1598,7 +1598,7 @@ const ANCHOR_HEADER = [
 export const DEFAULTS = Object.freeze({ ...DEFAULTS_INNER })
 
 /**
- * The global skill index block: what this machine already knows how to do.
+ * The public skill index block: what this machine already knows how to do.
  * `{{skill_index}}` is replaced with the Python-rendered Level-1 lines.
  *
  * Project skills are deliberately absent: they are files in the checkout and
@@ -1606,8 +1606,8 @@ export const DEFAULTS = Object.freeze({ ...DEFAULTS_INNER })
  * the same tokens twice and make one skill look like two.
  */
 const SKILL_INDEX_HEADER = [
-  '## 技能（记忆库里的全局技能）',
-  '下面是记忆库中组织/系统级的技能，一行一个，只有触发条件与作用，不含步骤：',
+  '## 技能（公共技能：`~/.agents/skills`）',
+  '下面是本机公共技能目录里的技能，一行一个，只有触发条件与作用，不含步骤：',
   '',
   '{{skill_index}}',
   '',
@@ -1616,13 +1616,13 @@ const SKILL_INDEX_HEADER = [
 ].join('\n')
 
 /**
- * Shown when the store holds no global skill yet.
+ * Shown when there is no public skill yet.
  *
  * Same dedupe-first rule as the authoring rule below: this line is what the
  * model reads next, so it must not invite creating one.
  */
 const SKILL_INDEX_EMPTY =
-  '（记忆库里还没有全局技能。项目技能写在 `.agents/skills/`，由 DSH 技能目录列出；确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`。）'
+  '（`~/.agents/skills` 里还没有公共技能。项目技能写在 `.agents/skills/`，由 DSH 技能目录列出；确有验证过的做法要存时，先 `skill_list` 查重，再 `skill_create`。要存成公共技能必须先征得用户同意。）'
 
 /**
  * When saving a procedure is allowed.
@@ -1632,11 +1632,13 @@ const SKILL_INDEX_EMPTY =
  * "tested and reusable", not "plausible".
  */
 const SKILL_AUTHORING_RULE = [
-  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**；项目技能写成本项目 `.agents/skills/<name>/SKILL.md`（`name` 用 kebab-case ASCII，中文放 title），全局技能留在记忆库。 同时满足下面全部条件才值得存：',
+  '**技能写入职责**：技能是程序性记忆——可以重复执行的做法。工具不会自动提取它，**只有你调用 `skill_create` 才会保存**。默认存成本项目技能：`.agents/skills/<name>/SKILL.md`（`name` 用 kebab-case ASCII，中文放 title）。如果这套做法对**本机所有项目**都通用，可以存成公共技能：`scope="global"`，写入 `~/.agents/skills/<name>/SKILL.md`。 同时满足下面全部条件才值得存：',
   '- 这次任务中，这套步骤**真的被执行过并验证成功**（不是设想、不是只读过代码）；',
   '- 同类任务**大概率会再来**，步骤基本可复用；',
   '- 步骤里有**具体动作与顺序**（改了哪个模块、跑了什么命令、按什么顺序验证），不是“仔细阅读代码”这类空话；',
   '- `skill_list` 里**没有同类技能**——有就复用或改写那个，不要新建。 不要存的：一次性任务、临时调试步骤、能从代码或文档直接读到的内容、用户偏好（那属于 `memory_add`）、还没确认有效的做法。 项目技能建议控制在 24 个左右，超过写入会被拒绝；接近上限时先合并或 `skill_retire`，不要为了腾位置乱建。 技能文件会进版本库，那是知识不是日志：一次性调试步骤不要写进去。',
+  '',
+  '**公共技能必须先问用户**：公共技能写进 `~/.agents/skills`，对本机所有项目可见，属于用户的全局能力。在生成/保存公共技能之前，**必须先向用户说明准备保存的技能名、用途与步骤，并直接询问“是否要创建这个公共技能”**；只有用户明确同意后，才能调用 `skill_create` 并传 `scope="global"`、`user_approved=true`。用户没有明确同意、只是没有反对、或让你“记一下”时，都不要创建公共技能；可以改存项目技能，或先问清楚。',
 ].join('\n')
 
 /** Said after the session already saved one skill. */

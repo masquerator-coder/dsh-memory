@@ -21,13 +21,15 @@ re-recommend the same cluster every cycle.
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal, Sequence
 
+from . import project_skills
 from .config import L4Config
 from .errors import NotFoundError, ValidationError
-from .l4 import ScopeView, Skill, SkillDefinition, new_skill_id, qualified, slugify
+from .l4 import ScopeView, Skill, SkillDefinition, new_skill_id
 from .skills import CapacityError, SkillRegistry
 from .storage import Store, json_dumps, json_loads, iso_ago, to_iso, utcnow
 from .text import clip_words
@@ -413,7 +415,7 @@ class PromotionService:
                 (
                     promotion_id,
                     cluster["key"],
-                    "org",
+                    "global",
                     json_dumps(suggestion.to_dict()),
                     rationale,
                     json_dumps(evidence),
@@ -427,7 +429,7 @@ class PromotionService:
         return Promotion(
             promotion_id=promotion_id,
             cluster_key=cluster["key"],
-            proposal_scope="org",
+            proposal_scope="global",
             suggestion=suggestion,
             rationale=rationale,
             evidence=evidence,
@@ -523,41 +525,49 @@ class PromotionService:
         *,
         view: ScopeView,
         name: str | None = None,
-        scope_kind: Literal["org", "sys"] = "org",
+        scope_kind: Literal["global", "org", "sys"] = "global",
         decided_by: str = "user",
         note: str | None = None,
     ) -> Skill:
-        """User accepts: materialize the generalized skill at org/sys level."""
+        """User accepts: materialize the generalized skill as a global bundle.
+
+        ``scope_kind`` is accepted for backwards compatibility (``org``/``sys``
+        used to mean database rows) and is ignored: every promoted skill is now
+        a file under ``~/.agents/skills``.
+        """
         promotion = self.get(promotion_id)
         if promotion.status != "pending":
             raise ValidationError(f"promotion {promotion_id} is {promotion.status}")
         if promotion.suggestion is None:
             raise ValidationError("promotion has no suggestion")
-        if scope_kind == "sys" and not view.org_id:
-            raise ValidationError("sys-level promotion requires an administrative scope")
-        base = promotion.copy_from[0] if promotion.copy_from else None
-        base_name = name or _name_from_copies(self.store, promotion.copy_from)
+        base_name = name or _name_from_definition(promotion.suggestion)
         now = to_iso(utcnow())
-        # The skill and the decision are one act. Creating the skill in its own
-        # transaction left a window where the org-level skill existed while the
-        # promotion was still `pending`: accepting again then collided with
-        # "already exists", and the pending row could still be rejected,
-        # leaving a live skill whose promotion says it was refused. An outer
-        # transaction folds ``registry.create``'s inner one into a savepoint,
-        # so the skill, the decision and the provenance updates land together
-        # or not at all.
-        with self.store.transaction():
-            skill = self.registry.create(
-                view=view,
-                definition=promotion.suggestion,
+        # A promoted skill is global procedural memory, so it is written as a
+        # bundle under ~/.agents/skills — not as an l4_skills row. The file is
+        # written before the decision is recorded so a successful decision
+        # always has its file; if a previous attempt wrote the file and then
+        # failed, retrying reuses that identical bundle instead of colliding.
+        root = project_skills.global_skill_root()
+        existing = project_skills.load_at(root, base_name)
+        if existing is not None:
+            if (
+                existing.title != promotion.suggestion.title
+                or existing.description != promotion.suggestion.description
+            ):
+                raise ValidationError(
+                    f"global skill {base_name!r} already exists with different content; "
+                    "retire it or accept the promotion under another name"
+                )
+            bundle = existing
+        else:
+            bundle = project_skills.create_at(
+                root,
+                promotion.suggestion,
                 name=base_name,
-                scope_kind=scope_kind,
-                ns="user",
-                status="active",
-                origin_project=None,
-                parent_skill_id=base,
-                activation_reason=f"promotion:{promotion_id}",
+                scope="global",
             )
+        skill = bundle.to_skill(scope_kind="global", ns="user", status="active")
+        with self.store.transaction():
             # ``status='pending'`` in the predicate: the earlier read is outside
             # the transaction, so re-assert it where it is actually enforced.
             cur = self.store.execute(
@@ -567,20 +577,28 @@ class PromotionService:
             )
             if not cur.rowcount:
                 raise ValidationError(f"promotion {promotion_id} is no longer pending")
-            for source_id in promotion.copy_from:
-                self.store.execute(
-                    "UPDATE l4_skills SET promoted_to = ? WHERE skill_id = ?", (skill.skill_id, source_id)
-                )
-                try:
-                    self.archive.snapshot(self.registry.get(source_id), status="superseded")
-                except NotFoundError:
-                    pass
+            self.store.execute(
+                "INSERT INTO events(event_id, kind, layer, project_id, detail, created_at) "
+                "VALUES (lower(hex(randomblob(8))), 'skill.promoted', 'l4', ?, ?, ?)",
+                (
+                    view.project_id,
+                    json_dumps(
+                        {
+                            "promotion_id": promotion_id,
+                            "name": bundle.name,
+                            "path": str(bundle.path),
+                            "scope": "global",
+                        }
+                    ),
+                    now,
+                ),
+            )
         return skill
 
     def reject(self, promotion_id: str, *, note: str | None = None, decided_by: str = "user") -> Promotion:
         promotion = self.get(promotion_id)
         # A decided promotion is history. Overwriting an accepted one with
-        # 'rejected' left the org-level skill it created alive while its
+        # 'rejected' left the global skill it created alive while its
         # provenance said the proposal was refused; and re-rejecting re-armed
         # the cooldown clock. Refuse instead of silently rewriting the record.
         if promotion.status != "pending":
@@ -636,13 +654,18 @@ def _looks_project_specific(value: Any) -> bool:
     return any(token in text for token in ("project", "repo", "workspace", "c:/", "/users/"))
 
 
-def _name_from_copies(store: Store, skill_ids: Sequence[str]) -> str:
-    if not skill_ids:
-        return "promoted-skill"
-    row = store.query_one(
-        f"SELECT qualified_name FROM l4_skills WHERE skill_id IN ({','.join('?' * len(skill_ids))})",
-        list(skill_ids),
-    )
-    if row is None:
-        return "promoted-skill"
-    return row["qualified_name"].split(":", 1)[-1].split(":")[-1]
+def _name_from_definition(definition: SkillDefinition) -> str:
+    """A kebab-case ASCII bundle name for a promoted skill.
+
+    Copy-source rows are gone (project skills are files now), so the name is
+    derived from the generalized suggestion itself rather than from a store
+    lookup that would always miss. Titles are often Chinese, and the skill
+    catalog only accepts ``[a-z0-9-]``, so prefer the ASCII intent labels and
+    triggers before falling back to a sanitized title.
+    """
+    for source in (*definition.intent_labels, *definition.triggers, definition.title):
+        words = re.findall(r"[a-z0-9]+", str(source or "").lower())
+        slug = "-".join(words[:6]).strip("-")
+        if slug:
+            return slug[:60].strip("-") or "promoted-skill"
+    return "promoted-skill"

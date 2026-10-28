@@ -37,4 +37,5 @@ def isolate_default_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     are unaffected.
     """
     monkeypatch.setenv("DSH_MEMORY_HOME", str(tmp_path / "dsh-home"))
+    monkeypatch.setenv("DSH_MEMORY_GLOBAL_SKILLS", str(tmp_path / "global-skills"))
     monkeypatch.delenv("DSH_HOME", raising=False)

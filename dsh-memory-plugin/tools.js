@@ -147,8 +147,8 @@ function skillLine(skill) {
  */
 export function formatSkillList(result) {
   const items = Array.isArray(result?.items) ? result.items : []
-  if (items.length === 0) return '当前项目还没有任何技能。'
-  const rank = { project: 3, org: 2, sys: 1 }
+  if (items.length === 0) return '当前项目与公共技能目录里都还没有技能。'
+  const rank = { project: 3, global: 2, org: 2, sys: 1 }
   const ordered = [...items].sort((a, b) => (rank[b.scope] ?? 0) - (rank[a.scope] ?? 0))
   const active = ordered.filter((item) => item.status === 'active')
   const others = ordered.filter((item) => item.status !== 'active')
@@ -389,13 +389,23 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_create',
       description:
-        '把一个刚被验证过的程序性做法存成**本项目**的技能：写入 `<项目根>/.agents/skills/<name>/SKILL.md`，即 DSH 技能目录扫描的位置，下一回合起模型目录（`available_skills`）会列出它，人和别的工具也读同一个文件。`name` 必填，必须是小写 kebab-case ASCII（如 `locate-failing-test`），中文标题放 `title`。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。',
+        '把一个刚被验证过的程序性做法存成技能。默认存**本项目**：写入 `<项目根>/.agents/skills/<name>/SKILL.md`；传 `scope="global"` 则存成**公共技能**，写入 `~/.agents/skills/<name>/SKILL.md`，对本机所有项目可见。两个目录都是 DSH 技能目录扫描的位置，下一回合起模型目录（`available_skills`）会列出它，人和别的工具也读同一个文件。`name` 必填，必须是小写 kebab-case ASCII（如 `locate-failing-test`），中文标题放 `title`。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。**创建公共技能前必须先问用户是否要保存为公共技能，得到明确同意后才能传 `scope="global"` 与 `user_approved=true`；不要自行假定同意。**',
       parameters: {
         name: {
           type: 'string',
           required: true,
           description:
             '技能标识，同时是目录名：小写 kebab-case ASCII，如 `locate-failing-test`。中文会被 DSH 丢弃，所有中文放 title/description。',
+        },
+        scope: {
+          type: 'string',
+          description:
+            '`project`（默认，写入本项目 `.agents/skills`）或 `global`（公共技能，写入 `~/.agents/skills`，所有项目可见）。选 global 前必须先询问用户。',
+        },
+        user_approved: {
+          type: 'boolean',
+          description:
+            '仅当用户已明确同意创建公共技能（或退役公共技能）时设为 true；创建普通项目技能不需要。',
         },
         title: { type: 'string', required: true, description: '技能名，简短可区分，如「定位失败的测试」。' },
         description: { type: 'string', required: true, description: '一句话说明这个技能做什么，不超过 30 字。' },
@@ -444,6 +454,8 @@ export function buildTools({ call, projectFor, generateDigest }) {
             project_id: await requireProject(exec),
             cwd: cwdOf(exec),
             model_authored: true,
+            scope: args.scope === 'global' ? 'global' : 'project',
+            user_approved: args.user_approved === true,
             name: args.name,
             definition: {
               title: args.title,
@@ -459,15 +471,19 @@ export function buildTools({ call, projectFor, generateDigest }) {
           exec?.signal,
         )
         const skill = result?.skill ?? {}
+        const where = result?.scope === 'global' ? '公共技能' : '项目技能'
+        const record = result?.record_id
+          ? `记忆库已保留创建记录 \`${result.record_id}\`。`
+          : '记忆库创建记录未写入（技能文件已保存）。'
         return textOutput(
-          `已创建项目技能 \`${skill.qualified_name}\`（${skill.step_count} 步），写入 \`${skill.path}\`。下一回合起 DSH 技能目录会列出它，可用 \`skill\` 工具加载；执行后同 skill_run 记录结果，做法过时用 skill_retire 退役。`,
+          `已创建${where} \`${skill.qualified_name}\`（${skill.step_count} 步），写入 \`${skill.path}\`。下一回合起 DSH 技能目录会列出它，可用 \`skill\` 工具加载；执行后同 skill_run 记录结果，做法过时用 skill_retire 退役。${record}`,
         )
       },
     },
     {
       name: 'skill_list',
       description:
-        '列出当前项目可用的技能：项目技能（`.agents/skills` 里的文件）+ 组织/系统级技能（记忆库）。新建技能前先用它确认没有同类技能。',
+        '列出当前项目可用的技能：项目技能（本项目 `.agents/skills`）+ 公共技能（`~/.agents/skills`）。新建技能前先用它确认没有同类技能。',
       parameters: {},
       output: TEXT_OUTPUT,
       isConcurrencySafe: () => true,
@@ -483,12 +499,12 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_get',
       description:
-        '读取一个技能的完整定义（全部步骤、前置条件、成功标准）。索引里只有一行摘要，执行前需要细节时调用；项目技能直接返回 `SKILL.md` 正文。',
+        '读取一个技能的完整定义（全部步骤、前置条件、成功标准）。索引里只有一行摘要，执行前需要细节时调用；项目技能与公共技能都直接返回 `SKILL.md` 正文。',
       parameters: {
         skill: {
           type: 'string',
           required: true,
-          description: '技能名（项目技能用它的 kebab-case name，如 `locate-failing-test`）或 skill_id。',
+          description: '技能名（用它的 kebab-case name，如 `locate-failing-test`）或 skill_id。',
         },
       },
       output: TEXT_OUTPUT,
@@ -505,7 +521,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_run',
       description:
-        '记录一次技能执行的结果。技能被真正按步骤用过之后调用，用于成功率；只是看一眼技能不要调用。项目技能的执行记录追加到记忆库目录下的 `l4_runs`，不进仓库。',
+        '记录一次技能执行的结果。技能被真正按步骤用过之后调用，用于成功率；只是看一眼技能不要调用。执行记录追加到记忆库目录下的 `l4_runs`，不进技能目录。',
       parameters: {
         skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
         outcome: { type: 'string', description: 'success / failure / partial，默认 success。' },
@@ -534,10 +550,14 @@ export function buildTools({ call, projectFor, generateDigest }) {
     {
       name: 'skill_retire',
       description:
-        '退役一个**本项目**的技能：做法过时、被更好的做法替代、或用户明确说不要时使用。项目技能是把目录移到 `.agents/skills/.retired/`，文件保留可恢复；org/sys 级技能只有用户能退役。',
+        '退役一个技能：做法过时、被更好的做法替代、或用户明确说不要时使用。技能目录会被移到同级的 `.retired/`，文件保留可恢复。项目技能可直接退役；**公共技能对全部项目可见，退役前必须先询问用户并得到同意，再传 `user_approved=true`。**',
       parameters: {
         skill: { type: 'string', required: true, description: '技能名或 skill_id。' },
         reason: { type: 'string', description: '退役原因。' },
+        user_approved: {
+          type: 'boolean',
+          description: '仅当用户已明确同意退役公共技能时设为 true；退役项目技能不需要。',
+        },
       },
       output: TEXT_OUTPUT,
       async execute(args, exec) {
@@ -549,6 +569,7 @@ export function buildTools({ call, projectFor, generateDigest }) {
             skill: args.skill,
             reason: args.reason || 'tool request',
             model_authored: true,
+            user_approved: args.user_approved === true,
           },
           exec?.signal,
         )

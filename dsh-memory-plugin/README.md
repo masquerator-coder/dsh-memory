@@ -17,11 +17,11 @@ Markdown 备份与项目根摘要文件全部由 `memory_system` 实现，插件
 | --- | --- |
 | `memory_recall` / `memory_search` / `memory_add` / `memory_forget` | 记忆的读、写、归档 |
 | `memory_profile_read` / `memory_digest_read` / `memory_digest_generate` | 画像与全局摘要 |
-| `skill_create` | 把验证过的做法写成**本项目**技能文件（`.agents/skills/<name>/SKILL.md`，`name` 要 kebab-case） |
-| `skill_list` / `skill_get` | 列出 / 读取技能（项目技能在磁盘，全局技能在库里） |
-| `skill_run` / `skill_retire` | 记录执行结果（写 `l4_runs` 台账）/ 退役（目录移进 `.retired/`） |
+| `skill_create` | 把验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`（必须先问用户，同意后带 `user_approved=true`） |
+| `skill_list` / `skill_get` | 列出 / 读取技能（项目技能与全局技能都在磁盘，`skill_list` 合并两处） |
+| `skill_run` / `skill_retire` | 记录执行结果（写 `<memoryHome>/l4_runs` 台账）/ 退役（目录移进 `.retired/`；退役全局技能同样需要用户同意） |
 
-技能分两处存：**项目技能是仓库里的文件**（DSH 自己的技能目录会列出它，并用原生 `skill` 工具加载），**全局技能是记忆库里的 `l4_skills` 行**。org / sys 级晋升是用户决策，工具与桥接命令都不提供。
+技能分两处存，都是文件：**项目技能**在仓库 `.agents/skills`（DSH 自己的技能目录会列出它，并用原生 `skill` 工具加载），**全局技能**在 `~/.agents/skills`（所有项目共享，可用 `DSH_MEMORY_GLOBAL_SKILLS` 覆盖）。`org` / `sys` 数据库作用域已移除；全局技能的创建与退役是用户决策，模型必须先征得同意。每次成功创建还会在记忆库留一条 L2 审计记录，但技能定义本身只在 `SKILL.md` 里。
 
 ## 设置页功能
 
@@ -69,7 +69,7 @@ patch 里的模块名是相对路径（`./index.js`），所以仓库放在哪�
 | `autoSummary` | `true` | 回合结束、空闲后自动生成全局摘要；常开，界面不提供开关。摘要是**读**记忆，不受 `captureTurns` 影响 |
 | `autoSummaryDelayMs` | `15000` | 回合结束到生成摘要之间的空闲间隔 |
 | `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
-| `skillIndex` | `true` | 是否注入记忆库里**全局**技能索引（一行一个技能，30 秒缓存）；项目技能由 DSH 技能目录另行列出 |
+| `skillIndex` | `true` | 是否注入 `~/.agents/skills` 里的**全局**技能索引（一行一个技能，30 秒缓存）；项目技能由 DSH 技能目录另行列出 |
 | `skillAuthoring` | `true` | 是否在提示词里告诉模型何时可以 `skill_create`（写 `.agents/skills`）；默认每个会话最多新建 1 个 |
 | `heartbeatSteps` | `0` | 距上次 `memory_add` 经过多少个模型步（`step/start`，一次模型调用算一步）后，在系统提示词里出现一次记忆提醒，随后重新计数；`0` 关闭（默认）。提醒会改写常驻提示词，开启即意味着周期性前缀缓存失效 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型，检查还有没有未写入的记忆 |
