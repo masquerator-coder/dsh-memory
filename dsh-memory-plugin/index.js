@@ -1732,8 +1732,9 @@ const ANCHOR_HEADER = [
   '',
   '**技能固化**：',
   '',
-  '- 完成可复用任务（同一套步骤后续还会复用）后，先用 `skill_list` 检查是否有同类技能；如无，再用 `skill_create` 保存。仅保存已跑通验证的，一次性任务不保存。',
-  '- 选级别：只对这个项目成立的做法存**项目级**（默认，`scope="project"`）；跨项目通用的做法（如 Windows 沙箱踩坑、通用构建流程）才考虑**全局**（`scope="global"`）。全局技能对本机所有项目可见，必须先用 `ask_user_question` 征求用户同意——问题 id 用 `dsh-memory:skill-scope`、选项 id 用 `global`，宿主只认这次真实答复，没有它全局写入会被直接拒绝；用户不选全局就存成本项目技能，不要重复追问。',
+  '- 完成可复用任务（同一套步骤后续还会复用）后，先 `skill_list` 查重；已有同类不重复创建，必要时 `skill_create` 同名覆盖或 `skill_retire` 退役旧技能。仅保存已跑通验证的；一次性任务不保存；一个会话最多新建 1 个。',
+  '- 选级别：拿不准就存**项目级**（默认，`scope="project"`）；只有跨项目通用、已验证、不含项目路径/私有依赖/敏感信息的做法才考虑**全局**（`scope="global"`）。',
+  '- 写全局必须先用 `ask_user_question` 取得用户**本次**答复：问题 id `dsh-memory:skill-scope`、选项 id 含 `global`。该授权一次性、10 分钟内有效，宿主只认这次答复，模型自述无效；未选 `global` 就存项目级，不重复追问。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */
