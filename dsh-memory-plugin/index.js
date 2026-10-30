@@ -36,6 +36,20 @@ export const TOOL_NAMES = [
 /** Prompt section order: after the built-in tool docs, before the persona. */
 const ANCHOR_ORDER = 9500
 
+/**
+ * Prompt section order for the user's standing instruction.
+ *
+ * Deliberately first and not adjacent to the memory anchor: it is the user's
+ * own text, so it reads as the deployment persona's neighbour and stays
+ * independent of `systemPromptAnchor`. `dsh-system-prompt` reserves `0` for
+ * the deployment persona prefix, which a composition may replace; sitting
+ * just after it (`1`) keeps this section early without ever shadowing it.
+ */
+const INSTRUCTION_ORDER = 1
+
+/** How long a cached instruction stays usable before it is re-read. */
+const INSTRUCTION_REFRESH_MS = 15_000
+
 /** How long an anchor stays usable before it is refreshed. */
 const ANCHOR_REFRESH_MS = 15_000
 
@@ -984,6 +998,101 @@ export function apply(ctx, rawConfig) {
     ctx.effect(() => ctx.tools.register(wrapped), `dsh-memory.tool(${wrapped.name})`)
   }
 
+  // ── user instruction (a "soul.md" the user maintains) ─────────────────
+
+  /**
+   * The user's standing instruction, injected verbatim as a prompt section.
+   *
+   * The text lives in the memory store rather than in this plugin's config: it
+   * is user content edited from a page, not a deployment setting, and the
+   * bridge already owns "text the user maintains" (the profile). Injecting it
+   * is a separate switch — `memory.instruction.enabled` — so turning it off
+   * keeps the text for later, and a user who never writes anything pays
+   * nothing: an empty or switched-off instruction registers no section at all.
+   *
+   * The cache is a one-slot map because the value is global: every session
+   * shows the same instruction, so a per-directory key would only multiply
+   * identical round trips.
+   */
+  const instructionSlot = { at: 0, text: '', enabled: false, pending: false, loaded: false }
+
+  /**
+   * Read the instruction into the slot.
+   *
+   * A failed read leaves the last known text in place rather than blanking it:
+   * the section is the user's own words, and dropping them because a child
+   * process hiccuped would silently change the model's behaviour mid-session.
+   */
+  async function readInstruction() {
+    try {
+      const result = await call('instruction.read', {})
+      instructionSlot.text = typeof result?.content === 'string' ? result.content : ''
+      instructionSlot.enabled = result?.enabled === true
+      instructionSlot.loaded = true
+    } catch (error) {
+      logger.warn(`[dsh-memory] instruction refresh failed: ${error?.message ?? error}`)
+    } finally {
+      instructionSlot.at = Date.now()
+      instructionSlot.pending = false
+    }
+  }
+
+  /**
+   * Start a refresh when the cached instruction has aged.
+   *
+   * The section text is synchronous and the read is not, so the first
+   * assembly after a host start renders without it and the next one includes
+   * it. That is the same one-turn delay the anchor already has.
+   */
+  function refreshInstruction() {
+    if (instructionSlot.pending) return
+    if (instructionSlot.loaded && Date.now() - instructionSlot.at < INSTRUCTION_REFRESH_MS) return
+    instructionSlot.pending = true
+    void readInstruction()
+  }
+
+  /**
+   * Register the instruction section.
+   *
+   * Registered unconditionally and returning '' when there is nothing to say:
+   * `renderPrompt` drops empty sections, and registering once at load avoids
+   * the section appearing and disappearing from the prompt as the switch is
+   * toggled. A section that is absent in one assembly and present in the next
+   * changes the resident prefix either way; this way the change happens only
+   * when the user actually turns the instruction on.
+   */
+  ctx.effect(
+    () =>
+      ctx.systemPrompt.section({
+        name: 'dsh-memory:instruction',
+        order: INSTRUCTION_ORDER,
+        // The user's text is not a template: `{{…}}` groups in it must reach
+        // the model literally instead of failing assembly or being expanded.
+        interpolate: false,
+        text: () => {
+          refreshInstruction()
+          if (!instructionSlot.enabled) return ''
+          return instructionSlot.text
+        },
+      }),
+    'dsh-memory.instruction-section',
+  )
+
+  /**
+   * Re-read the instruction now, for the settings page.
+   *
+   * Saving (or toggling) has to be visible on the next assembly; waiting out
+   * the TTL made the page look like the save did nothing.
+   */
+  async function refreshInstructionNow() {
+    instructionSlot.pending = true
+    await readInstruction()
+  }
+
+  // Warm the slot at load so the first prompt of a session that starts after
+  // the host is already up carries the instruction.
+  void readInstruction()
+
   // ── system prompt anchor ──────────────────────────────────────────────
 
   if (config.systemPromptAnchor) {
@@ -1499,6 +1608,23 @@ export function apply(ctx, rawConfig) {
         return written
       }
       return await call('profile.read', {})
+    })
+
+    route('/dsh-memory/instruction', async (body) => {
+      // The text and the switch are separate controls, so an absent key means
+      // "leave this one alone" — that is what lets the page flip the switch
+      // without resending (and risking) the body it has on screen.
+      if (typeof body?.content === 'string' || typeof body?.enabled === 'boolean') {
+        const written = await call('instruction.write', {
+          content: typeof body?.content === 'string' ? body.content : undefined,
+          enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
+        })
+        // The section is resident in the system prompt: re-read it now so the
+        // next assembly shows the new text instead of the cached one.
+        await refreshInstructionNow()
+        return written
+      }
+      return await call('instruction.read', {})
     })
 
     route('/dsh-memory/digest', async (body) => {

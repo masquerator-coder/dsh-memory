@@ -86,6 +86,19 @@ window.__ModuleLoader__.load({
       "profile.loadFailed": "读取用户画像失败：{message}",
       "profile.updatedAt": "更新于 {time}",
       "profile.save": "保存用户画像",
+      "instruction.title": "系统指令",
+      "instruction.hint": "写进系统提示词的一段长期指令，常驻每个请求，作用类似 soul.md：人格、语气、固定规则、必须遵守的偏好。开关关闭时保留文本但不注入，重新打开立刻恢复。",
+      "instruction.placeholder": "例如：\n- 始终用中文回答，代码注释也用中文\n- 回答先给结论，再给理由\n- 改动前先确认仓库根与分支\n- 不要主动提交或推送代码",
+      "instruction.enable": "注入到系统提示词",
+      "instruction.disabled": "已关闭（文本已保留，不会注入）",
+      "instruction.enabledLabel": "已启用",
+      "instruction.disabledLabel": "已关闭",
+      "instruction.charCount": "{n} / {max} 字",
+      "instruction.saved": "系统指令已保存",
+      "instruction.toggled": "系统指令已{state}",
+      "instruction.loadFailed": "读取系统指令失败：{message}",
+      "instruction.save": "保存系统指令",
+      "instruction.tooLong": "指令超过 {max} 字上限，请精简后再保存",
       "digest.title": "记忆摘要",
       "digest.generate": "记忆摘要生成",
       "digest.view": "查看记忆摘要",
@@ -251,6 +264,19 @@ window.__ModuleLoader__.load({
       "profile.loadFailed": "Could not read the user profile: {message}",
       "profile.updatedAt": "Updated {time}",
       "profile.save": "Save profile",
+      "instruction.title": "System instruction",
+      "instruction.hint": "A standing instruction written into the system prompt and carried by every request — a soul.md in effect: persona, tone, fixed rules, must-follow preferences. Switching it off keeps the text but stops injecting it; turning it back on restores it immediately.",
+      "instruction.placeholder": "For example:\n- Always answer in Chinese, comment code in Chinese\n- Lead with the conclusion, then the reasoning\n- Confirm the repo root and branch before changing files\n- Never commit or push on your own",
+      "instruction.enable": "Inject into the system prompt",
+      "instruction.disabled": "Off (the text is kept, nothing is injected)",
+      "instruction.enabledLabel": "Enabled",
+      "instruction.disabledLabel": "Off",
+      "instruction.charCount": "{n} / {max} chars",
+      "instruction.saved": "System instruction saved",
+      "instruction.toggled": "System instruction {state}",
+      "instruction.loadFailed": "Could not read the system instruction: {message}",
+      "instruction.save": "Save instruction",
+      "instruction.tooLong": "The instruction exceeds the {max}-character limit; shorten it before saving",
       "digest.title": "Memory digest",
       "digest.generate": "Generate digest",
       "digest.view": "View digest",
@@ -367,6 +393,7 @@ window.__ModuleLoader__.load({
     const ROUTE_STATUS = '/dsh-memory/status'
     const ROUTE_SETTINGS = '/dsh-memory/settings'
     const ROUTE_PROFILE = '/dsh-memory/profile'
+    const ROUTE_INSTRUCTION = '/dsh-memory/instruction'
     const ROUTE_DIGEST = '/dsh-memory/digest'
     const ROUTE_MEMORIES = '/dsh-memory/memories'
     const ROUTE_BACKUP = '/dsh-memory/backup'
@@ -701,6 +728,16 @@ window.__ModuleLoader__.load({
       const [savingProfile, setSavingProfile] = useState(false)
       const [profileNote, setProfileNote] = useState(null)
 
+      // instruction
+      // Its own state, not part of `profile`: the two are separate controls on
+      // the page, and a save of one must never resend the other.
+      const [instruction, setInstruction] = useState('')
+      const [instructionEnabled, setInstructionEnabled] = useState(false)
+      const [instructionSaved, setInstructionSaved] = useState({ content: '', enabled: false })
+      const [instructionMax, setInstructionMax] = useState(4000)
+      const [savingInstruction, setSavingInstruction] = useState(false)
+      const [instructionNote, setInstructionNote] = useState(null)
+
       // digest
       const [digestState, setDigestState] = useState({ digest: null, history: [] })
       const [generating, setGenerating] = useState(false)
@@ -759,11 +796,26 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      const loadInstruction = React.useCallback(async () => {
+        try {
+          const result = await api(ROUTE_INSTRUCTION, {})
+          const content = result?.content ?? ''
+          const enabled = result?.enabled === true
+          setInstruction(content)
+          setInstructionEnabled(enabled)
+          setInstructionSaved({ content, enabled })
+          if (typeof result?.max_chars === 'number') setInstructionMax(result.max_chars)
+        } catch (error) {
+          setInstructionNote({ kind: 'error', text: t('instruction.loadFailed', { message: error.message }) })
+        }
+      }, [])
+
       React.useEffect(() => {
         void loadStatus()
         void loadProfile()
+        void loadInstruction()
         void loadDigest()
-      }, [loadStatus, loadProfile, loadDigest])
+      }, [loadStatus, loadProfile, loadInstruction, loadDigest])
 
       // Debounced commit: once the slider settles on a new preset for a beat,
       // write it. A range input fires `onChange` on every step, so writing
@@ -846,6 +898,65 @@ window.__ModuleLoader__.load({
           setProfileNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
         } finally {
           setSavingProfile(false)
+        }
+      }
+
+      /** Persist the standing instruction. */
+      async function saveInstruction() {
+        // The host is authoritative on the limit, but refusing here keeps the
+        // round trip (and the server-side error text) off the user's path.
+        if (instruction.length > instructionMax) {
+          setInstructionNote({ kind: 'error', text: t('instruction.tooLong', { max: instructionMax }) })
+          return
+        }
+        setSavingInstruction(true)
+        setInstructionNote(null)
+        try {
+          // `enabled` rides along so one save commits a half-edited page
+          // without a second request that could land out of order.
+          const result = await api(ROUTE_INSTRUCTION, { content: instruction, enabled: instructionEnabled })
+          const content = result?.content ?? instruction
+          const enabled = result?.enabled === true
+          setInstruction(content)
+          setInstructionEnabled(enabled)
+          setInstructionSaved({ content, enabled })
+          setInstructionNote({ kind: 'ok', text: t('instruction.saved') })
+        } catch (error) {
+          setInstructionNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
+        } finally {
+          setSavingInstruction(false)
+        }
+      }
+
+      /**
+       * Flip the switch and persist it.
+       *
+       * Sent right away rather than left to the save button: the switch is the
+       * whole point of the section, and a page that showed "on" while the host
+       * still had it off would be lying about what the model reads.
+       */
+      async function toggleInstruction(next) {
+        setInstructionEnabled(next)
+        setSavingInstruction(true)
+        setInstructionNote(null)
+        try {
+          // Only `enabled`: no `content` in the payload means "leave the text
+          // alone", so a toggle can never overwrite an unsaved edit or wipe
+          // what is stored.
+          const result = await api(ROUTE_INSTRUCTION, { enabled: next })
+          const enabled = result?.enabled === true
+          setInstructionEnabled(enabled)
+          setInstructionSaved((current) => ({ ...current, enabled }))
+          setInstructionNote({
+            kind: 'ok',
+            text: t('instruction.toggled', { state: enabled ? t('instruction.enabledLabel') : t('instruction.disabledLabel') }),
+          })
+        } catch (error) {
+          // Put the switch back where the host still has it.
+          setInstructionEnabled(!next)
+          setInstructionNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
+        } finally {
+          setSavingInstruction(false)
         }
       }
 
@@ -1128,6 +1239,71 @@ window.__ModuleLoader__.load({
               { kind: savingLength ? 'warn' : lengthNote?.kind },
               savingLength ? t('common.saving') : lengthNote?.text,
             ),
+          ),
+
+          // ── system instruction ─────────────────────────────────────────
+          h(
+            'section',
+            { className: 'mem-card' },
+            h(
+              'header',
+              null,
+              h('h3', { className: 'mem-title' }, t('instruction.title')),
+              // One chip says what the host is actually doing, not what the
+              // switch on screen says: an injection state is the useful fact.
+              h(
+                'span',
+                { className: instructionEnabled ? 'mem-chip mem-chip-ok' : 'mem-chip mem-chip-idle' },
+                instructionEnabled ? t('instruction.enabledLabel') : t('instruction.disabledLabel'),
+              ),
+            ),
+            h('p', { className: 'mem-hint' }, t('instruction.hint')),
+            h(
+              'label',
+              { className: 'mem-hint', style: { display: 'inline-flex', gap: '8px', alignItems: 'center' } },
+              h('input', {
+                type: 'checkbox',
+                checked: instructionEnabled,
+                disabled: savingInstruction,
+                onChange: (event) => void toggleInstruction(event.target.checked),
+              }),
+              t('instruction.enable'),
+            ),
+            h('textarea', {
+              className: 'mem-textarea',
+              value: instruction,
+              placeholder: t('instruction.placeholder'),
+              maxLength: instructionMax,
+              onChange: (event) => {
+                setInstruction(event.target.value)
+                setInstructionNote(null)
+              },
+            }),
+            h(
+              'div',
+              { className: 'mem-row' },
+              h('span', { className: 'mem-hint' }, t('instruction.charCount', { n: instruction.length, max: instructionMax })),
+              // Off is not the same as empty: say so, or a user who pasted
+              // text and switched off will wonder where it went.
+              instructionEnabled ? null : h('span', { className: 'mem-hint' }, t('instruction.disabled')),
+              h('span', { className: 'mem-spacer' }),
+              instruction !== instructionSaved.content || instructionEnabled !== instructionSaved.enabled
+                ? h('span', { className: 'mem-chip mem-chip-warn' }, t('common.unsaved'))
+                : null,
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'mem-btn mem-btn-primary',
+                  onClick: () => void saveInstruction(),
+                  disabled:
+                    savingInstruction ||
+                    (instruction === instructionSaved.content && instructionEnabled === instructionSaved.enabled),
+                },
+                savingInstruction ? t('common.saving') : t('instruction.save'),
+              ),
+            ),
+            h(Note, { kind: instructionNote?.kind }, instructionNote?.text),
           ),
 
           // ── user profile ───────────────────────────────────────────────

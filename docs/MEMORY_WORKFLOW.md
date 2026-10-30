@@ -14,6 +14,7 @@ DSH 宿主进程（JS 插件）                     Python 子进程（memory_sy
 apply(ctx) 注册 12 个工具 / 锚点 / 事件 / 路由
 
 系统提示词装配 ──digest.anchor────────────▶ 读 memory_digests + meta(用户画像)
+系统提示词装配 ──instruction.read─────────▶ 读 meta(系统指令 + 开关)
 memory_add ────memory.remember────────────▶ L2 事件 + L3 事实（同一事务）
                                               └─▶ 重写 <repo>/DSH_MEMORY.md
 turn/end ──15s 防抖──▶ digest.plan ──▶ 宿主 llm.stream ──▶ digest.commit
@@ -149,6 +150,25 @@ L3 写时校验顺序（`l3.py:512-619`）：
 #### 用户画像写入
 
 只有设置页 `profile.write`，模型没有写画像的工具（`tools.js:306-317`、`bridge.py:442-454`）。
+
+#### 系统指令写入
+
+只有设置页 `instruction.write`，模型没有写指令的工具。三处存储键（`summary.py` 顶部）：
+
+| meta 键 | 含义 |
+| --- | --- |
+| `memory.instruction` | 指令正文，保存时 `strip()`，上限 4000 字（`INSTRUCTION_MAX_CHARS`） |
+| `memory.instruction.enabled` | `'1'` / `'0'`。**缺省视为关闭**——该 section 常驻每个请求，注入必须是一次明确选择 |
+| `memory.instruction.updated_at` | 最后写入时间 |
+
+正文与开关是**两个独立字段**：`set_instruction(text, enabled=...)` 用 `None` 表示"这一项不动"，因此
+`instruction.write` 只传 `enabled` 时不会重发、也不会覆盖正文；清除正文必须显式传 `content: ""`。
+超限抛 `ValidationError`，且在写入前抛出，所以被拒绝的写入不会破坏已存内容。
+
+注入侧（`index.js`）：`dsh-memory:instruction` section，`order: 1`，`interpolate: false`（用户的 `{{…}}`
+保持字面，不展开也不报错）。空文本或开关关闭时返回 `''`，`renderPrompt` 丢弃空 section，没写指令的用户零成本。
+宿主侧有 15 秒缓存槽（`INSTRUCTION_REFRESH_MS`），保存/切换开关时调用 `refreshInstructionNow()` 立刻重读，
+所以设置页保存后的下一次装配就能看到。**不受 `systemPromptAnchor` 影响**——那是记忆锚点的开关。
 
 #### 备份恢复
 

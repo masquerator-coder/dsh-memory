@@ -69,6 +69,21 @@
     "updatedAt": "Updated {time}",
     "save": "Save profile"
   },
+  "instruction": {
+    "title": "System instruction",
+    "hint": "A standing instruction written into the system prompt and carried by every request — a soul.md in effect: persona, tone, fixed rules, must-follow preferences. Switching it off keeps the text but stops injecting it; turning it back on restores it immediately.",
+    "placeholder": "For example:\n- Always answer in Chinese, comment code in Chinese\n- Lead with the conclusion, then the reasoning\n- Confirm the repo root and branch before changing files\n- Never commit or push on your own",
+    "enable": "Inject into the system prompt",
+    "disabled": "Off (the text is kept, nothing is injected)",
+    "enabledLabel": "Enabled",
+    "disabledLabel": "Off",
+    "charCount": "{n} / {max} chars",
+    "saved": "System instruction saved",
+    "toggled": "System instruction {state}",
+    "loadFailed": "Could not read the system instruction: {message}",
+    "save": "Save instruction",
+    "tooLong": "The instruction exceeds the {max}-character limit; shorten it before saving"
+  },
   "digest": {
     "title": "Memory digest",
     "generate": "Generate digest",

@@ -69,6 +69,21 @@
     "updatedAt": "更新于 {time}",
     "save": "保存用户画像"
   },
+  "instruction": {
+    "title": "系统指令",
+    "hint": "写进系统提示词的一段长期指令，常驻每个请求，作用类似 soul.md：人格、语气、固定规则、必须遵守的偏好。开关关闭时保留文本但不注入，重新打开立刻恢复。",
+    "placeholder": "例如：\n- 始终用中文回答，代码注释也用中文\n- 回答先给结论，再给理由\n- 改动前先确认仓库根与分支\n- 不要主动提交或推送代码",
+    "enable": "注入到系统提示词",
+    "disabled": "已关闭（文本已保留，不会注入）",
+    "enabledLabel": "已启用",
+    "disabledLabel": "已关闭",
+    "charCount": "{n} / {max} 字",
+    "saved": "系统指令已保存",
+    "toggled": "系统指令已{state}",
+    "loadFailed": "读取系统指令失败：{message}",
+    "save": "保存系统指令",
+    "tooLong": "指令超过 {max} 字上限，请精简后再保存"
+  },
   "digest": {
     "title": "记忆摘要",
     "generate": "记忆摘要生成",

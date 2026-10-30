@@ -240,7 +240,7 @@ score = similarity × (0.2 + 0.8 × R)
 | `projectOverride` | `''` | 固定项目 id，不再按会话 cwd 推导 |
 | `autoSummary` | `true` | 回合结束后自动生成全局摘要；设置页不提供开关 |
 | `autoSummaryDelayMs` | `15000` | `turn/end` 到生成摘要之间的空闲间隔 |
-| `systemPromptAnchor` | `true` | 是否注入记忆锚点 |
+| `systemPromptAnchor` | `true` | 是否注入记忆锚点。系统指令是独立 section，不受此开关影响 |
 | `heartbeatSteps` | `0` | 距上次 `memory_add` 经过多少个模型步（`step/start`）后提醒一次（随后重新计数）；`0` 关闭。默认关闭，因为它会改写系统提示词、使前缀缓存失效 |
 | `maintenanceIntervalMs` | `600000` | 每隔多久问一次 Python 侧“有到期的后台任务吗”。任务本身按 `MaintenanceConfig` 的节奏（1h/6h/24h）自限，早到的 tick 只是一次空转；`0` 关闭 |
 | `sessionEndCheck` | `true` | 会话结束时调用一次模型检查遗漏 |
@@ -274,6 +274,7 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 | `status` | 连接状态、当前项目 id、条目数、存储位置、检索后端 |
 | `settings` | 摘要长度档位（300–3000 字） |
 | `profile` | 读取 / 保存用户画像 |
+| `instruction` | 读取 / 保存**系统指令**（常驻系统提示词的长期指令，类似 `soul.md`）与注入开关 |
 | `digest` | 查看全文、手动生成、历史版本 |
 | `memories` | 列出、搜索、编辑、归档、恢复条目 |
 | `backup` | 导出 Markdown；从 Markdown 预览并恢复（只新增，不删除） |
@@ -299,7 +300,7 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 ## 测试
 
 ```bash
-pytest            # 269 项
+pytest            # 278 项
 ```
 
 ## 文档

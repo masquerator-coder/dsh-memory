@@ -11,11 +11,13 @@ import pytest
 
 from memory_system import FactInput, MemoryConfig, MemorySystem
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
+from memory_system.errors import ValidationError
 from memory_system.summary import (
     AUTO_MODE,
     BACKUP_MARKER,
     DEFAULT_LENGTH,
     DIGEST_PROJECT_LABEL_MAX,
+    INSTRUCTION_MAX_CHARS,
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
@@ -117,6 +119,54 @@ def test_profile_is_stored_and_anchored(service: DigestService):
 def test_profile_too_long_is_refused(service: DigestService):
     with pytest.raises(Exception):
         service.set_profile("x" * 200_000)
+
+
+# ── standing instruction ────────────────────────────────────────────────
+
+
+def test_instruction_defaults_to_off_and_empty(service: DigestService):
+    settings = service.settings()
+    # Off by default: the section is resident in every request, so injecting
+    # it has to be a deliberate choice.
+    assert settings.instruction == ""
+    assert settings.instruction_enabled is False
+    assert settings.to_dict()["instruction_max_chars"] == INSTRUCTION_MAX_CHARS
+
+
+def test_instruction_text_and_switch_are_independent(service: DigestService):
+    settings = service.set_instruction("- 总是先给结论", enabled=True)
+    assert settings.instruction == "- 总是先给结论"
+    assert settings.instruction_enabled is True
+
+    # Switching off keeps the text: the page only stops carrying it.
+    settings = service.set_instruction(enabled=False)
+    assert settings.instruction_enabled is False
+    assert settings.instruction == "- 总是先给结论"
+
+    # Turning it back on restores exactly what was written.
+    settings = service.set_instruction(enabled=True)
+    assert settings.instruction_enabled is True
+    assert service.get_instruction() == "- 总是先给结论"
+
+
+def test_instruction_write_leaves_the_switch_alone(service: DigestService):
+    service.set_instruction("old", enabled=True)
+    settings = service.set_instruction("new text")
+    assert settings.instruction == "new text"
+    assert settings.instruction_enabled is True
+
+    # An explicit empty string clears the text; that is not the same as
+    # omitting the argument.
+    assert service.set_instruction("").instruction == ""
+
+
+def test_instruction_is_stripped_and_bounded(service: DigestService):
+    assert service.set_instruction("\n\n  带空白的指令  \n").instruction == "带空白的指令"
+    assert service.set_instruction("x" * INSTRUCTION_MAX_CHARS).instruction == "x" * INSTRUCTION_MAX_CHARS
+    with pytest.raises(ValidationError):
+        service.set_instruction("x" * (INSTRUCTION_MAX_CHARS + 1))
+    # The refused write must not have replaced the stored text.
+    assert service.get_instruction() == "x" * INSTRUCTION_MAX_CHARS
 
 
 # ── digest ──────────────────────────────────────────────────────────────
@@ -789,6 +839,74 @@ def test_bridge_profile_accepts_both_keys(tmp_path: Path):
     assert written["result"]["chars"] > 0
     read = handle({"id": "2", "command": "profile.read", "payload": {"home": home}})
     assert read["result"]["content"] == "# 画像\n- 中文"
+
+
+def test_bridge_instruction_round_trip(tmp_path: Path):
+    home = str(tmp_path / "mem")
+    written = handle(
+        {
+            "id": "1",
+            "command": "instruction.write",
+            "payload": {"home": home, "content": "- 总是中文回答", "enabled": True},
+        }
+    )
+    assert written["ok"], written
+    assert written["result"]["enabled"] is True
+    assert written["result"]["content"] == "- 总是中文回答"
+
+    read = handle({"id": "2", "command": "instruction.read", "payload": {"home": home}})
+    assert read["result"]["content"] == "- 总是中文回答"
+    assert read["result"]["enabled"] is True
+
+
+def test_bridge_instruction_switch_keeps_the_text(tmp_path: Path):
+    """The switch and the text are separate controls on the page."""
+    home = str(tmp_path / "mem")
+    handle(
+        {
+            "id": "1",
+            "command": "instruction.write",
+            "payload": {"home": home, "content": "保留这段", "enabled": True},
+        }
+    )
+    off = handle(
+        {"id": "2", "command": "instruction.write", "payload": {"home": home, "enabled": False}}
+    )
+    assert off["result"]["enabled"] is False
+    assert off["result"]["content"] == "保留这段"
+
+    # An absent `content` means "no change", never "clear" — a switch flip that
+    # wiped the text would be a silent destructive write.
+    read = handle({"id": "3", "command": "instruction.read", "payload": {"home": home}})
+    assert read["result"]["content"] == "保留这段"
+
+
+def test_bridge_instruction_too_long_is_a_client_error(tmp_path: Path):
+    home = str(tmp_path / "mem")
+    reply = handle(
+        {
+            "id": "1",
+            "command": "instruction.write",
+            "payload": {"home": home, "content": "x" * (INSTRUCTION_MAX_CHARS + 1)},
+        }
+    )
+    assert reply["ok"] is False
+    assert reply["error"]["code"] == "validation"
+
+
+def test_bridge_settings_set_carries_the_instruction(tmp_path: Path):
+    """`settings.set` is the page's whole-payload path; it must accept both."""
+    home = str(tmp_path / "mem")
+    reply = handle(
+        {
+            "id": "1",
+            "command": "settings.set",
+            "payload": {"home": home, "instruction": "通过 settings 写入", "instruction_enabled": True},
+        }
+    )
+    assert reply["ok"], reply
+    assert reply["result"]["settings"]["instruction"] == "通过 settings 写入"
+    assert reply["result"]["settings"]["instruction_enabled"] is True
 
 
 def test_serve_survives_a_legacy_console_codepage(tmp_path: Path):

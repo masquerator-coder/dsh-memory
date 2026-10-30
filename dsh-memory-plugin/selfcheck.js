@@ -99,6 +99,22 @@ async function assemble(scenario) {
     logger: { info() {}, warn() {}, error() {} },
   }
 
+  /**
+   * Render every registered section the way `renderPrompt` does.
+   *
+   * Empty text disappears in the real assembly, so a section that renders ''
+   * must be absent from the joined prompt rather than present as a blank line.
+   * @returns {string} the joined prompt sections.
+   */
+  const renderAll = () => {
+    const parts = []
+    for (const text of sections.values()) {
+      const value = typeof text === 'function' ? text({}) : text
+      if (value) parts.push(value)
+    }
+    return parts.join('\n\n')
+  }
+
   const originalCall = BridgeClient.prototype.call
   // Every bridge answer this scenario needs comes from the stub below. The
   // spawn itself is blocked process-wide at the top of this file, so a read
@@ -136,6 +152,7 @@ async function assemble(scenario) {
     if (command === 'memory.list') {
       return { items: payload.state === 'active' ? (scenario.memories ?? []) : [] }
     }
+    if (command === 'instruction.read') return scenario.instruction ?? { content: '', enabled: false }
     return {}
   }
 
@@ -160,13 +177,20 @@ async function assemble(scenario) {
     // Assembly is synchronous and the bridge read resolves off to the side:
     // one pass starts it, the wait lets it land, the next pass renders it.
     const context = { agent: { session: { id: 's1', header: { cwd: CWD } } } }
-    const render = () => sections.get('dsh-memory:anchor')(context)
+    // A scenario that turns the memory anchor off (`systemPromptAnchor: false`)
+    // has no such section, and the rest of the checks still have to run.
+    const render = () => {
+      const text = sections.get('dsh-memory:anchor')
+      return typeof text === 'function' ? text(context) : ''
+    }
     const anchorFirst = render()
     await new Promise((resolve) => setTimeout(resolve, 30))
     const assembled = {
       anchorFirst,
       anchor: render(),
       render,
+      /** The whole rendered system prompt, empty sections dropped. */
+      prompt: renderAll,
       emit,
       request,
       /** Execute one registered tool the way the loop would. */
@@ -440,6 +464,37 @@ console.log('a maintenance tick asks for the due tasks')
     }),
     'the host leaves the task cadence to the Python side',
   )
+}
+
+console.log('the user instruction is injected only when it is switched on')
+{
+  const text = '- 回答先给结论，再展开细节\n- 代码注释用中文'
+  // Switched on and non-empty: the text reaches the prompt verbatim.
+  const on = await assemble({ instruction: { content: text, enabled: true } })
+  check(on.prompt().includes(text), 'an enabled instruction is injected')
+  // Off keeps the text on disk but keeps it out of the prompt: a section that
+  // is present but blank would still be paid for on every request.
+  const off = await assemble({ instruction: { content: text, enabled: false } })
+  check(!off.prompt().includes(text), 'a switched-off instruction is not injected')
+  // Never written: nothing to say, so nothing is carried.
+  const blank = await assemble({ instruction: { content: '', enabled: true } })
+  check(!blank.prompt().includes('回答先给结论'), 'an empty instruction renders nothing')
+}
+{
+  // The user's text is literal: a `{{…}}` group in it must not be expanded or
+  // fail assembly, which is why the section sets `interpolate: false`.
+  const text = '用 {{cwd}} 作占位符的写法保持原样'
+  const { prompt } = await assemble({ instruction: { content: text, enabled: true } })
+  check(prompt().includes('{{cwd}}'), 'braces in the instruction survive verbatim')
+}
+{
+  // The instruction is the user's own text, not a memory fact: turning the
+  // memory anchor off must not take the instruction with it.
+  const { prompt } = await assemble({
+    config: { systemPromptAnchor: false },
+    instruction: { content: '独立于记忆锚点的指令', enabled: true },
+  })
+  check(prompt().includes('独立于记忆锚点的指令'), 'the instruction survives systemPromptAnchor: false')
 }
 
 if (failures > 0) {

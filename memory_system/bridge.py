@@ -471,6 +471,15 @@ def cmd_settings_set(memory: MemorySystem, payload: dict[str, Any]) -> dict[str,
         settings = service.set_mode(payload["mode"])
     if "profile" in payload and payload["profile"] is not None:
         settings = service.set_profile(str(payload["profile"]))
+    instruction = payload.get("instruction")
+    instruction_enabled = payload.get("instruction_enabled")
+    if instruction is not None or instruction_enabled is not None:
+        # `instruction` and `instruction_enabled` are independent, so a caller
+        # may flip the switch without resending the text.
+        settings = service.set_instruction(
+            None if instruction is None else str(instruction),
+            enabled=None if instruction_enabled is None else _bool(instruction_enabled),
+        )
     return _settings_payload(settings)
 
 
@@ -511,6 +520,42 @@ def cmd_profile_write(memory: MemorySystem, payload: dict[str, Any]) -> dict[str
         "content": settings.profile,
         "updated_at": settings.profile_updated_at,
         "chars": len(settings.profile),
+    }
+
+
+# ── standing instruction ────────────────────────────────────────────────
+
+
+@command("instruction.read")
+def cmd_instruction_read(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    settings = DigestService(memory).settings()
+    return {
+        "content": settings.instruction,
+        "enabled": settings.instruction_enabled,
+        "updated_at": settings.instruction_updated_at,
+        "max_chars": settings.to_dict()["instruction_max_chars"],
+        "chars": len(settings.instruction),
+    }
+
+
+@command("instruction.write")
+def cmd_instruction_write(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    service = DigestService(memory)
+    # Unlike `profile.write`, an absent key is "no change" rather than "clear":
+    # the switch and the text are two controls, and flipping one must not
+    # silently wipe the other. Removing the text is an explicit ``""``.
+    raw = payload["content"] if "content" in payload else payload.get("instruction")
+    enabled = payload.get("enabled")
+    settings = service.set_instruction(
+        None if raw is None else str(raw),
+        enabled=None if enabled is None else _bool(enabled),
+    )
+    return {
+        "content": settings.instruction,
+        "enabled": settings.instruction_enabled,
+        "updated_at": settings.instruction_updated_at,
+        "chars": len(settings.instruction),
+        "max_chars": settings.to_dict()["instruction_max_chars"],
     }
 
 

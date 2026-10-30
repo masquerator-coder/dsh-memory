@@ -59,6 +59,10 @@ LENGTH_MIN = LENGTH_PRESETS[0]
 LENGTH_MAX = LENGTH_PRESETS[-1]
 DEFAULT_LENGTH = 1_000
 PROFILE_MAX_CHARS = 100_000
+# The standing instruction rides in every request as a system-prompt section,
+# so it is paid for on every turn. 4000 characters fits a real "soul.md"
+# without letting one paste quietly multiply the resident prefix cost.
+INSTRUCTION_MAX_CHARS = 4_000
 # Ceiling for one memory's summary text, shared by the editor and the restore
 # path so a backup written by another host still round-trips.
 SUMMARY_MAX_CHARS = 8_000
@@ -219,6 +223,13 @@ META_MODE = "memory.summary.auto"
 META_UPDATED = "memory.summary.updated_at"
 META_PROFILE = "memory.user_profile"
 META_PROFILE_UPDATED = "memory.user_profile.updated_at"
+# The user-authored standing instruction (a "soul.md" the user maintains from
+# the settings page). Two keys, not one: the text and whether it is injected
+# are independent, so switching the section off must not destroy what was
+# written — the page only stops carrying it into the prompt.
+META_INSTRUCTION = "memory.instruction"
+META_INSTRUCTION_UPDATED = "memory.instruction.updated_at"
+META_INSTRUCTION_ENABLED = "memory.instruction.enabled"
 
 
 @dataclass(slots=True)
@@ -230,6 +241,9 @@ class SummarySettings:
     updated_at: str | None = None
     profile: str = ""
     profile_updated_at: str | None = None
+    instruction: str = ""
+    instruction_updated_at: str | None = None
+    instruction_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +256,10 @@ class SummarySettings:
             "profile": self.profile,
             "profile_updated_at": self.profile_updated_at,
             "profile_max_chars": PROFILE_MAX_CHARS,
+            "instruction": self.instruction,
+            "instruction_updated_at": self.instruction_updated_at,
+            "instruction_enabled": self.instruction_enabled,
+            "instruction_max_chars": INSTRUCTION_MAX_CHARS,
         }
 
 
@@ -265,6 +283,11 @@ def load_settings(store: Store) -> SummarySettings:
         updated_at=store.get_meta(META_UPDATED),
         profile=store.get_meta(META_PROFILE) or "",
         profile_updated_at=store.get_meta(META_PROFILE_UPDATED),
+        instruction=store.get_meta(META_INSTRUCTION) or "",
+        instruction_updated_at=store.get_meta(META_INSTRUCTION_UPDATED),
+        # Absent means "never switched on", which is off: the section is
+        # resident in every request, so it must be an explicit choice.
+        instruction_enabled=(store.get_meta(META_INSTRUCTION_ENABLED) or "") == "1",
     )
 
 
@@ -583,6 +606,43 @@ class DigestService:
         with self.store.transaction():
             self.store.set_meta(META_PROFILE, text)
             self.store.set_meta(META_PROFILE_UPDATED, _iso_now())
+        return self.settings()
+
+    # ── standing instruction ───────────────────────────────────────────
+    def get_instruction(self) -> str:
+        return self.store.get_meta(META_INSTRUCTION) or ""
+
+    def instruction_enabled(self) -> bool:
+        return (self.store.get_meta(META_INSTRUCTION_ENABLED) or "") == "1"
+
+    def set_instruction(
+        self,
+        text: str | None = None,
+        *,
+        enabled: bool | None = None,
+    ) -> SummarySettings:
+        """Store the user's standing instruction and/or its on-off switch.
+
+        The two are independent on purpose: switching the section off leaves
+        the text on disk, so turning it back on restores exactly what the user
+        wrote instead of an empty box they have to retype. ``None`` means
+        "leave this field alone", which is what the page sends when it only
+        flips the switch.
+        """
+        with self.store.transaction():
+            if text is not None:
+                # Surrounding whitespace is dropped because the section is
+                # rendered as-is: leading blank lines would shift the prompt
+                # prefix on a keystroke without changing what the model reads.
+                text = str(text).strip()
+                if len(text) > INSTRUCTION_MAX_CHARS:
+                    raise ValidationError(
+                        f"instruction is {len(text)} chars; limit is {INSTRUCTION_MAX_CHARS}"
+                    )
+                self.store.set_meta(META_INSTRUCTION, text)
+                self.store.set_meta(META_INSTRUCTION_UPDATED, _iso_now())
+            if enabled is not None:
+                self.store.set_meta(META_INSTRUCTION_ENABLED, "1" if enabled else "0")
         return self.settings()
 
     # ── plans ──────────────────────────────────────────────────────────
