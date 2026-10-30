@@ -2,7 +2,7 @@
   "name": "dsh-memory-plugin",
   "version": "1.0.0",
   "private": true,
-  "description": "DSH 记忆插件：把 memory_system 的记忆库接入系统提示词、设置页与会话采集。",
+  "description": "DSH 记忆插件：把 memory_system 的长期记忆接入 DSH —— 系统提示词里的记忆锚点、会话采集，以及设置页里的摘要生成、画像与记忆编辑。",
   "type": "module",
   "exports": {
     ".": "./index.js",
