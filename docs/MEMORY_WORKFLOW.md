@@ -53,7 +53,7 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
   `（还没有可用的记忆摘要。）`
 - 计数行**只含摘要规模、时间、用户画像规模**，不含摘要正文（`summary.py:807-826`）；正文由 `{{recent_work}}` 单独提供：当前项目最新 `memory.list` 条目，最多 8 条、合计 ≤400 字（`RECENT_CHARS` / `RECENT_LIMIT`），超出时尾注指向 `memory_search`，没有记忆的项目整节省略。
 
-锚点里的写入/读取职责说明只写工具定义装不下的部分——写入分四件事（不会自动保存、遇到什么值得记、一条一件事、什么不该存），召回分五件事（先用 `memory_recall`、换说法用 `memory_search`、摘要与 `DSH_MEMORY.md` 只记工程动作、画像只读、`memory_forget` 是软删除）；工具名与参数不在此重复（`index.js:1378-1402` `ANCHOR_HEADER`）。技能的门槛、反例与存储位置现在只写在 `skill_create` / `skill_retire` 的工具描述里，提示词不再重复。
+锚点里的写入/读取职责说明只写工具定义装不下的部分——写入分四件事（不会自动保存、遇到什么值得记、一条一件事、什么不该存），召回分五件事（先用 `memory_recall`、换说法用 `memory_search`、摘要与 `DSH_MEMORY.md` 只记工程动作、画像只读、`memory_forget` 是软删除）；工具名与参数不在此重复（`index.js:1568` `ANCHOR_HEADER`）。技能的门槛、反例与存储位置写在 `skill_create` / `skill_retire` 的工具描述里，但锚点仍保留**一行无条件指引**（`**技能固化**`：可复用任务→先 `skill_list`→无同类则 `skill_create` 存本项目；只存已验证的）：早先把技能规则完全留在 schema 里时，模型每回合只被提醒写记忆、从不被提醒固化技能，项目连续多天零技能创建、全局技能零创建；这一行是使触发率从 0 变非零的最小代价。
 
 #### （2）第一次工具调用才注册项目
 
@@ -326,7 +326,13 @@ score = similarity * (0.2 + 0.8 * R)
 3. **不淘汰**：active 技能达到 `DEFAULT_LIMIT`（24）时
    拒绝写入，而不是悄悄退役一个；
 4. **作用域**：默认 `scope=project`；写全局必须显式 `scope=global`。桥接层对 `org` / `sys` 直接报
-   `bad_request`，模型写入全局时还必须带 `user_approved=true`——模型必须先询问用户，得到明确同意后才能带这个标记。
+   `bad_request`。全局写入的同意由**宿主签字**，不再由模型自述：`skill_create` / `skill_retire`
+   的模型可见参数里没有任何"我同意了"字段，模型必须先调用 `ask_user_question`
+   （问题 id `dsh-memory:skill-scope`，选项 id `global`），宿主在 `session/event` 的 `tool/result`
+   里读到这次真实答复才给桥接传 `host_approved=true`；授权一次性、10 分钟内有效，写完即作废，
+   超时（`pending`）或报错的答复不算同意。`bridge.py` 只认 `host_approved`——它代表**宿主已取得
+   用户同意**，是存储层对"模型直接调桥接"的底线；直接调桥接的 CLI/脚本可自行置位（人跑命令
+   本身就是同意的主体）。模型侧的门在 `dsh-memory-plugin/tools.js`。
 
 写盘是原子的：先写 `SKILL.md.tmp`，再 `os.replace`；失败会清掉刚创建的空目录，不留半成品。
 每次成功创建还会写一条 L2 审计记录（`content_key=skill:<scope>:<name>`）。
@@ -339,7 +345,7 @@ score = similarity * (0.2 + 0.8 * R)
   同样是文件，没有 Hot/Warm/Cold 分层。
 - **退役**：把目录移进对应根下的 `.retired/<name>/`（DSH 的一层扫描看不见它，文件还在，挪回来就恢复）。
   项目技能退到 `<项目根>/.agents/skills/.retired`，全局技能退到 `~/.agents/skills/.retired`；
-  退役全局技能同样需要 `user_approved=true`。
+  退役全局技能同样需要用户同意（走同一个 `dsh-memory:skill-scope` 问题）。
 - **执行证据**：追加到 `<memoryHome>/l4_runs/<项目>/<name>.jsonl`（**不进仓库**，
   否则 `git status` 会被日志污染）；全局技能记在保留作用域 `_global` 下。`skill_run` 返回滚动窗口内的成功率。
 - **旧数据迁移**：`migrate.export_project_skills` 把库里遗留的 project 行写成 bundle，
@@ -432,7 +438,8 @@ python -m memory_system memory.recall '{\"home\":\"C:\\\\temp\\\\mem\",\"cwd\":\
    `skill.index` / `skill.list` / `skill.create` / `skill.get` / `skill.run` / `skill.retire`
    接入的是：**项目技能写进 `<项目根>/.agents/skills/<name>/SKILL.md`**（DSH 自己的
    `skill-filesystem` 提供者扫描它、模型用原生 `skill` 工具加载），**全局技能写进 `~/.agents/skills`**，
-   由 DSH 技能目录列出（`available_skills`），创建/退役全局技能要求用户明确同意（`user_approved=true`）。
+   由 DSH 技能目录列出（`available_skills`），创建/退役全局技能要求用户明确同意：宿主先从
+   `ask_user_question`（问题 id `dsh-memory:skill-scope`）取得真实答复，才给桥接传 `host_approved=true`。
    桥接层不再读写 `l4_skills` 的全局行。轨迹归纳（`prepare_turn` / `capture_trajectory`）、备份归档
    （`SkillArchive`）与晋升仍未接入；`memory_system/adapters/dsh.py` 仍是接口桩。
    `promotions` 的两个扫描器读的是库里的 project 行，因此模型写入文件后通常为空

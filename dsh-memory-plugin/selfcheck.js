@@ -230,6 +230,114 @@ console.log('a cold anchor does not claim the store is empty')
   check(!anchorFirst.includes('还没有全局摘要'), 'an unread anchor does not report a missing digest')
 }
 
+console.log('the anchor still tells the model to fixate a reusable procedure')
+{
+  // The skill rules live in the tool schema, but a schema-only rule produced
+  // days of zero skill creation: the anchor reminded the model to write
+  // memories every turn and never to save a verified procedure. This line is
+  // the only unconditional trigger, so losing it silently is the regression.
+  const { anchorFirst } = await assemble({})
+  check(anchorFirst.includes('**技能固化**'), 'the anchor carries a skill section')
+  check(anchorFirst.includes('`skill_list`'), 'it names skill_list as the first move')
+  check(anchorFirst.includes('`skill_create`'), 'it names skill_create as the second')
+  check(anchorFirst.includes('一次性任务不保存'), 'it keeps the one-off exception')
+}
+
+console.log('a global skill needs an answer the host saw, not a flag the model set')
+{
+  const asks = []
+  const callArgs = (args) => ({
+    name: 'locate-failing-test',
+    title: '定位失败的测试',
+    description: '找出失败的测试并定位原因',
+    when_to_use: '测试报告失败时',
+    steps: [{ action: '跑一遍失败用例' }],
+    ...args,
+  })
+
+  // No question was ever answered, so a global write is refused even though the
+  // model could pass anything it liked in the arguments.
+  const first = await assemble({
+    run: async ({ runTool }) => {
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global' })))
+    },
+  })
+  check(first.anchorFirst.includes('**技能固化**'), 'the refused scenario still assembles')
+  check(
+    asks[0]?.text.includes('未创建'),
+    'a global create without a user answer is refused',
+  )
+  check(
+    asks[0]?.text.includes('dsh-memory:skill-scope'),
+    'the refusal names the question id to ask',
+  )
+
+  // An actual answer to that question lets the write through, and only once.
+  const granted = await assemble({
+    run: async ({ runTool, emit }) => {
+      emit({
+        type: 'tool/result',
+        data: {
+          message: {
+            toolCallId: 'call-1',
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  answers: [{ id: 'dsh-memory:skill-scope', selected: ['global'] }],
+                }),
+              },
+            ],
+          },
+        },
+      })
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global' })))
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global', name: 'second-skill' })))
+    },
+  })
+  check(granted.anchorFirst.includes('**技能固化**'), 'the granted scenario still assembles')
+  check(!asks[1]?.text.includes('未创建'), 'the answered question lets the global write through')
+  check(asks[2]?.text.includes('未创建'), 'the grant is spent after one write')
+
+  // An explicit "project only" answer never grants global scope.
+  const declined = await assemble({
+    run: async ({ runTool, emit }) => {
+      emit({
+        type: 'tool/result',
+        data: {
+          message: {
+            toolCallId: 'call-2',
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  answers: [{ id: 'dsh-memory:skill-scope', selected: ['project'] }],
+                }),
+              },
+            ],
+          },
+        },
+      })
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global' })))
+    },
+  })
+  check(declined.anchorFirst.includes('**技能固化**'), 'the declined scenario assembles')
+  check(asks[3]?.text.includes('未创建'), 'choosing the project option does not grant global')
+
+  // A pending (timed-out) ask carries no answers; silence is not consent.
+  const pending = await assemble({
+    run: async ({ runTool, emit }) => {
+      emit({
+        type: 'tool/result',
+        data: { message: { toolCallId: 'call-3', content: [{ type: 'text', text: '{"pending":true}' }] } },
+      })
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global' })))
+    },
+  })
+  check(pending.anchorFirst.includes('**技能固化**'), 'the pending scenario assembles')
+  check(asks[4]?.text.includes('未创建'), 'a timed-out ask grants nothing')
+}
+
 console.log('recent work is bounded and conditional')
 {
   const memories = Array.from({ length: 8 }, (_, i) => ({

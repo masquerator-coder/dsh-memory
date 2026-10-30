@@ -128,7 +128,7 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | `memory_profile_read` | 读取用户自己维护的画像 |
 | `memory_digest_read` | 读取全局摘要全文 |
 | `memory_digest_generate` | 调用一次模型，重新生成全局摘要 |
-| `skill_create` | 把一个验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`（必须先问用户，同意后带 `user_approved=true`） |
+| `skill_create` | 把一个验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`——全局必须先用 `ask_user_question`（问题 id `dsh-memory:skill-scope`）取得用户答复，宿主读到答复才放行 |
 | `skill_list` | 列出本项目可见的技能（磁盘上的项目技能 + `~/.agents/skills` 里的全局技能） |
 | `skill_get` | 读取一个技能的完整定义（项目技能与全局技能都直接返回 `SKILL.md` 正文） |
 | `skill_run` | 记录一次技能执行结果（写入 `<memoryHome>/l4_runs` 台账与成功率） |
@@ -153,7 +153,7 @@ score = similarity × (0.2 + 0.8 × R)
 **L4 程序性技能。** 项目技能和全局技能都是文件，区别只在目录：
 
 - **项目技能 = 仓库里的文件**：`<项目根>/.agents/skills/<name>/SKILL.md`。这是 DSH 自己的技能目录（`project-agents`，rank 200；`.dsh/skills` 是 rank 100），所以**模型用原生 `skill` 工具加载它，人和别的工具读同一个文件**，技能随仓库进版本库。
-- **全局技能 = 用户级文件**：`~/.agents/skills/<name>/SKILL.md`（可用 `DSH_MEMORY_GLOBAL_SKILLS` 覆盖，测试用）。所有项目共享，DSH 的原生技能目录同样会扫描它。创建全局技能是**用户决策**：模型必须先问用户，得到明确同意后才带 `user_approved=true` 调 `skill_create scope=global`；`org` / `sys` 两个数据库作用域已移除。
+- **全局技能 = 用户级文件**：`~/.agents/skills/<name>/SKILL.md`（可用 `DSH_MEMORY_GLOBAL_SKILLS` 覆盖，测试用）。所有项目共享，DSH 的原生技能目录同样会扫描它。创建全局技能是**用户决策**：模型必须先调用 `ask_user_question`（问题 id `dsh-memory:skill-scope`、选项 id `global`），宿主从会话的 `tool/result` 里读到这次真实答复才置 `host_approved` 放行；这个授权一次性、10 分钟内有效，模型无法自我声明。`org` / `sys` 两个数据库作用域已移除。
 
 无论项目还是全局，成功创建后都会在记忆库留**一条 L2 记录**（`content_key=skill:<scope>:<name>`），回答“什么时候、从哪个项目存了这个技能”；技能定义本身只存在于 `SKILL.md`，库里不再有 `l4_skills` 行。会话里能做的是创建（`skill_create`）、查看（`skill_list` / `skill_get`）、记录执行（`skill_run`）、退役（`skill_retire`）。
 
@@ -179,7 +179,7 @@ score = similarity × (0.2 + 0.8 × R)
 | 名字合法 | `name` 必须是 `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`——DSH 对别的拼写是**静默丢弃**，所以在写入前就报错 |
 | 不覆盖、不淘汰 | 同名目录已存在直接拒绝（先 `skill_get` 看一眼，确需替换先 `skill_retire`）；active 技能达到上限（默认 24）拒绝写入，而不是悄悄退役一个 |
 
-全局技能多一道同意护栏：模型创建或退役公共技能时，桥接要求 `user_approved=true`；模型必须先询问用户，得到明确同意后才能带上这个标记。
+全局技能多一道同意护栏：模型创建或退役公共技能时，宿主必须先从 `ask_user_question` 拿到用户答复，才会给桥接传 `host_approved=true`；桥接只认这个标记，它代表**宿主已取得用户同意**，不代表模型自己声称同意。直接调桥接的 CLI/脚本可以自己置位（人跑命令本身就是同意的主体）。
 
 写入是原子的（`SKILL.md.tmp` → `os.replace`），失败不留半成品目录。执行记录**不进仓库**：追加到 `<memoryHome>/l4_runs/<项目>/<name>.jsonl`，否则 `git status` 会被日志污染。
 

@@ -133,6 +133,25 @@ function sessionIdOf(context) {
   return context?.agent?.session?.id
 }
 
+/**
+ * Question id the model must use when asking the user whether a skill may be
+ * written globally. The host records the answer itself, so the model cannot
+ * assert consent on its own.
+ */
+export const SKILL_SCOPE_QUESTION_ID = 'dsh-memory:skill-scope'
+
+/** Option id inside {@link SKILL_SCOPE_QUESTION_ID} that grants global scope. */
+export const SKILL_SCOPE_GLOBAL_ID = 'global'
+
+/**
+ * How long one global-skill approval stays usable, in milliseconds.
+ *
+ * The approval is answered immediately before the write in practice; the TTL
+ * only stops a stale grant from authorising an unrelated skill much later in a
+ * long session.
+ */
+const SKILL_GRANT_TTL_MS = 10 * 60_000
+
 /** Text of a message's content blocks, ignoring non-text blocks. */
 function messageText(message) {
   const blocks = Array.isArray(message?.content) ? message.content : []
@@ -141,6 +160,52 @@ function messageText(message) {
     .map((block) => block.text)
     .join('\n')
     .trim()
+}
+
+/**
+ * Answer ids of one `ask_user_question` result, or null when the text is not
+ * an answer batch.
+ *
+ * The tool returns `{"answers":[{"id":"...","selected":["..."],"custom"?:"..."}]}`.
+ * `pending` payloads (timed-out asks) carry no `answers` array and must not
+ * count as consent.
+ * @param {string} text - the tool result text.
+ * @returns {Array<{id: string, selected: string[], custom?: string}> | null}
+ */
+function parseAnswers(text) {
+  const start = String(text ?? '').indexOf('{')
+  const end = String(text ?? '').lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  let parsed
+  try {
+    parsed = JSON.parse(String(text).slice(start, end + 1))
+  } catch {
+    return null
+  }
+  const answers = parsed?.answers
+  if (!Array.isArray(answers)) return null
+  return answers
+    .filter((answer) => answer && typeof answer.id === 'string')
+    .map((answer) => ({
+      id: answer.id,
+      selected: Array.isArray(answer.selected) ? answer.selected.map(String) : [],
+      ...(typeof answer.custom === 'string' ? { custom: answer.custom } : {}),
+    }))
+}
+
+/**
+ * Whether one answer to {@link SKILL_SCOPE_QUESTION_ID} says "global".
+ *
+ * Both a selected option and a typed custom answer are honoured, and the match
+ * is on the option id rather than on prose so a different locale or wording
+ * cannot flip the meaning.
+ * @param {{selected: string[], custom?: string}} answer - one answer.
+ * @returns {boolean} true only for an explicit global choice.
+ */
+function answerSaysGlobal(answer) {
+  const selected = Array.isArray(answer?.selected) ? answer.selected : []
+  if (selected.some((value) => String(value).trim() === SKILL_SCOPE_GLOBAL_ID)) return true
+  return String(answer?.custom ?? '').includes(SKILL_SCOPE_GLOBAL_ID)
 }
 
 /**
@@ -374,6 +439,69 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Sessions in which the user has just approved one global skill write.
+   *
+   * A global skill is visible to every project on the machine, so the grant
+   * must not come from the model: the old design let the model pass a boolean
+   * asserting its own permission, which only asked it to be honest. The host now
+   * reads the answer out of the session's own `tool/result` event and signs the
+   * bridge call with `host_approved`, and the grant covers exactly one write
+   * before it is spent — the next global write asks again.
+   *
+   * @type {Map<string, {at: number, skill: string | null}>}
+   */
+  const skillScopeGrants = new Map()
+
+  /**
+   * Record the user's answer to a skill-scope question, if this result is one.
+   *
+   * Only a real `ask_user_question` result counts. A `pending` payload (the
+   * ask timed out) and an errored call carry no answers, so they grant
+   * nothing: silence is not consent.
+   * @param {string} sessionId - the session the result belongs to.
+   * @param {any} event - the `tool/result` session event.
+   */
+  function noteSkillScopeAnswer(sessionId, event) {
+    if (!sessionId) return
+    const data = event?.data
+    // An errored or aborted ask never expressed a choice.
+    if (!data || data.error !== undefined) return
+    const message = data.message
+    if (!message || message.isError === true) return
+    const answers = parseAnswers(messageText(message))
+    if (!answers) return
+    const answer = answers.find((item) => item.id === SKILL_SCOPE_QUESTION_ID)
+    if (!answer) return
+    if (answerSaysGlobal(answer)) {
+      skillScopeGrants.set(sessionId, { at: Date.now(), skill: null })
+    } else {
+      // An explicit "project only" answer also clears a stale grant.
+      skillScopeGrants.delete(sessionId)
+    }
+  }
+
+  /**
+   * Spend this session's global-skill grant, if one is live.
+   *
+   * A grant is single-use and short-lived: it must have been given inside this
+   * session and be the most recent answer, so an approval from an hour ago
+   * cannot silently authorise a second, unrelated skill.
+   * @param {string} sessionId - the session attempting a global write.
+   * @returns {boolean} true when the write may proceed.
+   */
+  function takeSkillScopeGrant(sessionId) {
+    if (!sessionId) return false
+    const grant = skillScopeGrants.get(sessionId)
+    if (!grant) return false
+    if (Date.now() - grant.at > SKILL_GRANT_TTL_MS) {
+      skillScopeGrants.delete(sessionId)
+      return false
+    }
+    skillScopeGrants.delete(sessionId)
+    return true
+  }
+
+  /**
    * The last session id this process saw.
    *
    * Host-side model calls (digest generation, the session-end review) happen
@@ -421,11 +549,13 @@ export function apply(ctx, rawConfig) {
       bumpStep(session?.id)
       return
     }
+    if (type === 'tool/result') noteSkillScopeAnswer(session?.id, event)
     if (type !== 'turn/end') return
     if (config.autoSummary) scheduleAutoSummary(session)
   })
 
   ctx.effect(() => () => stepsSinceWrite.clear(), 'dsh-memory.heartbeat-state')
+  ctx.effect(() => () => skillScopeGrants.clear(), 'dsh-memory.skill-scope-state')
 
   /**
    * Last-chance memory check when a session goes away.
@@ -823,7 +953,17 @@ export function apply(ctx, rawConfig) {
 
   // ── tools ─────────────────────────────────────────────────────────────
 
-  for (const definition of buildTools({ call, projectFor, generateDigest })) {
+  for (const definition of buildTools({
+    call,
+    projectFor,
+    generateDigest,
+    // The global-skill gate lives here, not in `tools.js`: only the host sees
+    // the session's `tool/result` events, and only the host can tell a real
+    // user answer from a boolean the model filled in itself.
+    takeSkillScopeGrant,
+    skillScopeQuestionId: SKILL_SCOPE_QUESTION_ID,
+    skillScopeGlobalId: SKILL_SCOPE_GLOBAL_ID,
+  })) {
     // The heartbeat only needs to know that the model *made* a recording
     // attempt, so wrapping here keeps `tools.js` a pure schema+execute module.
     // A duplicate rejected by the memory store still counts: the model did its
@@ -1559,6 +1699,11 @@ const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_g
  * repeating names and parameters would only cost tokens and drift. What it
  * carries is what no single tool description can hold — the order the tools
  * are meant to be used in, and the edge each one has.
+ *
+ * The skill line is the deliberate exception. With the skill rules living only
+ * in the `skill_create` schema, projects went days with zero skills created:
+ * the model was reminded every turn to write memories, never to固化 a verified
+ * procedure. One unconditional line here is cheap next to that.
  */
 const ANCHOR_HEADER = [
   '## 记忆',
@@ -1584,6 +1729,11 @@ const ANCHOR_HEADER = [
   '- 摘要与 `DSH_MEMORY.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
   '- 用户画像只能读，由用户自己在设置页维护。',
   '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"。',
+  '',
+  '**技能固化**：',
+  '',
+  '- 完成可复用任务（同一套步骤后续还会复用）后，先用 `skill_list` 检查是否有同类技能；如无，再用 `skill_create` 保存。仅保存已跑通验证的，一次性任务不保存。',
+  '- 选级别：只对这个项目成立的做法存**项目级**（默认，`scope="project"`）；跨项目通用的做法（如 Windows 沙箱踩坑、通用构建流程）才考虑**全局**（`scope="global"`）。全局技能对本机所有项目可见，必须先用 `ask_user_question` 征求用户同意——问题 id 用 `dsh-memory:skill-scope`、选项 id 用 `global`，宿主只认这次真实答复，没有它全局写入会被直接拒绝；用户不选全局就存成本项目技能，不要重复追问。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */

@@ -17,7 +17,7 @@ Markdown 备份与项目根摘要文件全部由 `memory_system` 实现，插件
 | --- | --- |
 | `memory_recall` / `memory_search` / `memory_add` / `memory_forget` | 记忆的读、写、归档 |
 | `memory_profile_read` / `memory_digest_read` / `memory_digest_generate` | 画像与全局摘要 |
-| `skill_create` | 把验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`（必须先问用户，同意后带 `user_approved=true`） |
+| `skill_create` | 把验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`——全局必须先用 `ask_user_question`（问题 id `dsh-memory:skill-scope`、选项 id `global`）取得用户答复，宿主读到该答复才放行；`user_approved` 已从模型可见参数中移除，模型无法自我声明同意 |
 | `skill_list` / `skill_get` | 列出 / 读取技能（项目技能与全局技能都在磁盘，`skill_list` 合并两处） |
 | `skill_run` / `skill_retire` | 记录执行结果（写 `<memoryHome>/l4_runs` 台账）/ 退役（目录移进 `.retired/`；退役全局技能同样需要用户同意） |
 

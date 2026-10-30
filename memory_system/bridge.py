@@ -800,9 +800,14 @@ def cmd_memory_capture(memory: MemorySystem, payload: dict[str, Any]) -> dict[st
 # longer injects this index into the system prompt; it remains a read-only
 # bridge view for clients that want the one-line catalog.
 #
-# Creating a global skill is a user decision. The model must ask first and
-# retry with ``user_approved=true``; the payload flag is the only thing that
-# binds the write to an actual "yes".
+# Creating a global skill is a user decision. The host is what obtains that
+# decision: it asks the user through ``ask_user_question`` and reads the real
+# answer out of the session before it sets ``host_approved``. The flag below
+# therefore attests "the host signed off", not "the user said yes" — this layer
+# cannot see the conversation, so trusting the model's own boolean here would be
+# trusting the party asking for permission. A direct bridge caller (CLI, script)
+# sets the flag itself, which is intended: a human running the command is the
+# user whose consent it stands for.
 
 GLOBAL_SCOPE = "global"
 
@@ -957,9 +962,17 @@ def cmd_skill_list(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, A
 def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     """Write a skill bundle: project-local by default, global on request.
 
-    Global skills need ``user_approved=true``. That flag is not a formality:
-    a global skill is visible to every project on the machine, so the model
-    must ask the user first and pass the flag only after an explicit yes.
+    Global skills need ``host_approved=true``. A global skill is visible to
+    every project on the machine, so the write is only allowed when the host has
+    obtained the user's consent. The host is the only party that can: it asks
+    through ``ask_user_question`` (question id ``dsh-memory:skill-scope``) and
+    reads the real answer out of the session's ``tool/result`` event.
+
+    Note the trust boundary: ``host_approved`` attests that the *host* signed
+    off, not that the user said yes. This layer never sees the conversation, so
+    the flag is a floor against a model calling the bridge directly, while the
+    model-facing gate — a single-use, short-lived grant the model cannot forge —
+    lives in ``dsh-memory-plugin/tools.js``.
     """
     project, root = _skill_scope(payload)
     memory.ensure_project(project, root_path=str(root))
@@ -979,12 +992,13 @@ def cmd_skill_create(memory: MemorySystem, payload: dict[str, Any]) -> dict[str,
     if (
         scope == GLOBAL_SCOPE
         and _skill_actor(payload) == "model"
-        and payload.get("user_approved") is not True
+        and payload.get("host_approved") is not True
     ):
         raise BridgeError(
             "bad_request",
-            "创建公共技能需要用户明确同意：先询问用户是否要保存为公共技能，"
-            "得到同意后再带 user_approved=true 重试；不要自行假定同意。",
+            "创建公共技能需要用户明确同意：宿主必须先用 ask_user_question"
+            "（问题 id dsh-memory:skill-scope）取得用户答复并置 host_approved=true；"
+            "模型不能自行假定同意。",
         )
     limit = payload.get("max_active")
     target_root = _global_root() if scope == GLOBAL_SCOPE else project_skills.skill_root(root)
@@ -1102,11 +1116,12 @@ def cmd_skill_retire(memory: MemorySystem, payload: dict[str, Any]) -> dict[str,
     if (
         scope == GLOBAL_SCOPE
         and _skill_actor(payload) == "model"
-        and payload.get("user_approved") is not True
+        and payload.get("host_approved") is not True
     ):
         raise BridgeError(
             "bad_request",
-            "退役公共技能需要用户明确同意：先询问用户，得到同意后再带 user_approved=true 重试。",
+            "退役公共技能需要用户明确同意：宿主必须先用 ask_user_question"
+            "（问题 id dsh-memory:skill-scope）取得用户答复并置 host_approved=true。",
         )
     target_root = _global_root() if scope == GLOBAL_SCOPE else project_skills.skill_root(root)
     retired = project_skills.retire_at(target_root, bundle.name, scope=scope)

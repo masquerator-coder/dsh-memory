@@ -238,7 +238,7 @@ def test_global_create_writes_the_user_skill_root(home: str, repo: str):
         definition=DEFINITION,
         name=NAME,
         scope="global",
-        user_approved=True,
+        host_approved=True,
     )
     assert created["scope"] == "global"
     skill = created["skill"]
@@ -311,8 +311,8 @@ def test_model_cannot_retire_a_global_skill_without_approval(home: str, repo: st
     error = fail(home, repo, "skill.retire", skill="org-rule", model_authored=True)
     assert error["code"] == "bad_request"
     assert "需要用户明确同意" in error["message"]
-    # The user's own call (or a model call after the "yes") still goes through.
+    # The host's signed call (or the user's own) still goes through.
     retired = call(
-        home, repo, "skill.retire", skill="org-rule", model_authored=True, user_approved=True
+        home, repo, "skill.retire", skill="org-rule", model_authored=True, host_approved=True
     )
     assert retired["scope"] == "global" and retired["skill"]["status"] == "retired"

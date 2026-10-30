@@ -156,7 +156,7 @@ promotions.propose() -> list[Promotion]
 
 **匹配打分**：`0.4·intent + 0.3·prereq + 0.2·semantic + 0.1·success`。前置不满足（工具不可用）时分数乘 0.45 —— 技能必须**可执行**才有资格被推荐。
 
-**作用域**：记忆库里的技能行只用于 `project`（程序化 API）；模型/桥接路径的项目技能与全局技能都是 `.agents/skills` 文件，全局文件在 `~/.agents/skills`。`SkillRegistry.create` 拒绝新的 `org` / `sys` 写入，桥接层也不读写全局 `l4_skills` 行；旧行只保留给迁移。创建与退役全局技能都需要用户明确同意（`user_approved=true`）。
+**作用域**：记忆库里的技能行只用于 `project`（程序化 API）；模型/桥接路径的项目技能与全局技能都是 `.agents/skills` 文件，全局文件在 `~/.agents/skills`。`SkillRegistry.create` 拒绝新的 `org` / `sys` 写入，桥接层也不读写全局 `l4_skills` 行；旧行只保留给迁移。创建与退役全局技能都需要用户明确同意：宿主先从 `ask_user_question`（问题 id `dsh-memory:skill-scope`）取得真实答复，才给桥接传 `host_approved=true`；该标记由宿主签字，模型无法自我声明。
 
 **成熟度 ≠ 运行状态**：运行状态是 `candidate → active → retired`；"mature" 只表示轨迹证据满足五个条件（≥3 次成功、≥2 个会话、步骤一致性 ≥0.6、有前置条件、非单步）。步骤一致性在**同一 signature 的全部变体之间**计算（组内取众数 variant 作代表键）—— 变体是单条轨迹精确工具序列的哈希，按它分组等于每组与自身比较，不允许失败。成熟的轨迹变成 `candidate` 技能，**必须经用户审核**才 `active`。
 
