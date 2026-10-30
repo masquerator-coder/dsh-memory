@@ -602,9 +602,12 @@ window.__ModuleLoader__.load({
    screen-reader semantics stay the browser's; only the paint is ours. The
    thumb is translated by the track width minus its own, which keeps it inside
    the pill at any font size without hardcoding a travel distance. */
-.mem-switch { display: inline-flex; align-items: center; gap: 9px; font-size: 12px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
+.mem-switch { position: relative; display: inline-flex; align-items: center; gap: 9px; font-size: 12px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
 .mem-switch-track { position: relative; flex: 0 0 auto; width: 38px; height: 22px; border-radius: 999px; background: var(--dsw-alias-border-l2); transition: background .16s ease; }
 .mem-switch-thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: transform .16s ease; }
+/* The real checkbox is transparent and stretched over the whole row, so the
+   label text and the pill are both hit targets while the paint stays ours.
+   It must remain the track's PREVIOUS SIBLING for the rules below to match. */
 .mem-switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: inherit; }
 .mem-switch input:checked + .mem-switch-track { background: var(--dsw-alias-brand-primary); }
 .mem-switch input:checked + .mem-switch-track .mem-switch-thumb { transform: translateX(16px); }
@@ -1400,17 +1403,23 @@ window.__ModuleLoader__.load({
                 'label',
                 { className: 'mem-switch', 'data-on': String(instructionEnabled) },
                 t('instruction.enable'),
+                // The checkbox must sit BEFORE the track as its previous
+                // sibling: every state rule below is written as
+                // `input:checked + .mem-switch-track`, and a `+` combinator
+                // never matches a descendant. Nesting it inside the track
+                // (as this markup once did) left every rule dead — the thumb
+                // never moved, the track never lit up.
+                h('input', {
+                  type: 'checkbox',
+                  role: 'switch',
+                  checked: instructionEnabled,
+                  disabled: savingInstruction,
+                  'aria-label': t('instruction.enable'),
+                  onChange: (event) => void toggleInstruction(event.target.checked),
+                }),
                 h(
                   'span',
                   { className: 'mem-switch-track' },
-                  h('input', {
-                    type: 'checkbox',
-                    role: 'switch',
-                    checked: instructionEnabled,
-                    disabled: savingInstruction,
-                    'aria-label': t('instruction.enable'),
-                    onChange: (event) => void toggleInstruction(event.target.checked),
-                  }),
                   h('span', { className: 'mem-switch-thumb', 'aria-hidden': 'true' }),
                 ),
               ),
