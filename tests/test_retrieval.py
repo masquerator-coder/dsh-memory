@@ -374,3 +374,44 @@ def test_as_of_recall_answers_the_belief_state_at_that_time(memory: MemorySystem
     tails = {h.tail.name for h in after.facts}
     assert "bank-api-eu" in tails
     assert "bank-api" not in tails  # closed at 2026-03-01
+def test_adjacency_cache_notices_an_equal_length_meta_rewrite(memory: MemorySystem, project: str):
+    """Disputing an edge must invalidate the adjacency cache even when the
+    serialized `meta` keeps its exact character length.
+
+    The stamp used `length(meta)` as its only view of meta content, so a
+    same-length rewrite was invisible and a stale adjacency (still containing
+    a now-disputed edge) was served for the rest of the process lifetime.
+    `l3.py` writes the flag with `json_set`, which is exactly this shape: the
+    value goes 0 -> 1 while the length is unchanged.
+    """
+    decision = memory.l3.add_fact(
+        project, FactInput(head="billing-service", relation="depends_on", tail="postgres")
+    )
+    assert decision.status == "accepted"
+    edge_id = decision.edge.edge_id
+
+    with memory.store.transaction():
+        memory.store.execute(
+            "UPDATE l3_edges SET meta = json_set(meta, '$.disputed', 0) WHERE edge_id = ?",
+            (edge_id,),
+        )
+    before_meta = memory.store.query_one(
+        "SELECT meta FROM l3_edges WHERE edge_id = ?", (edge_id,)
+    )["meta"]
+    # Warm the cache so a missed invalidation would actually be served.
+    memory.retriever._adjacency([project])
+    stamp_before = memory.retriever._adjacency_cache[0]
+
+    with memory.store.transaction():
+        memory.store.execute(
+            "UPDATE l3_edges SET meta = json_set(meta, '$.disputed', 1) WHERE edge_id = ?",
+            (edge_id,),
+        )
+    after_meta = memory.store.query_one(
+        "SELECT meta FROM l3_edges WHERE edge_id = ?", (edge_id,)
+    )["meta"]
+    assert len(before_meta) == len(after_meta), "the rewrite must be length-preserving to be meaningful"
+
+    memory.retriever._adjacency([project])
+    stamp_after = memory.retriever._adjacency_cache[0]
+    assert stamp_after != stamp_before

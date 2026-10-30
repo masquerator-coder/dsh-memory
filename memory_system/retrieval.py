@@ -421,20 +421,25 @@ class Retriever:
         signature = ",".join(sorted(project_ids))
         # Content-derived, not rowcount-derived: the graph mutates mostly by
         # UPDATE, not INSERT. close/retract flip valid_to (the row leaves the
-        # current set), strengthen raises confidence and grows meta, dispute
-        # grows meta ($ .disputed) — none change the row count. count, the
-        # confidence total and the meta-lineage length together cover all of
-        # those; a meta edit of identical length on a confidence-saturated
-        # edge is the only blind spot left, and it is accepted (documented
-        # residual).
+        # current set), strengthen raises confidence, dispute flips
+        # ``$.disputed`` — none change the row count.
+        #
+        # The meta component is a digest of the two keys that actually change
+        # behaviour, not ``length(meta)``: length was blind to an equal-length
+        # rewrite, and the reachable case is exactly the interesting one —
+        # flipping ``disputed`` from absent/0 to 1 on an edge whose meta was
+        # already the right length (``l3.py`` writes it with ``json_set``).
+        # ``episode_ids`` is included because ``_build_adjacency`` drops an edge
+        # whose sources were forgotten, and that is read from this list.
         marks = ",".join("?" * len(project_ids))
         agg = self.store.query_one(
             f"SELECT count(*) AS n, coalesce(total(confidence), 0) AS conf, "
-            f"coalesce(sum(length(meta)), 0) AS meta_len "
+            f"coalesce(sum(coalesce(json_extract(meta, '$.disputed'), 0)), 0) AS disputed_n, "
+            f"coalesce(total(length(coalesce(json_extract(meta, '$.episode_ids'), ''))), 0) AS evidence_len "
             f"FROM l3_edges WHERE project_id IN ({marks}) AND valid_to IS NULL",
             list(project_ids),
         )
-        stamp = (agg["n"], agg["conf"], agg["meta_len"])
+        stamp = (agg["n"], agg["conf"], agg["disputed_n"], agg["evidence_len"])
         # A forget/restore flips a source's visibility without adding an edge,
         # so edge content alone cannot invalidate the cache.
         forgotten_at_stamp = int(

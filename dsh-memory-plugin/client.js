@@ -49,7 +49,8 @@ window.__ModuleLoader__.load({
       "common.keywords": "关键词",
       "common.search": "搜索",
       "common.reset": "重置",
-      "common.unsaved": "未保存",
+      "common.autosave": "修改后自动保存",
+      "common.autosaved": "已自动保存",
       "status.connected": "记忆库已连接",
       "status.disconnected": "记忆库未连接",
       "status.project": "当前项目",
@@ -79,26 +80,19 @@ window.__ModuleLoader__.load({
       "length.saved": "摘要长度已保存",
       "length.unit": "字",
       "profile.title": "用户画像",
-      "profile.hint": "写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。记忆摘要与助手都会参考它，系统提示词里会提示模型可以查看画像。",
+      "profile.hint": "用户的介绍：偏好、习惯、技术栈、沟通方式等。",
       "profile.placeholder": "例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开",
       "profile.charCount": "{n} / {max} 字",
       "profile.saved": "用户画像已保存",
       "profile.loadFailed": "读取用户画像失败：{message}",
       "profile.updatedAt": "更新于 {time}",
-      "profile.save": "保存用户画像",
       "instruction.title": "系统指令",
-      "instruction.hint": "写进系统提示词的一段长期指令，常驻每个请求，作用类似 soul.md：人格、语气、固定规则、必须遵守的偏好。开关关闭时保留文本但不注入，重新打开立刻恢复。",
+      "instruction.hint": "写进系统提示词的一段长期指令，常驻每个请求。",
       "instruction.placeholder": "例如：\n- 始终用中文回答，代码注释也用中文\n- 回答先给结论，再给理由\n- 改动前先确认仓库根与分支\n- 不要主动提交或推送代码",
       "instruction.enable": "注入到系统提示词",
       "instruction.disabled": "已关闭（文本已保留，不会注入）",
-      "instruction.enabledLabel": "已启用",
-      "instruction.disabledLabel": "已关闭",
       "instruction.charCount": "{n} / {max} 字",
-      "instruction.saved": "系统指令已保存",
-      "instruction.toggled": "系统指令已{state}",
       "instruction.loadFailed": "读取系统指令失败：{message}",
-      "instruction.save": "保存系统指令",
-      "instruction.tooLong": "指令超过 {max} 字上限，请精简后再保存",
       "digest.title": "记忆摘要",
       "digest.generate": "记忆摘要生成",
       "digest.view": "查看记忆摘要",
@@ -118,16 +112,14 @@ window.__ModuleLoader__.load({
       "digest.noContent": "还没有记忆摘要。先点上方按钮生成一次。",
       "digest.needMaterials": "记忆库还没有内容；先和助手聊几轮，或手动添加记忆。",
       "digest.failed": "生成失败：{message}",
-      "digest.viewerTitle": "全局记忆摘要",
-      "digest.globalHint": "摘要覆盖所有项目，只记录已经做过的工作（不记录经验教训与偏好）；预算越大越详细，不会被截断。",
       "digest.loadFailed": "读取摘要失败：{message}",
+      "digest.viewerTitle": "全局记忆摘要",
       "digest.generatingHint": "正在生成全局记忆摘要…这一步会调用模型，可能需要几十秒。",
       "digest.generatedLabel": "生成于",
       "digest.size": "规模",
       "digest.budget": "预算",
       "digest.sourcesLabel": "来源",
       "digest.materials": "{n} 字材料",
-      "digest.emptyHint": "还没有生成过记忆摘要。生成后，摘要会以锚点形式进入系统提示词。",
       "digest.lastFailed": "上次生成失败",
       "digest.statusNone": "无",
       "digest.emptyBody": "（摘要内容为空）",
@@ -166,7 +158,6 @@ window.__ModuleLoader__.load({
       "memories.next": "下一页",
       "memories.selectHint": "从左侧选择一条记忆查看详情",
       "memories.summaryRequired": "记忆内容不能为空",
-      "memories.hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。列表默认显示全部项目的记忆；取消勾选「全部项目」只看当前项目。",
       "memories.unscoped": "当前没有活动会话的工作目录，无法判定“当前项目”，因此列表为空；取消勾选「全部项目」可查看全部记忆。",
       "memories.loadFailed": "读取记忆失败：{message}",
       "memories.opFailed": "操作失败：{message}",
@@ -227,7 +218,8 @@ window.__ModuleLoader__.load({
       "common.keywords": "Keywords",
       "common.search": "Search",
       "common.reset": "Reset",
-      "common.unsaved": "Unsaved",
+      "common.autosave": "Saves automatically",
+      "common.autosaved": "Saved automatically",
       "status.connected": "Memory store connected",
       "status.disconnected": "Memory store unavailable",
       "status.project": "Current project",
@@ -257,26 +249,19 @@ window.__ModuleLoader__.load({
       "length.saved": "Digest length saved",
       "length.unit": "chars",
       "profile.title": "User profile",
-      "profile.hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",
+      "profile.hint": "An introduction to the user: preferences, habits, stack, communication style, and so on.",
       "profile.placeholder": "For example:\n- Answer in Chinese, comment code in Chinese\n- Mostly TypeScript and Python\n- Prefer the conclusion first, then the detail",
       "profile.charCount": "{n} / {max} chars",
       "profile.saved": "User profile saved",
       "profile.loadFailed": "Could not read the user profile: {message}",
       "profile.updatedAt": "Updated {time}",
-      "profile.save": "Save profile",
       "instruction.title": "System instruction",
-      "instruction.hint": "A standing instruction written into the system prompt and carried by every request — a soul.md in effect: persona, tone, fixed rules, must-follow preferences. Switching it off keeps the text but stops injecting it; turning it back on restores it immediately.",
+      "instruction.hint": "A standing instruction written into the system prompt and carried by every request.",
       "instruction.placeholder": "For example:\n- Always answer in Chinese, comment code in Chinese\n- Lead with the conclusion, then the reasoning\n- Confirm the repo root and branch before changing files\n- Never commit or push on your own",
       "instruction.enable": "Inject into the system prompt",
       "instruction.disabled": "Off (the text is kept, nothing is injected)",
-      "instruction.enabledLabel": "Enabled",
-      "instruction.disabledLabel": "Off",
       "instruction.charCount": "{n} / {max} chars",
-      "instruction.saved": "System instruction saved",
-      "instruction.toggled": "System instruction {state}",
       "instruction.loadFailed": "Could not read the system instruction: {message}",
-      "instruction.save": "Save instruction",
-      "instruction.tooLong": "The instruction exceeds the {max}-character limit; shorten it before saving",
       "digest.title": "Memory digest",
       "digest.generate": "Generate digest",
       "digest.view": "View digest",
@@ -297,7 +282,6 @@ window.__ModuleLoader__.load({
       "digest.needMaterials": "The memory store is still empty; chat for a few turns or add a memory first.",
       "digest.failed": "Generation failed: {message}",
       "digest.viewerTitle": "Global memory digest",
-      "digest.globalHint": "The digest spans every project and records only work already done (no lessons or preferences). A larger budget means more detail; it is never clipped.",
       "digest.loadFailed": "Could not read the digest: {message}",
       "digest.generatingHint": "Generating the global digest… this calls the model and can take a few tens of seconds.",
       "digest.generatedLabel": "Generated",
@@ -305,7 +289,6 @@ window.__ModuleLoader__.load({
       "digest.budget": "Budget",
       "digest.sourcesLabel": "Sources",
       "digest.materials": "{n} chars of material",
-      "digest.emptyHint": "No digest has been generated yet. Once generated, it enters the system prompt as an anchor.",
       "digest.lastFailed": "The last generation failed",
       "digest.statusNone": "None",
       "digest.emptyBody": "(the digest is empty)",
@@ -344,7 +327,6 @@ window.__ModuleLoader__.load({
       "memories.next": "Next",
       "memories.selectHint": "Pick an entry on the left to see its details",
       "memories.summaryRequired": "Memory content cannot be empty",
-      "memories.hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone). The list spans every project by default; uncheck “All projects” to narrow it to the current one.",
       "memories.unscoped": "No live session names a working directory, so “this project” cannot be decided and the list is empty; uncheck “All projects” to see every memory.",
       "memories.loadFailed": "Could not load memories: {message}",
       "memories.opFailed": "Action failed: {message}",
@@ -391,6 +373,7 @@ window.__ModuleLoader__.load({
      * checked by the plugin's own smoke test.
      */
     const ROUTE_STATUS = '/dsh-memory/status'
+    const ROUTE_TOKEN = '/dsh-memory/token'
     const ROUTE_SETTINGS = '/dsh-memory/settings'
     const ROUTE_PROFILE = '/dsh-memory/profile'
     const ROUTE_INSTRUCTION = '/dsh-memory/instruction'
@@ -400,20 +383,72 @@ window.__ModuleLoader__.load({
     const ROUTE_HEALTH = '/dsh-memory/health'
 
     /**
+     * The route token, fetched once per page load.
+     *
+     * Every mutating route requires it (see `requestRejection` in `index.js`):
+     * the loopback fence alone is satisfied by any local process, so the token
+     * is what makes a call deliberate rather than ambient. It is cached in a
+     * promise, not a value, so concurrent first calls share one handshake.
+     */
+    let tokenPromise = null
+
+    /**
+     * The last resolved token, mirrored into a ref-like box.
+     *
+     * `routeToken()` is a promise and the unmount flush cannot await, so the
+     * value is written here as soon as a handshake succeeds. It is a plain
+     * object rather than `React.useRef` because this sits outside the component
+     * and must be readable from an unmount callback.
+     */
+    const tokenRef = { current: null }
+
+    /**
+     * Resolve the route token, fetching it on first use.
+     * @returns {Promise<string>} the token.
+     */
+    function routeToken() {
+      if (tokenPromise === null) {
+        tokenPromise = fetch(ROUTE_TOKEN, {
+          method: 'GET',
+          credentials: 'same-origin',
+          cache: 'no-store',
+        })
+          .then((response) => response.json())
+          .then((payload) => {
+            if (!payload || payload.ok !== true) {
+              throw new Error(callTranslate('errors.badResponse', { path: ROUTE_TOKEN, status: 403 }))
+            }
+            const token = String(payload.result?.token ?? '')
+            tokenRef.current = token
+            return token
+          })
+          .catch((error) => {
+            // A failed handshake must be retried on the next call, not cached
+            // as a permanent failure: the host may simply still be starting.
+            tokenPromise = null
+            throw error
+          })
+      }
+      return tokenPromise
+    }
+
+    /**
      * Call one plugin route.
      * @param {string} path - route path.
      * @param {object} [body] - JSON body; omitted for a GET.
      * @returns {Promise<any>} the `result` field.
      */
     async function api(path, body) {
+      const token = await routeToken()
+      const headers = { 'x-dsh-memory-token': token }
       const init =
         body === undefined
-          ? { method: 'GET', credentials: 'same-origin', cache: 'no-store' }
+          ? { method: 'GET', credentials: 'same-origin', cache: 'no-store', headers }
           : {
               method: 'POST',
               credentials: 'same-origin',
               cache: 'no-store',
-              headers: { 'content-type': 'application/json' },
+              headers: { ...headers, 'content-type': 'application/json' },
               body: JSON.stringify(body),
             }
       const response = await fetch(path, init)
@@ -562,6 +597,23 @@ window.__ModuleLoader__.load({
 .mem-textarea { width: 100%; min-height: 150px; resize: vertical; line-height: 1.6; font-family: inherit; }
 .mem-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mem-range { flex: 1; min-width: 180px; accent-color: var(--dsw-alias-brand-primary); }
+/* ── slide switch ──────────────────────────────────────────────────────
+   A native checkbox hidden inside the track, so focus, the space key and
+   screen-reader semantics stay the browser's; only the paint is ours. The
+   thumb is translated by the track width minus its own, which keeps it inside
+   the pill at any font size without hardcoding a travel distance. */
+.mem-switch { display: inline-flex; align-items: center; gap: 9px; font-size: 12px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
+.mem-switch-track { position: relative; flex: 0 0 auto; width: 38px; height: 22px; border-radius: 999px; background: var(--dsw-alias-border-l2); transition: background .16s ease; }
+.mem-switch-thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: transform .16s ease; }
+.mem-switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: inherit; }
+.mem-switch input:checked + .mem-switch-track { background: var(--dsw-alias-brand-primary); }
+.mem-switch input:checked + .mem-switch-track .mem-switch-thumb { transform: translateX(16px); }
+.mem-switch input:focus-visible + .mem-switch-track { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
+.mem-switch input:disabled + .mem-switch-track { opacity: .55; }
+/* The label text follows the state, so one glance answers "is it on?" without
+   reading the thumb's position. */
+.mem-switch[data-on='true'] { color: var(--dsw-alias-label-primary); }
+.mem-autosave { font-size: 12px; color: var(--dsw-alias-label-secondary); }
 /* ── digest-length rail ────────────────────────────────────────────────
    A continuous rail with a tick per preset value, laid out by VALUE rather than
    by index: 300 and 500 are close, 2000 and 3000 are not, and the ticks have to
@@ -722,8 +774,11 @@ window.__ModuleLoader__.load({
       const [savedLength, setSavedLength] = useState(1000)
 
       // profile
+      // `saved` mirrors what the server last confirmed, so the debounce below
+      // can tell an edit from an echo. There is no Save button: the textarea
+      // commits on settle, the way the digest-length slider already does.
       const [profile, setProfile] = useState('')
-      const [profileDirty, setProfileDirty] = useState(false)
+      const [profileSaved, setProfileSaved] = useState('')
       const [profileMax, setProfileMax] = useState(100000)
       const [savingProfile, setSavingProfile] = useState(false)
       const [profileNote, setProfileNote] = useState(null)
@@ -788,9 +843,10 @@ window.__ModuleLoader__.load({
       const loadProfile = React.useCallback(async () => {
         try {
           const result = await api(ROUTE_PROFILE, {})
-          setProfile(result?.content ?? '')
+          const content = result?.content ?? ''
+          setProfile(content)
+          setProfileSaved(content)
           if (typeof result?.max_chars === 'number') setProfileMax(result.max_chars)
-          setProfileDirty(false)
         } catch (error) {
           setProfileNote({ kind: 'error', text: t('profile.loadFailed', { message: error.message }) })
         }
@@ -863,6 +919,97 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [])
 
+      /**
+       * Auto-save the two free-text fields.
+       *
+       * Same shape as the digest-length debounce above: the newest value and
+       * the last confirmed value live in refs, so the timer never reads a stale
+       * closure, and the effect depends only on the text — a landed save must
+       * not re-arm its own timer.
+       *
+       * Short fields commit as they settle. The profile is allowed a longer
+       * pause: it is the longer document of the two, and a 100k ceiling means a
+       * big paste would otherwise turn into one write per keystroke burst.
+       */
+      const profileSavedRef = React.useRef(profileSaved)
+      profileSavedRef.current = profileSaved
+      const profileRef = React.useRef(profile)
+      profileRef.current = profile
+
+      React.useEffect(() => {
+        if (profile === profileSavedRef.current) return undefined
+        const timer = setTimeout(() => {
+          if (profileRef.current !== profileSavedRef.current) void saveProfile(profileRef.current)
+        }, 900)
+        return () => clearTimeout(timer)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [profile])
+
+      const instructionSavedRef = React.useRef(instructionSaved)
+      instructionSavedRef.current = instructionSaved
+      const instructionRef = React.useRef(instruction)
+      instructionRef.current = instruction
+
+      React.useEffect(() => {
+        // The ceiling is the textarea's own `maxLength`, so an over-long value
+        // cannot reach here; the Python side re-checks it as the floor.
+        if (instruction === instructionSavedRef.current.content) return undefined
+        const timer = setTimeout(() => {
+          if (instructionRef.current !== instructionSavedRef.current.content) {
+            void saveInstruction(instructionRef.current)
+          }
+        }, 700)
+        return () => clearTimeout(timer)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [instruction])
+
+      // Flush pending text if the page unmounts before either timer fires.
+      // No React state here on purpose: the tree is going away, so there is
+      // nothing left to update, and a keepalive POST survives the navigation.
+      //
+      // The token is appended as a query parameter rather than sent as a header:
+      // an unmount cannot await, so the value has to be already-known, and
+      // `tokenRef` holds whatever the last handshake resolved. A header would
+      // also work here, but the query form keeps this flush identical to the
+      // one shape the server accepts for both, and it is the path that survives
+      // a keepalive request being rewritten by the browser.
+      React.useEffect(() => {
+        return () => {
+          const token = tokenRef.current
+          if (!token) return
+          const withToken = (path) => `${path}?token=${encodeURIComponent(token)}`
+          const pendingProfile = profileRef.current
+          if (pendingProfile !== profileSavedRef.current) {
+            try {
+              void fetch(withToken(ROUTE_PROFILE), {
+                method: 'POST',
+                credentials: 'same-origin',
+                cache: 'no-store',
+                keepalive: true,
+                body: JSON.stringify({ content: pendingProfile }),
+              })
+            } catch {
+              // Best effort: `/profile` reconciles from the server on load.
+            }
+          }
+          const pendingInstruction = instructionRef.current
+          if (pendingInstruction !== instructionSavedRef.current.content) {
+            try {
+              void fetch(withToken(ROUTE_INSTRUCTION), {
+                method: 'POST',
+                credentials: 'same-origin',
+                cache: 'no-store',
+                keepalive: true,
+                body: JSON.stringify({ content: pendingInstruction }),
+              })
+            } catch {
+              // Best effort, same as above.
+            }
+          }
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
       /** Persist the length budget. */
       async function saveLength(nextLength) {
         setSavingLength(true)
@@ -886,13 +1033,18 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Persist the user profile. */
-      async function saveProfile() {
+      /**
+       * Persist the user profile.
+       * @param {string} nextContent - the text to write (not read from state:
+       *   the debounce fires after the closure that armed it).
+       */
+      async function saveProfile(nextContent) {
         setSavingProfile(true)
         setProfileNote(null)
         try {
-          await api(ROUTE_PROFILE, { content: profile })
-          setProfileDirty(false)
+          await api(ROUTE_PROFILE, { content: nextContent })
+          // Trust what we sent; the server echoes the stored text unchanged.
+          setProfileSaved(nextContent)
           setProfileNote({ kind: 'ok', text: t('profile.saved') })
         } catch (error) {
           setProfileNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
@@ -901,26 +1053,22 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Persist the standing instruction. */
-      async function saveInstruction() {
-        // The host is authoritative on the limit, but refusing here keeps the
-        // round trip (and the server-side error text) off the user's path.
-        if (instruction.length > instructionMax) {
-          setInstructionNote({ kind: 'error', text: t('instruction.tooLong', { max: instructionMax }) })
-          return
-        }
+      /**
+       * Persist the standing instruction text.
+       *
+       * Only `content` is sent: the switch is its own request (see
+       * `toggleInstruction`), so a pending, unflushed switch flip can never be
+       * clobbered by a text debounce that captured an older `enabled`.
+       * @param {string} nextContent - the text to write.
+       */
+      async function saveInstruction(nextContent) {
         setSavingInstruction(true)
         setInstructionNote(null)
         try {
-          // `enabled` rides along so one save commits a half-edited page
-          // without a second request that could land out of order.
-          const result = await api(ROUTE_INSTRUCTION, { content: instruction, enabled: instructionEnabled })
-          const content = result?.content ?? instruction
-          const enabled = result?.enabled === true
-          setInstruction(content)
-          setInstructionEnabled(enabled)
-          setInstructionSaved({ content, enabled })
-          setInstructionNote({ kind: 'ok', text: t('instruction.saved') })
+          const result = await api(ROUTE_INSTRUCTION, { content: nextContent })
+          const content = result?.content ?? nextContent
+          setInstructionSaved((current) => ({ ...current, content }))
+          setInstructionNote({ kind: 'ok', text: t('common.autosaved') })
         } catch (error) {
           setInstructionNote({ kind: 'error', text: t('errors.saveFailed', { message: error.message }) })
         } finally {
@@ -931,9 +1079,9 @@ window.__ModuleLoader__.load({
       /**
        * Flip the switch and persist it.
        *
-       * Sent right away rather than left to the save button: the switch is the
-       * whole point of the section, and a page that showed "on" while the host
-       * still had it off would be lying about what the model reads.
+       * Sent immediately rather than debounced: a switch is one discrete act,
+       * and a page that showed "on" while the host still had it off would be
+       * lying about what the model reads.
        */
       async function toggleInstruction(next) {
         setInstructionEnabled(next)
@@ -941,16 +1089,12 @@ window.__ModuleLoader__.load({
         setInstructionNote(null)
         try {
           // Only `enabled`: no `content` in the payload means "leave the text
-          // alone", so a toggle can never overwrite an unsaved edit or wipe
+          // alone", so a toggle can never overwrite a pending edit or wipe
           // what is stored.
           const result = await api(ROUTE_INSTRUCTION, { enabled: next })
           const enabled = result?.enabled === true
           setInstructionEnabled(enabled)
           setInstructionSaved((current) => ({ ...current, enabled }))
-          setInstructionNote({
-            kind: 'ok',
-            text: t('instruction.toggled', { state: enabled ? t('instruction.enabledLabel') : t('instruction.disabledLabel') }),
-          })
         } catch (error) {
           // Put the switch back where the host still has it.
           setInstructionEnabled(!next)
@@ -1249,26 +1393,29 @@ window.__ModuleLoader__.load({
               'header',
               null,
               h('h3', { className: 'mem-title' }, t('instruction.title')),
-              // One chip says what the host is actually doing, not what the
-              // switch on screen says: an injection state is the useful fact.
+              // The switch sits in the header, beside the title it governs:
+              // it is the one control that decides whether anything on this
+              // card reaches the model.
               h(
-                'span',
-                { className: instructionEnabled ? 'mem-chip mem-chip-ok' : 'mem-chip mem-chip-idle' },
-                instructionEnabled ? t('instruction.enabledLabel') : t('instruction.disabledLabel'),
+                'label',
+                { className: 'mem-switch', 'data-on': String(instructionEnabled) },
+                t('instruction.enable'),
+                h(
+                  'span',
+                  { className: 'mem-switch-track' },
+                  h('input', {
+                    type: 'checkbox',
+                    role: 'switch',
+                    checked: instructionEnabled,
+                    disabled: savingInstruction,
+                    'aria-label': t('instruction.enable'),
+                    onChange: (event) => void toggleInstruction(event.target.checked),
+                  }),
+                  h('span', { className: 'mem-switch-thumb', 'aria-hidden': 'true' }),
+                ),
               ),
             ),
             h('p', { className: 'mem-hint' }, t('instruction.hint')),
-            h(
-              'label',
-              { className: 'mem-hint', style: { display: 'inline-flex', gap: '8px', alignItems: 'center' } },
-              h('input', {
-                type: 'checkbox',
-                checked: instructionEnabled,
-                disabled: savingInstruction,
-                onChange: (event) => void toggleInstruction(event.target.checked),
-              }),
-              t('instruction.enable'),
-            ),
             h('textarea', {
               className: 'mem-textarea',
               value: instruction,
@@ -1287,21 +1434,12 @@ window.__ModuleLoader__.load({
               // text and switched off will wonder where it went.
               instructionEnabled ? null : h('span', { className: 'mem-hint' }, t('instruction.disabled')),
               h('span', { className: 'mem-spacer' }),
-              instruction !== instructionSaved.content || instructionEnabled !== instructionSaved.enabled
-                ? h('span', { className: 'mem-chip mem-chip-warn' }, t('common.unsaved'))
+              // No Save button: the text commits as it settles. The chip is
+              // the only feedback on that, so it must not be mistaken for a
+              // failure to save — hence "自动保存" rather than "未保存".
+              instruction !== instructionSaved.content
+                ? h('span', { className: 'mem-autosave' }, savingInstruction ? t('common.saving') : t('common.autosave'))
                 : null,
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'mem-btn mem-btn-primary',
-                  onClick: () => void saveInstruction(),
-                  disabled:
-                    savingInstruction ||
-                    (instruction === instructionSaved.content && instructionEnabled === instructionSaved.enabled),
-                },
-                savingInstruction ? t('common.saving') : t('instruction.save'),
-              ),
             ),
             h(Note, { kind: instructionNote?.kind }, instructionNote?.text),
           ),
@@ -1330,7 +1468,6 @@ window.__ModuleLoader__.load({
               maxLength: profileMax,
               onChange: (event) => {
                 setProfile(event.target.value)
-                setProfileDirty(true)
                 setProfileNote(null)
               },
             }),
@@ -1339,12 +1476,9 @@ window.__ModuleLoader__.load({
               { className: 'mem-row' },
               h('span', { className: 'mem-hint' }, t('profile.charCount', { n: profile.length, max: profileMax })),
               h('span', { className: 'mem-spacer' }),
-              profileDirty ? h('span', { className: 'mem-chip mem-chip-warn' }, t('common.unsaved')) : null,
-              h(
-                'button',
-                { type: 'button', className: 'mem-btn mem-btn-primary', onClick: () => void saveProfile(), disabled: savingProfile || !profileDirty },
-                savingProfile ? t('common.saving') : t('profile.save'),
-              ),
+              profile !== profileSaved
+                ? h('span', { className: 'mem-autosave' }, savingProfile ? t('common.saving') : t('common.autosave'))
+                : null,
             ),
             h(Note, { kind: profileNote?.kind }, profileNote?.text),
           ),
@@ -1359,7 +1493,6 @@ window.__ModuleLoader__.load({
               h('h3', { className: 'mem-title' }, t('digest.title')),
               h(DigestStatus, { digest: latest }),
             ),
-            h('p', { className: 'mem-hint' }, t('digest.globalHint')),
             latest
               ? h(
                   'dl',
@@ -1376,7 +1509,7 @@ window.__ModuleLoader__.load({
                   h('dt', null, t('digest.sourcesLabel')),
                   h('dd', null, `${t('digest.materials', { n: latest.materials_chars ?? 0 })}${latest.generator ? ` · ${latest.generator}` : ''}`),
                 )
-              : h('p', { className: 'mem-hint' }, t('digest.emptyHint')),
+              : null,
             h(
               'div',
               { className: 'mem-row' },
@@ -1409,7 +1542,6 @@ window.__ModuleLoader__.load({
               h('h3', { className: 'mem-title' }, t('memories.title')),
               h('span', { className: 'mem-hint' }, t('memories.count', { total: status?.memories ?? 0 })),
             ),
-            h('p', { className: 'mem-hint' }, t('memories.hint')),
             h(
               'div',
               { className: 'mem-row' },

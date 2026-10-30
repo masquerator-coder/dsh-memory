@@ -104,6 +104,49 @@ def test_weaker_evidence_does_not_overwrite(memory: MemorySystem, project: str):
     assert memory.l3.get_entity(current[0].tail_id).name == "dc1"
 
 
+def test_older_claim_loses_without_minting_a_phantom_edge(memory: MemorySystem, project: str):
+    """An incoming claim that loses the recency tie-break is rejected, not
+    "closed".
+
+    The `winner == "existing"` branch used to create a new edge and close it in
+    the same breath, then report that freshly-closed row as `decision.edge`
+    with status "closed": the caller was handed the loser, `closed_edge_ids`
+    named nobody, and a permanently `superseded` row was left in `l3_edges`
+    that had never held the belief.
+    """
+    episode = memory.l2.add(project_id=project, summary="observed in a batch import", importance=0.8)
+    incumbent = memory.l3.add_fact(
+        project,
+        fact("svc", "located_in", "dc1", confidence=0.8, episode_ids=[episode.memory_id]),
+        recorded_at="2026-02-01T00:00:00+00:00",
+    )
+    assert incumbent.status == "accepted"
+    edges_before = len(memory.store.query("SELECT edge_id FROM l3_edges"))
+
+    # Same evidence strength, but recorded earlier: the incumbent keeps the belief.
+    older = memory.l3.add_fact(
+        project,
+        fact("svc", "located_in", "dc2", confidence=0.8, episode_ids=[episode.memory_id]),
+        recorded_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert older.status == "rejected"
+    assert older.reason == "older_than_incumbent"
+    # The reported edge is the one that still holds the belief, and it is open.
+    assert older.edge is not None
+    assert older.edge.edge_id == incumbent.edge.edge_id
+    assert older.edge.valid_to is None
+    # Nothing was closed, and nothing was created.
+    assert older.closed_edge_ids == []
+    assert (older.conflict or {}).get("incumbent") == incumbent.edge.edge_id
+    assert len(memory.store.query("SELECT edge_id FROM l3_edges")) == edges_before
+
+    svc = memory.l3.resolve_entity(project, "svc", create=False)
+    current = memory.l3.edges_of(svc.entity_id, relation="located_in")
+    assert len(current) == 1
+    assert memory.l3.get_entity(current[0].tail_id).name == "dc1"
+
+
 def test_dual_temporal_as_of_query(memory: MemorySystem, project: str):
     memory.l3.add_fact(project, fact("svc", "located_in", "dc1", confidence=0.95),
                        recorded_at="2026-01-01T00:00:00+00:00")
@@ -332,3 +375,83 @@ def test_alias_lookup_handles_quotes(memory: MemorySystem, project: str):
     by_alias = memory.l3.resolve_entity(project, 'he said "hi"', entity_type="job")
     assert by_alias.entity_id == target.entity_id
     assert by_alias.name == "nightly batch"
+def test_reopening_a_closed_triple_keeps_its_earlier_evidence(memory: MemorySystem, project: str):
+    """Re-asserting a closed triple must not drop the episodes that supported
+    it before.
+
+    `_create_edge` rebuilt `meta` from the new fact alone, so the live
+    `episode_ids` (which `provenance()` and `edge_lost_its_sources` read) lost
+    every earlier source as soon as a closed triple was reopened. Only the
+    `l3_changes` snapshot kept them, and nothing read that back. `owns` is
+    cardinality=one, so a second tail on the same head closes the first edge.
+    """
+    first = memory.remember(
+        project_id=project,
+        summary="service alpha owns the billing module",
+        event_type="fact",
+        importance=0.8,
+        facts=[fact("service alpha", "owns", "billing module")],
+    )
+    episode_id = first["memory_id"]
+    edge_id = first["facts"][0]["edge_id"]
+
+    # A conflicting tail closes the edge (same head, cardinality one).
+    memory.remember(
+        project_id=project,
+        summary="correction: service alpha owns the ledger module",
+        event_type="fact",
+        importance=0.8,
+        facts=[fact("service alpha", "owns", "ledger module")],
+    )
+    closed = memory.l3.get_edge(edge_id)
+    assert closed.valid_to is not None
+    assert closed.meta["episode_ids"] == [episode_id]
+
+    # Re-assert the original triple: the edge reopens with a second episode.
+    reopened = memory.remember(
+        project_id=project,
+        summary="reverted: service alpha owns the billing module",
+        event_type="fact",
+        importance=0.8,
+        facts=[fact("service alpha", "owns", "billing module")],
+    )
+    new_episode_id = reopened["memory_id"]
+    assert reopened["facts"][0]["edge_id"] == edge_id
+
+    edge = memory.l3.get_edge(edge_id)
+    assert edge.valid_to is None
+    assert edge.meta["episode_ids"] == [episode_id, new_episode_id]
+    # `provenance()` aggregates the change/source audit rows rather than reading
+    # `meta`, so it is asserted by containment: both episodes must still be
+    # traceable, but the audit order is its own business.
+    traced = set(memory.l3.provenance(edge_id)["episode_ids"])
+    assert {episode_id, new_episode_id} <= traced
+
+
+def test_repeated_reopen_does_not_duplicate_evidence(memory: MemorySystem, project: str):
+    """The merge is order-stable and de-duplicated: reopening the same triple
+    many times cannot inflate the evidence list into a growing pile."""
+    for _ in range(3):
+        memory.remember(
+            project_id=project,
+            summary="service alpha owns the billing module",
+            event_type="fact",
+            importance=0.8,
+            facts=[fact("service alpha", "owns", "billing module")],
+        )
+        memory.remember(
+            project_id=project,
+            summary="service alpha owns the ledger module",
+            event_type="fact",
+            importance=0.8,
+            facts=[fact("service alpha", "owns", "ledger module")],
+        )
+
+    billing = memory.l3.edges_of(
+        memory.l3.resolve_entity(project, "service alpha").entity_id,
+        relation="owns",
+        current_only=False,
+    )
+    for edge in billing:
+        ids = edge.meta["episode_ids"]
+        assert len(ids) == len(set(ids))

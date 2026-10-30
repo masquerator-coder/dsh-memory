@@ -164,6 +164,16 @@ class VectorIndex:
             raise ValueError(f"query dim {len(query)} != index dim {self.dim}")
         if k <= 0:
             return []
+        # A degenerate query is rejected here, for both backends, rather than
+        # per backend: the fallback path skips a zero vector (cosine is
+        # undefined) while vec0 happily scored it, and vec0's Euclidean content
+        # for a zero query is the *stored* norm, which came back as 0.5
+        # cosine-distance -- a "half match" against every row. A non-finite
+        # component is treated the same way: it would poison the ranking
+        # instead of merely being useless, which is what the fallback path also
+        # refuses to rank.
+        if not all(math.isfinite(x) for x in query) or not any(x != 0.0 for x in query):
+            return []
         if self.backend == "sqlite-vec":
             table = VEC_TABLES[kind]
             payload = self._sqlite_vec.serialize_float32(list(query))
@@ -240,6 +250,9 @@ class VectorIndex:
         scored: list[tuple[int, float]] = []
         q = list(query)
         qn = sum(x * x for x in q) ** 0.5
+        # `qn == 0` cannot reach here: the entry guard rejects a degenerate
+        # query for both backends. Kept as a cheap invariant so a future caller
+        # of this branch cannot divide by zero.
         if qn == 0.0:
             return []
         for row in rows:

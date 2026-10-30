@@ -25,7 +25,8 @@
     "keywords": "关键词",
     "search": "搜索",
     "reset": "重置",
-    "unsaved": "未保存"
+    "autosave": "修改后自动保存",
+    "autosaved": "已自动保存"
   },
   "status": {
     "connected": "记忆库已连接",
@@ -61,28 +62,21 @@
   },
   "profile": {
     "title": "用户画像",
-    "hint": "写给人看的自我介绍：偏好、习惯、技术栈、沟通方式。记忆摘要与助手都会参考它，系统提示词里会提示模型可以查看画像。",
+    "hint": "用户的介绍：偏好、习惯、技术栈、沟通方式等。",
     "placeholder": "例如：\n- 中文回答，代码注释用中文\n- 主要写 TypeScript 与 Python\n- 喜欢先给结论再展开",
     "charCount": "{n} / {max} 字",
     "saved": "用户画像已保存",
     "loadFailed": "读取用户画像失败：{message}",
-    "updatedAt": "更新于 {time}",
-    "save": "保存用户画像"
+    "updatedAt": "更新于 {time}"
   },
   "instruction": {
     "title": "系统指令",
-    "hint": "写进系统提示词的一段长期指令，常驻每个请求，作用类似 soul.md：人格、语气、固定规则、必须遵守的偏好。开关关闭时保留文本但不注入，重新打开立刻恢复。",
+    "hint": "写进系统提示词的一段长期指令，常驻每个请求。",
     "placeholder": "例如：\n- 始终用中文回答，代码注释也用中文\n- 回答先给结论，再给理由\n- 改动前先确认仓库根与分支\n- 不要主动提交或推送代码",
     "enable": "注入到系统提示词",
     "disabled": "已关闭（文本已保留，不会注入）",
-    "enabledLabel": "已启用",
-    "disabledLabel": "已关闭",
     "charCount": "{n} / {max} 字",
-    "saved": "系统指令已保存",
-    "toggled": "系统指令已{state}",
-    "loadFailed": "读取系统指令失败：{message}",
-    "save": "保存系统指令",
-    "tooLong": "指令超过 {max} 字上限，请精简后再保存"
+    "loadFailed": "读取系统指令失败：{message}"
   },
   "digest": {
     "title": "记忆摘要",
@@ -105,7 +99,6 @@
     "needMaterials": "记忆库还没有内容；先和助手聊几轮，或手动添加记忆。",
     "failed": "生成失败：{message}",
     "viewerTitle": "全局记忆摘要",
-    "globalHint": "摘要覆盖所有项目，只记录已经做过的工作（不记录经验教训与偏好）；预算越大越详细，不会被截断。",
     "loadFailed": "读取摘要失败：{message}",
     "generatingHint": "正在生成全局记忆摘要…这一步会调用模型，可能需要几十秒。",
     "generatedLabel": "生成于",
@@ -113,7 +106,6 @@
     "budget": "预算",
     "sourcesLabel": "来源",
     "materials": "{n} 字材料",
-    "emptyHint": "还没有生成过记忆摘要。生成后，摘要会以锚点形式进入系统提示词。",
     "lastFailed": "上次生成失败",
     "statusNone": "无",
     "emptyBody": "（摘要内容为空）"
@@ -154,7 +146,6 @@
     "next": "下一页",
     "selectHint": "从左侧选择一条记忆查看详情",
     "summaryRequired": "记忆内容不能为空",
-    "hint": "记忆库里的原始条目：可以查看、改内容与重要度、归档（软删除，可恢复）。列表默认显示全部项目的记忆；取消勾选「全部项目」只看当前项目。",
     "unscoped": "当前没有活动会话的工作目录，无法判定“当前项目”，因此列表为空；取消勾选「全部项目」可查看全部记忆。",
     "loadFailed": "读取记忆失败：{message}",
     "opFailed": "操作失败：{message}",

@@ -25,7 +25,8 @@
     "keywords": "Keywords",
     "search": "Search",
     "reset": "Reset",
-    "unsaved": "Unsaved"
+    "autosave": "Saves automatically",
+    "autosaved": "Saved automatically"
   },
   "status": {
     "connected": "Memory store connected",
@@ -61,28 +62,21 @@
   },
   "profile": {
     "title": "User profile",
-    "hint": "A short introduction for the assistant: preferences, habits, stack, communication style. Digests and the assistant both consult it, and the system prompt tells the model it can read it.",
+    "hint": "An introduction to the user: preferences, habits, stack, communication style, and so on.",
     "placeholder": "For example:\n- Answer in Chinese, comment code in Chinese\n- Mostly TypeScript and Python\n- Prefer the conclusion first, then the detail",
     "charCount": "{n} / {max} chars",
     "saved": "User profile saved",
     "loadFailed": "Could not read the user profile: {message}",
-    "updatedAt": "Updated {time}",
-    "save": "Save profile"
+    "updatedAt": "Updated {time}"
   },
   "instruction": {
     "title": "System instruction",
-    "hint": "A standing instruction written into the system prompt and carried by every request — a soul.md in effect: persona, tone, fixed rules, must-follow preferences. Switching it off keeps the text but stops injecting it; turning it back on restores it immediately.",
+    "hint": "A standing instruction written into the system prompt and carried by every request.",
     "placeholder": "For example:\n- Always answer in Chinese, comment code in Chinese\n- Lead with the conclusion, then the reasoning\n- Confirm the repo root and branch before changing files\n- Never commit or push on your own",
     "enable": "Inject into the system prompt",
     "disabled": "Off (the text is kept, nothing is injected)",
-    "enabledLabel": "Enabled",
-    "disabledLabel": "Off",
     "charCount": "{n} / {max} chars",
-    "saved": "System instruction saved",
-    "toggled": "System instruction {state}",
-    "loadFailed": "Could not read the system instruction: {message}",
-    "save": "Save instruction",
-    "tooLong": "The instruction exceeds the {max}-character limit; shorten it before saving"
+    "loadFailed": "Could not read the system instruction: {message}"
   },
   "digest": {
     "title": "Memory digest",
@@ -105,7 +99,6 @@
     "needMaterials": "The memory store is still empty; chat for a few turns or add a memory first.",
     "failed": "Generation failed: {message}",
     "viewerTitle": "Global memory digest",
-    "globalHint": "The digest spans every project and records only work already done (no lessons or preferences). A larger budget means more detail; it is never clipped.",
     "loadFailed": "Could not read the digest: {message}",
     "generatingHint": "Generating the global digest… this calls the model and can take a few tens of seconds.",
     "generatedLabel": "Generated",
@@ -113,7 +106,6 @@
     "budget": "Budget",
     "sourcesLabel": "Sources",
     "materials": "{n} chars of material",
-    "emptyHint": "No digest has been generated yet. Once generated, it enters the system prompt as an anchor.",
     "lastFailed": "The last generation failed",
     "statusNone": "None",
     "emptyBody": "(the digest is empty)"
@@ -154,7 +146,6 @@
     "next": "Next",
     "selectHint": "Pick an entry on the left to see its details",
     "summaryRequired": "Memory content cannot be empty",
-    "hint": "The raw entries behind the digest: inspect them, edit the text and importance, or archive them (a soft delete that can be undone). The list spans every project by default; uncheck “All projects” to narrow it to the current one.",
     "unscoped": "No live session names a working directory, so “this project” cannot be decided and the list is empty; uncheck “All projects” to see every memory.",
     "loadFailed": "Could not load memories: {message}",
     "opFailed": "Action failed: {message}",

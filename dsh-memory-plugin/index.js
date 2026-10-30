@@ -12,6 +12,7 @@
  * @module dsh-memory
  */
 
+import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
 import { BridgeClient, BridgeError, defaultMemoryHome, defaultMemorySystemRoot } from './bridge.js'
@@ -154,8 +155,31 @@ function sessionIdOf(context) {
  */
 export const SKILL_SCOPE_QUESTION_ID = 'dsh-memory:skill-scope'
 
-/** Option id inside {@link SKILL_SCOPE_QUESTION_ID} that grants global scope. */
+/**
+ * Marker that grants global scope.
+ *
+ * It is NOT an option id: `ask_user_question` has no option-id field (its
+ * option schema is `{label, description}` only) and echoes back the chosen
+ * *labels* in `selected`. Matching a literal option id therefore never
+ * succeeded, which made every global skill write deny itself. The marker is
+ * instead required to appear inside the chosen option's label, so it survives
+ * the round trip whatever wording the model wraps around it.
+ */
 export const SKILL_SCOPE_GLOBAL_ID = 'global'
+
+/**
+ * The token the global option's label must contain, e.g.
+ * `「存成全局技能」[skill-scope:global]`.
+ *
+ * A bracketed, namespaced token is used instead of the bare word so that an
+ * unrelated label such as "use the global cache" cannot grant consent by
+ * accident.
+ * @param {string} [marker] - the bare marker value.
+ * @returns {string} the literal token to look for.
+ */
+export function skillScopeToken(marker = SKILL_SCOPE_GLOBAL_ID) {
+  return `[skill-scope:${marker}]`
+}
 
 /**
  * How long one global-skill approval stays usable, in milliseconds.
@@ -210,16 +234,27 @@ function parseAnswers(text) {
 /**
  * Whether one answer to {@link SKILL_SCOPE_QUESTION_ID} says "global".
  *
- * Both a selected option and a typed custom answer are honoured, and the match
- * is on the option id rather than on prose so a different locale or wording
- * cannot flip the meaning.
+ * `selected` carries the chosen option *labels*, so the match is on the
+ * bracketed token ({@link skillScopeToken}) that the global option's label is
+ * required to contain. The bare marker is also accepted as an exact label and
+ * in `custom`, so a user who types it by hand is still understood, and a label
+ * that merely mentions "global" in passing is not.
  * @param {{selected: string[], custom?: string}} answer - one answer.
  * @returns {boolean} true only for an explicit global choice.
  */
 function answerSaysGlobal(answer) {
   const selected = Array.isArray(answer?.selected) ? answer.selected : []
-  if (selected.some((value) => String(value).trim() === SKILL_SCOPE_GLOBAL_ID)) return true
-  return String(answer?.custom ?? '').includes(SKILL_SCOPE_GLOBAL_ID)
+  const token = skillScopeToken()
+  const saysYes = (value) => {
+    const text = String(value ?? '').trim()
+    if (text.length === 0) return false
+    if (text.includes(token)) return true
+    // A bare `global` is accepted only as the whole value, never as a substring
+    // of a longer label, so "global" inside prose cannot grant consent.
+    return text === SKILL_SCOPE_GLOBAL_ID
+  }
+  if (selected.some(saysYes)) return true
+  return saysYes(answer?.custom)
 }
 
 /**
@@ -977,6 +1012,7 @@ export function apply(ctx, rawConfig) {
     takeSkillScopeGrant,
     skillScopeQuestionId: SKILL_SCOPE_QUESTION_ID,
     skillScopeGlobalId: SKILL_SCOPE_GLOBAL_ID,
+    skillScopeToken: skillScopeToken(),
   })) {
     // The heartbeat only needs to know that the model *made* a recording
     // attempt, so wrapping here keeps `tools.js` a pure schema+execute module.
@@ -1038,6 +1074,23 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Re-read the instruction now, for the settings page.
+   *
+   * The `pending` flag is set *before* delegating and cleared in a `finally`
+   * here rather than by `readInstruction`, whose own `finally` would clear it
+   * even if the call threw synchronously before the promise existed — which
+   * left the slot wedged until reload, silently freezing the section.
+   */
+  async function refreshInstructionNow() {
+    instructionSlot.pending = true
+    try {
+      await readInstruction()
+    } finally {
+      instructionSlot.pending = false
+    }
+  }
+
+  /**
    * Start a refresh when the cached instruction has aged.
    *
    * The section text is synchronous and the read is not, so the first
@@ -1077,17 +1130,6 @@ export function apply(ctx, rawConfig) {
       }),
     'dsh-memory.instruction-section',
   )
-
-  /**
-   * Re-read the instruction now, for the settings page.
-   *
-   * Saving (or toggling) has to be visible on the next assembly; waiting out
-   * the TTL made the page look like the save did nothing.
-   */
-  async function refreshInstructionNow() {
-    instructionSlot.pending = true
-    await readInstruction()
-  }
 
   // Warm the slot at load so the first prompt of a session that starts after
   // the host is already up carries the instruction.
@@ -1420,6 +1462,47 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Per-process write token.
+   *
+   * The loopback fence stops a web page, but not a program running as the same
+   * user: such a program controls every request header and can therefore
+   * satisfy the loopback + Origin checks trivially. The token raises that bar
+   * by requiring a value that is minted per host start and never written to
+   * disk.
+   *
+   * What this is and is not, stated plainly: a local process that can read the
+   * handshake route's response — or the page's own memory — can obtain the
+   * token, so this is *not* isolation from a same-user attacker. It does stop
+   * the blind/opportunistic cases (a stray script posting to the port, a
+   * curl with no knowledge of the token, another plugin poking at fixed
+   * paths), and it makes every mutating call opt-in rather than ambient.
+   * `crypto.randomUUID` is the platform RNG; no dependency is added.
+   */
+  const routeToken = randomUUID()
+
+  /**
+   * Whether one request carries the write token.
+   *
+   * The header is preferred; a `?token=` fallback exists because the settings
+   * page issues two `keepalive` POSTs on unmount, and a header cannot be
+   * attached to those without making them non-simple (which would change the
+   * preflight behaviour). Comparing in constant time is not meaningful here —
+   * the attacker already knows the length — so a plain compare is used.
+   * @param {import('node:http').IncomingMessage} req - the incoming request.
+   * @returns {boolean} true when the token matches.
+   */
+  function carriesRouteToken(req) {
+    const header = req.headers['x-dsh-memory-token']
+    if (typeof header === 'string' && header === routeToken) return true
+    try {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      return url.searchParams.get('token') === routeToken
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Whether this request may reach the memory routes.
    *
    * The plugin registers plain exact routes, so nothing upstream has vetted
@@ -1437,6 +1520,10 @@ export function apply(ctx, rawConfig) {
    * reachability carries the trust exactly as it does for any other
    * loopback-only local service.
    *
+   * Beyond that, a caller must present {@link routeToken} (see
+   * {@link carriesRouteToken}) — the loopback checks alone are satisfied by
+   * any local process.
+   *
    * @param {import('node:http').IncomingMessage} req - the incoming request.
    * @param {any} webCtx - the context that injected `webServer`.
    * @returns {number | undefined} HTTP status to reject with, else undefined.
@@ -1446,12 +1533,14 @@ export function apply(ctx, rawConfig) {
     if (authority === undefined || !isLoopbackHostname(authority.hostname)) return 403
     if (req.headers['sec-fetch-site'] === 'cross-site') return 403
     const origin = req.headers.origin
-    if (origin === undefined) return undefined
-    try {
-      return new URL(origin).host === authority.host ? undefined : 403
-    } catch {
-      return 403
+    if (origin !== undefined) {
+      try {
+        if (new URL(origin).host !== authority.host) return 403
+      } catch {
+        return 403
+      }
     }
+    return carriesRouteToken(req) ? undefined : 403
   }
 
   /**
@@ -1579,6 +1668,46 @@ export function apply(ctx, rawConfig) {
         `dsh-memory.route(${path})`,
       )
     }
+
+    // ── token handshake ────────────────────────────────────────────────
+    // Registered directly, not through `route()`, because the generic wrapper
+    // enforces the token and this is the endpoint that hands it out. It still
+    // runs the loopback + Origin fence — only the token check is skipped, so a
+    // cross-site page cannot read it.
+    webCtx.effect(
+      () =>
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: '/dsh-memory/token',
+          handler: (req, res) => {
+            const authority = requestAuthority(req, webCtx)
+            const allowed =
+              authority !== undefined &&
+              isLoopbackHostname(authority.hostname) &&
+              req.headers['sec-fetch-site'] !== 'cross-site' &&
+              (req.headers.origin === undefined ||
+                (() => {
+                  try {
+                    return new URL(req.headers.origin).host === authority.host
+                  } catch {
+                    return false
+                  }
+                })())
+            res.writeHead(allowed ? 200 : 403, {
+              'content-type': 'application/json; charset=utf-8',
+              'cache-control': 'no-store',
+            })
+            res.end(
+              JSON.stringify(
+                allowed
+                  ? { ok: true, result: { token: routeToken } }
+                  : { ok: false, error: { code: 'FORBIDDEN', message: '未授权的请求' } },
+              ),
+            )
+          },
+        }),
+      'dsh-memory.route(/dsh-memory/token)',
+    )
 
     route('/dsh-memory/status', async (body) => {
       const projectId = await routeProject(body)
@@ -1860,7 +1989,7 @@ const ANCHOR_HEADER = [
   '',
   '- 完成可复用任务（同一套步骤后续还会复用）后，先 `skill_list` 查重；已有同类不重复创建，必要时 `skill_create` 同名覆盖或 `skill_retire` 退役旧技能。仅保存已跑通验证的；一次性任务不保存；一个会话最多新建 1 个。',
   '- 选级别：拿不准就存**项目级**（默认，`scope="project"`）；只有跨项目通用、已验证、不含项目路径/私有依赖/敏感信息的做法才考虑**全局**（`scope="global"`）。',
-  '- 写全局必须先用 `ask_user_question` 取得用户**本次**答复：问题 id `dsh-memory:skill-scope`、选项 id 含 `global`。该授权一次性、10 分钟内有效，宿主只认这次答复，模型自述无效；未选 `global` 就存项目级，不重复追问。',
+  '- 写全局必须先用 `ask_user_question` 取得用户**本次**答复：问题 id `dsh-memory:skill-scope`，且「全局」选项的 label 里要包含标记 `[skill-scope:global]`（options 只有 label/description，没有 id 字段）。该授权一次性、10 分钟内有效，宿主只认这次答复，模型自述无效；用户没选那一项就存项目级，不重复追问。',
 ].join('\n')
 
 /** Resolved configuration defaults, exposed for the plugin's own smoke test. */

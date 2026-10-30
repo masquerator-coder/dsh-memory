@@ -646,6 +646,25 @@ class SemanticMemory:
                 "episode_ids": list(prior.meta.get("episode_ids") or []),
             }
         episode_ids = list(fact.episode_ids or [])
+        # Re-asserting a closed triple must not erase the evidence that
+        # supported it before it was closed. The snapshot above preserves the
+        # old ids inside `l3_changes`, but `provenance()` and
+        # `edge_lost_its_sources` read the live `meta`, so dropping them here
+        # made a well-evidenced edge look single-sourced after a reopen.
+        # Order is stable (oldest first) and duplicates collapse, so repeated
+        # reopens cannot inflate the list.
+        if prior is not None:
+            merged: list[str] = []
+            seen: set[str] = set()
+            for candidate in [
+                *(prior.meta.get("episode_ids") or []),
+                *episode_ids,
+            ]:
+                key = str(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(key)
+            episode_ids = merged
         meta = {
             "episode_ids": episode_ids,
             "observed_context": fact.observed_context or {},
@@ -789,23 +808,40 @@ class SemanticMemory:
                 )
 
         if winner == "existing":
-            decision = self._create_edge(project_id, head, relation, tail, fact, valid_from, recorded_at)
-            if decision.edge is not None:
-                with self.store.transaction():
-                    self.store.execute(
-                        """UPDATE l3_edges SET valid_to = ?, meta = json_set(meta, '$.closed_reason', ?)
-                           WHERE edge_id = ?""",
-                        (valid_from, "superseded", decision.edge.edge_id),
-                    )
-                    self._record_change(
-                        project_id,
-                        kind="edge.closed",
-                        target_kind="edge",
-                        target_id=decision.edge.edge_id,
-                        detail={"reason": "superseded", "by_policy": policy},
-                    )
-            decision.status = "closed"
-            return decision
+            # The incumbent belief wins on the recency tie-break, so the
+            # incoming claim is *rejected*: nothing is closed and nothing is
+            # created. This branch used to mint an edge and immediately close
+            # it, then report that freshly-closed row as `decision.edge` with
+            # status "closed". Three things were wrong with that: it left a
+            # permanently `superseded` row in `l3_edges` that never held the
+            # belief, `closed_edge_ids` named nobody, and `decision.edge`
+            # pointed at the loser rather than the edge that survived.
+            with self.store.transaction():
+                self._record_change(
+                    project_id,
+                    kind="edge.rejected",
+                    target_kind="edge",
+                    target_id=existing_edge.edge_id,
+                    detail={
+                        "head": head.name,
+                        "relation": relation,
+                        "tail": tail.name,
+                        "reason": "older_than_incumbent",
+                        "incumbent": existing_edge.edge_id,
+                        "by_policy": policy,
+                    },
+                    anchor_id=fact.anchor_id,
+                    recorded_at=recorded_at,
+                )
+            return EdgeDecision(
+                status="rejected",
+                reason="older_than_incumbent",
+                edge=self.get_edge(existing_edge.edge_id),
+                conflict={
+                    "incumbent": existing_edge.edge_id,
+                    "policy": policy,
+                },
+            )
 
         decision = self._create_edge(project_id, head, relation, tail, fact, valid_from, recorded_at)
         if decision.edge is None:

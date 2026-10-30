@@ -269,3 +269,29 @@ def _ctx(tools=(), entities=(), environment=None):
     return SkillContext(
         tools=frozenset(tools), entities=frozenset(entities), environment=dict(environment or {})
     )
+def test_degenerate_query_is_refused_by_both_backends(memory: MemorySystem, project: str):
+    """A zero or non-finite query vector must return nothing on every backend.
+
+    The fallback path skipped a zero vector (cosine is undefined) while the
+    vec0 path did not: its Euclidean distance is the stored norm, which came
+    back as a 0.5 cosine-distance -- a degenerate query scored as a half match
+    against every row. A NaN component poisoned the ranking instead.
+    """
+    memory.remember(
+        project_id=project,
+        summary="a row so the vector table is non-empty",
+        event_type="note",
+        importance=0.7,
+    )
+    vectors = memory.store.vectors
+    dim = vectors.dim
+    nan = float("nan")
+    inf = float("inf")
+
+    assert vectors.knn("l2", [0.0] * dim) == []
+    assert vectors.knn("l2", [nan] + [0.0] * (dim - 1)) == []
+    assert vectors.knn("l2", [inf] + [0.0] * (dim - 1)) == []
+
+    # The guard must not be so eager that a real query stops working.
+    hits = memory.recall("a row so the vector table is non-empty", project_id=project)
+    assert hits.episodes

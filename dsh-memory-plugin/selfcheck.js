@@ -297,6 +297,8 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
   )
 
   // An actual answer to that question lets the write through, and only once.
+  // `selected` carries the chosen option's *label* (the host has no option-id
+  // field), so the granting label must include the bracketed marker.
   const granted = await assemble({
     run: async ({ runTool, emit }) => {
       emit({
@@ -308,7 +310,9 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
               {
                 type: 'text',
                 text: JSON.stringify({
-                  answers: [{ id: 'dsh-memory:skill-scope', selected: ['global'] }],
+                  answers: [
+                    { id: 'dsh-memory:skill-scope', selected: ['存成全局技能 [skill-scope:global]'] },
+                  ],
                 }),
               },
             ],
@@ -322,6 +326,59 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
   check(granted.anchorFirst.includes('**技能固化**'), 'the granted scenario still assembles')
   check(!asks[1]?.text.includes('未创建'), 'the answered question lets the global write through')
   check(asks[2]?.text.includes('未创建'), 'the grant is spent after one write')
+
+  // The real host shape: a label the model wraps in its own wording. The marker
+  // must be found inside it, which is the regression this covers.
+  const labelled = await assemble({
+    run: async ({ runTool, emit }) => {
+      emit({
+        type: 'tool/result',
+        data: {
+          message: {
+            toolCallId: 'call-label',
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  answers: [
+                    { id: 'dsh-memory:skill-scope', selected: ['Save as a global skill [skill-scope:global] (Recommended)'] },
+                  ],
+                }),
+              },
+            ],
+          },
+        },
+      })
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global', name: 'labelled-skill' })))
+    },
+  })
+  check(labelled.anchorFirst.includes('**技能固化**'), 'the label-marked scenario assembles')
+  check(!asks[3]?.text.includes('未创建'), 'a real option label containing the marker grants consent')
+
+  // A label that merely mentions "global" must not grant consent.
+  const looseWord = await assemble({
+    run: async ({ runTool, emit }) => {
+      emit({
+        type: 'tool/result',
+        data: {
+          message: {
+            toolCallId: 'call-loose',
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  answers: [{ id: 'dsh-memory:skill-scope', selected: ['use the global cache'] }],
+                }),
+              },
+            ],
+          },
+        },
+      })
+      asks.push(await runTool('skill_create', callArgs({ scope: 'global', name: 'loose-skill' })))
+    },
+  })
+  check(looseWord.anchorFirst.includes('**技能固化**'), 'the loose-word scenario assembles')
+  check(asks[4]?.text.includes('未创建'), 'a label that merely mentions global does not grant consent')
 
   // An explicit "project only" answer never grants global scope.
   const declined = await assemble({
@@ -346,7 +403,7 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
     },
   })
   check(declined.anchorFirst.includes('**技能固化**'), 'the declined scenario assembles')
-  check(asks[3]?.text.includes('未创建'), 'choosing the project option does not grant global')
+  check(asks[5]?.text.includes('未创建'), 'choosing the project option does not grant global')
 
   // A pending (timed-out) ask carries no answers; silence is not consent.
   const pending = await assemble({
@@ -359,7 +416,7 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
     },
   })
   check(pending.anchorFirst.includes('**技能固化**'), 'the pending scenario assembles')
-  check(asks[4]?.text.includes('未创建'), 'a timed-out ask grants nothing')
+  check(asks[6]?.text.includes('未创建'), 'a timed-out ask grants nothing')
 }
 
 console.log('recent work is bounded and conditional')

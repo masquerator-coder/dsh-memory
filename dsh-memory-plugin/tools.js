@@ -214,7 +214,8 @@ export function compileParameters(spec) {
  * @param {(sessionId?: string) => boolean} [deps.takeSkillScopeGrant] - consume the
  *   host-recorded answer to the global-skill question for one session.
  * @param {string} [deps.skillScopeQuestionId] - question id the host recognises.
- * @param {string} [deps.skillScopeGlobalId] - option id that grants global scope.
+ * @param {string} [deps.skillScopeGlobalId] - marker value that grants global scope.
+ * @param {string} [deps.skillScopeToken] - literal token the global option's label must contain.
  * @returns {object[]} registry-ready definitions.
  */
 export function buildTools({
@@ -224,6 +225,7 @@ export function buildTools({
   takeSkillScopeGrant,
   skillScopeQuestionId = 'dsh-memory:skill-scope',
   skillScopeGlobalId = 'global',
+  skillScopeToken = '[skill-scope:global]',
 }) {
   /** Resolve the project a tool call acts on, failing clearly when unknown. */
   const requireProject = async (exec) => {
@@ -469,7 +471,7 @@ export function buildTools({
           return textOutput(
             [
               '**未创建**：全局技能对本机所有项目可见，必须由用户明确同意。',
-              `请先调用 \`ask_user_question\`，把问题 id 设为 \`${skillScopeQuestionId}\`，其中一个选项的 id 设为 \`${skillScopeGlobalId}\`（例如「存成本项目技能」/「存成全局技能」），拿到用户的明确答复后再重试本工具。`,
+              `请先调用 \`ask_user_question\`，把问题 id 设为 \`${skillScopeQuestionId}\`，并让「全局」那个选项的 **label** 里包含标记 \`${skillScopeToken}\`，例如 label 写成「存成全局技能 ${skillScopeToken}」。（注意：options 只有 label/description，没有 id 字段；宿主回传的是用户所选选项的 label 原文。）`,
               '用户选了项目级，或没有答复，就改存 `scope="project"`；不要自行假定同意，也不要重复追问。',
             ].join('\n\n'),
           )
@@ -608,7 +610,7 @@ export function buildTools({
             return textOutput(
               [
                 '**未退役**：公共技能对本机所有项目可见，必须由用户明确同意。',
-                `请先调用 \`ask_user_question\`，问题 id 设为 \`${skillScopeQuestionId}\`，其中一个选项的 id 设为 \`${skillScopeGlobalId}\`，拿到用户答复后再重试。`,
+                `请先调用 \`ask_user_question\`，问题 id 设为 \`${skillScopeQuestionId}\`，并让「全局」选项的 label 包含标记 \`${skillScopeToken}\`，拿到用户答复后再重试。`,
               ].join('\n\n'),
             )
           }

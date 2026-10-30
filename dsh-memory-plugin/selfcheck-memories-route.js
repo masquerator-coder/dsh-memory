@@ -100,15 +100,26 @@ BridgeClient.prototype.call = async (command, payload = {}) => {
 
 apply(stub, {})
 
-/** Minimal Node request/response pair, enough for `jsonRoute`. */
+/**
+ * Send one request through a registered route.
+ *
+ * Every route is behind the per-process write token now (see
+ * `requestRejection`), so this performs the same handshake the settings page
+ * does and replays the token as a header.
+ *
+ * @param {string} path - route path.
+ * @param {object} payload - JSON body.
+ * @returns {Promise<any>} the `result` field.
+ */
 async function routeTo(path, payload) {
   const handler = ROUTES.get(path)
   if (!handler) throw new Error(`the ${path} route was not registered`)
+  const token = await handshake()
   const listeners = new Map()
   const req = {
     method: 'POST',
     url: path,
-    headers: { host: '127.0.0.1:58586' },
+    headers: { host: '127.0.0.1:58586', 'x-dsh-memory-token': token },
     socket: { remoteAddress: '127.0.0.1' },
     on(event, fn) {
       if (!listeners.has(event)) listeners.set(event, [])
@@ -133,6 +144,30 @@ async function routeTo(path, payload) {
   const envelope = JSON.parse(res._body)
   if (!envelope.ok) throw new Error(`route rejected: ${JSON.stringify(envelope.error)}`)
   return envelope.result
+}
+
+/** The write token, minted by the host and fetched once. */
+let cachedToken = null
+
+/**
+ * Fetch the token from the handshake route.
+ * @returns {Promise<string>} the current token.
+ */
+async function handshake() {
+  if (cachedToken !== null) return cachedToken
+  const handler = ROUTES.get('/dsh-memory/token')
+  if (!handler) throw new Error('the token route was not registered')
+  const res = {
+    statusCode: 0,
+    _body: '',
+    writeHead(status) { this.statusCode = status; return this },
+    end(chunk) { if (chunk) this._body += String(chunk) },
+  }
+  handler({ method: 'GET', url: '/dsh-memory/token', headers: { host: '127.0.0.1:58586' } }, res)
+  const envelope = JSON.parse(res._body)
+  if (!envelope.ok) throw new Error('the token handshake was refused')
+  cachedToken = String(envelope.result.token)
+  return cachedToken
 }
 
 /** POST to the memories route. */
