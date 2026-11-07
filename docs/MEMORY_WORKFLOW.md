@@ -50,13 +50,13 @@ session/disposed ──reviewSessionEnd───────▶ memory.remember(
 
 `systemPrompt.section.text(context)` 被同步调用，内部触发**异步**请求 `digest.anchor` 与当前项目的 `project.context`（`index.js`）：
 
-- 锚点缓存按 `cwd` 分槽：`@@dsh-memory` 计数行与画像行是全局的，紧随其后的**项目上下文**按项目不同；
+- 锚点缓存按 `cwd` 分槽：摘要/画像计数行是全局的，紧随其后的**项目上下文**按项目不同；
 - 15 秒内复用旧文本（`ANCHOR_REFRESH_MS` / `PROJECT_CONTEXT_REFRESH_MS`，均为 15 秒）；
 - 第一次装配时缓存为空，所以模型看到的是规则 + 占位文本：
-  `（还没有可用的记忆摘要。）`
-- 计数行**只含摘要规模、时间、用户画像规模**，不含摘要正文（`summary.py:867-922`）；项目上下文由 `project.context` 单独提供：`.agents/memory/` 下按 UTC 日期分的日文件（最新一天在前拼接，`memory_chars`，默认 ≤1200 字）与 `.agents/rules/*.md` 的全部规则（`rule_chars` / `max_rules`，默认 ≤2400 字 / 12 条，按文件名排序）；日文件还没生成、或 checkout 只读时回退到旧的单文件 `.agents/memory/MEMORY.md`，再无可用记录时用 `recent` 回退到该项目最新 8 条 L2 工作条目。没有记忆也没有规则的项目整节省略。
+  `（正在读取记忆摘要…）`
+- 记忆状态行**只含摘要规模、时间、用户画像规模**与三条固定指引（画像怎么读、全局摘要的覆盖范围、项目工作摘要的位置），不含摘要正文（`summary.py:867-922`）；项目上下文由 `project.context` 单独提供：`.agents/memory/` 下按 UTC 日期分的日文件（最新一天在前拼接，`memory_chars`，默认 ≤1200 字）与 `.agents/rules/*.md` 的全部规则（`rule_chars` / `max_rules`，默认 ≤2400 字 / 12 条，按文件名排序）；日文件还没生成、或 checkout 只读时回退到旧的单文件 `.agents/memory/MEMORY.md`，再无可用记录时用 `recent` 回退到该项目最新 8 条 L2 工作条目。没有记忆也没有规则的项目整节省略。
 
-锚点里的写入/读取职责说明只写工具定义装不下的部分——写入分四件事（不会自动保存、遇到什么值得记、一条一件事、什么不该存），召回分五件事（先用 `memory_recall`、换说法用 `memory_search`、摘要与 `.agents/memory/` 的工作记录只记工程动作、画像只读、`memory_forget` 是软删除），并说明项目约定/规则写到 `.agents/rules/`；工具名与参数不在此重复（`index.js` `ANCHOR_HEADER`）。技能的门槛、反例与存储位置写在 `skill_create` / `skill_retire` 的工具描述里，但锚点仍保留一段**无条件指引**（`**技能固化**`，三条：可复用任务→先 `skill_list` 查重、同类不重建，必要时 `skill_create` 同名覆盖或 `skill_retire` 退役，只存已验证、一次性不存、一会话最多新建 1 个；拿不准就存项目级，只有跨项目通用且不含私有信息才考虑全局；写全局须 `ask_user_question` 取得本次答复，授权一次性、10 分钟内有效）：早先把技能规则完全留在 schema 里时，模型每回合只被提醒写记忆、从不被提醒固化技能，项目连续多天零技能创建、全局技能零创建；这一行是使触发率从 0 变非零的最小代价。
+锚点里的写入/读取职责说明只写工具定义装不下的部分——写入四件事（不会自动保存、遇到什么值得记、一条一件事、什么不该存），召回四件事（先用 `memory_recall`、换说法用 `memory_search`、摘要与 `.agents/memory/` 的工作记录只记工程动作、画像由用户自己维护），项目规则两条（`rule_add` 写 `.agents/rules/<name>.md`、不要用 `memory_add` 存规则）；工具名与参数不在此重复（`index.js` `ANCHOR_HEADER`）。技能的门槛、反例与存储位置写在 `skill_create` / `skill_retire` 的工具描述里，但锚点仍保留一段**无条件指引**（`**技能固化**`，三条：可复用任务→先 `skill_list` 查重、同类不重建，必要时 `skill_create` 同名覆盖或 `skill_retire` 退役，只存已验证、一次性不存、一会话最多新建 1 个；默认存项目级，只有跨项目通用且不含私有信息才考虑全局；写全局须 `ask_user_question` 取得本次答复，授权一次性、10 分钟内有效）：早先把技能规则完全留在 schema 里时，模型每回合只被提醒写记忆、从不被提醒固化技能，项目连续多天零技能创建、全局技能零创建；这一行是使触发率从 0 变非零的最小代价。
 
 #### （2）第一次工具调用才注册项目
 
@@ -209,7 +209,7 @@ L3 写时校验顺序（`l3.py:512-619`）：
 - 只有 decision 进入材料，preference **没有**泄漏进摘要；
 - 摘要记录 `scope=global`, `reason=auto`, `status=ok`, `119 字 / 53 tokens`；
 - 15 秒后下一次提示词装配，锚点出现：
-  `全局记忆摘要：119 字（约 53 tokens），生成于 2026-10-25 23:09`
+  `- 全局记忆摘要：119 字（约 53 tokens），生成于 2026-10-25 23:09`
 
 > 注意：`ANCHOR_REFRESH_MS = 15s` 意味着摘要生成后的**前 15 秒内**，锚点仍是旧的；这是为了让提示词装配不阻塞在子进程上。
 

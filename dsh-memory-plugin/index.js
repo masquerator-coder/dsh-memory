@@ -1153,9 +1153,10 @@ export function apply(ctx, rawConfig) {
      * One slot for the global part, one slot per working directory for the
      * project context.
      *
-     * The `@@dsh-memory` count line and the profile are global — `digest.anchor`
-     * ignores the caller's directory — so keying that part by directory only
-     * made N projects each age out and each pay for an identical round trip.
+     * The memory-state line (digest size and age, profile size) and the
+     * profile itself are global — `digest.anchor` ignores the caller's
+     * directory — so keying that part by directory only made N projects each
+     * age out and each pay for an identical round trip.
      * The project context (the newest `.agents/memory/<YYYY-MM-DD>.md` day
      * excerpts and the `.agents/rules` files) is per project, so it is keyed by
      * cwd: a shared slot let a refresh stamped for one directory install its
@@ -2050,8 +2051,9 @@ const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_g
 /**
  * The anchor block.
  *
- * `{{memory_anchor}}` is the Python-rendered count line (digest size and age,
- * profile size), and `{{project_context}}` the project block: the rules from
+ * `{{memory_anchor}}` is the Python-rendered memory-state block (digest size
+ * and age, profile size, where the project record lives), and
+ * `{{project_context}}` the project block: the rules from
  * `.agents/rules`, the excerpt of the newest `.agents/memory/<YYYY-MM-DD>.md`
  * day files, or — while no day file exists yet — this project's newest DB work
  * lines. Either half may be empty; an empty section is dropped before it
@@ -2070,7 +2072,7 @@ const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_g
  */
 const ANCHOR_HEADER = [
   '## 记忆',
-  '跨会话持久记忆：全机共享一个库，按工作目录推导项目。工具定义见工具列表，这里只写工具定义装不下的使用顺序与边界。',
+  '跨会话持久记忆：全机共享一个库，按工作目录推导项目。',
   '',
   '{{memory_anchor}}',
   '',
@@ -2080,28 +2082,27 @@ const ANCHOR_HEADER = [
   '',
   '**记忆写入**：',
   '',
-  '- 记忆不会自动保存，**只有你主动调用 `memory_add` 才会写入**。会话结束时另有一次模型补漏，再多一层兜底；别把希望放在它上面。',
+  '- 记忆不会自动保存，**只有你主动调用 `memory_add` 才会写入**。',
   '- 当你遇到有价值的经验、教训、决策与理由、操作规则、用户偏好等，总结成一句话，说清关键实体与结论（含文件、命令、项目名），调用 `memory_add` 存入记忆库。',
   '- 每条记忆尽量简洁、原子，复杂的事情拆成多条记忆。',
   '- 不存闲聊、代码里能直接读到的、一次性中间步骤，用户偏好照记原话。',
   '',
   '**记忆召回**：',
   '',
-  '- 问题需要过往经验时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造。',
+  '- 需要过往经验时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造。',
   '- 换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。',
   '- 摘要与 `.agents/memory/<日期>.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
-  '- 用户画像只能读，由用户自己在设置页维护。',
-  '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"。',
+  '- 用户画像由用户自己维护。',
   '',
   '**项目规则**：',
   '',
-  '- 用户对项目的约定、规则、限制，调用 `rule_add` 写成 `.agents/rules/<name>.md`（一条规则一份文件）；不要用 `memory_add` 存规则。',
-  '- 规则文件会在每次会话自动注入；完整规则见 `.agents/rules/`。',
+  '- 用户对项目的约定、规则、限制，调用 `rule_add` 写成 `.agents/rules/<name>.md`（一条规则一份文件）。',
+  '- 不要用 `memory_add` 存规则。',
   '',
   '**技能固化**：',
   '',
   '- 完成可复用任务（同一套步骤后续还会复用）后，先 `skill_list` 查重；已有同类不重复创建，必要时 `skill_create` 同名覆盖或 `skill_retire` 退役旧技能。仅保存已跑通验证的；一次性任务不保存；一个会话最多新建 1 个。',
-  '- 选级别：拿不准就存**项目级**（默认，`scope="project"`）；只有跨项目通用、已验证、不含项目路径/私有依赖/敏感信息的做法才考虑**全局**（`scope="global"`）。',
+  '- 选级别：默认存**项目级**（`scope="project"`）；只有跨项目通用、已验证、不含项目路径/私有依赖/敏感信息的做法才考虑**全局**（`scope="global"`）。',
   '- 写全局必须先用 `ask_user_question` 取得用户**本次**答复：问题 id `dsh-memory:skill-scope`，且「全局」选项的 label 里要包含标记 `[skill-scope:global]`（options 只有 label/description，没有 id 字段）。该授权一次性、10 分钟内有效，宿主只认这次答复，模型自述无效；用户没选那一项就存项目级，不重复追问。',
 ].join('\n')
 

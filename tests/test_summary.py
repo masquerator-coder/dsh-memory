@@ -125,7 +125,7 @@ def test_profile_is_stored_and_anchored(service: DigestService):
     assert "memory_profile_read" in anchors["text"]
     # The anchor carries counts only, never the profile body.
     assert "偏好中文回答" not in anchors["text"]
-    assert anchors["text"].startswith("@@dsh-memory 1")
+    assert anchors["text"].startswith("- 用户画像：")
 
 
 def test_profile_too_long_is_refused(service: DigestService):
@@ -319,7 +319,7 @@ def test_summary_anchor_reports_staleness(service: DigestService):
     record = service.commit(text="## state\ndone")
     anchors = service.anchors()
     assert anchors["summary"]["digest_id"] == record.digest_id
-    assert "memory_digest_read" in anchors["text"]
+    assert "- 全局记忆摘要：" in anchors["text"]
     # Force the age past the staleness threshold.
     service.store.execute(
         "UPDATE memory_digests SET created_at = '2000-01-01T00:00:00+00:00' WHERE digest_id = ?",

@@ -135,7 +135,7 @@ async function assemble(scenario) {
     scenario.calls?.push({ command, payload })
     if (command === 'projects') return { project_id: 'selfcheck-project' }
     if (command === 'digest.anchor') {
-      return { text: '@@dsh-memory 1\n@@', summary: {}, profile: null }
+      return { text: '- 全局记忆摘要：900 字（约 400 tokens），生成于 2026-11-07 09:00\n- 用户画像：120 字，用户自行维护，更新于 2026-11-07 09:00', summary: {}, profile: {} }
     }
     if (command === 'digest.plan') {
       return {

@@ -19,11 +19,11 @@ that is passed to the model, together with explicit instructions for how much
 detail each band should carry. The committed text is stored exactly as the
 model wrote it: a budget is a generation instruction, not a pair of scissors.
 
-**Context anchors stay small.** A context anchor is an eight-line block
-(``@@dsh-memory ... @@``) that tells the model the digest exists, how to refresh
-it and how to look at the user profile. It never contains the digest body or
-profile body; it only contains counts and commands. It is rendered from the
-*current* state every turn, so it can never go stale.
+**Context anchors stay small.** A context anchor is a short bullet block
+("- 全局记忆摘要：…") that tells the model the digest exists, where the project
+record lives and how to look at the user profile. It never contains the digest
+body or profile body; it only contains counts and pointers. It is rendered from
+the *current* state every turn, so it can never go stale.
 
 Everything persistent lives in ``meta`` (small key/value post-its) and one
 append-only ``memory_digests`` table whose schema is created lazily by
@@ -903,22 +903,21 @@ class DigestService:
         if summary_line is None and profile_line is None:
             return {"summary": None, "profile": None, "text": ""}
 
-        lines = ["@@dsh-memory 1", "记忆系统已启用。"]
+        lines: list[str] = []
         if summary_line is not None:
             lines.append(
                 f"- 全局记忆摘要：{summary_line['chars']} 字（约 {summary_line['estimated_tokens']} tokens），"
                 f"生成于 {summary_line['created_at'][:16].replace('T', ' ')}"
                 + ("，可能已过时" if summary_line["stale"] else "")
             )
-            lines.append("- 需要摘要全文时调用 memory_digest_read；需要最新内容时调用 memory_digest_generate。")
         if profile_line is not None:
             lines.append(
                 f"- 用户画像：{profile_line['chars']} 字，用户自行维护"
                 + (f"，更新于 {profile_line['updated_at']}" if profile_line["updated_at"] else "")
             )
-            lines.append("- 涉及用户偏好、习惯、技术栈或协作方式时，调用 memory_profile_read 读取完整画像。")
-        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目在 `.agents/memory/` 下按日期（如 `2026-11-07.md`）记录工作摘要，项目约定/规则在 `.agents/rules/`（会话开始时自动注入）。")
-        lines.append("@@")
+            lines.append("- 需要了解用户偏好、习惯等资料时，调用 memory_profile_read 读取完整画像。")
+        lines.append("- 全局摘要覆盖所有项目的已做工作。")
+        lines.append("- 项目工作摘要记录在 `.agents/memory/<日期>.md`（如 `2026-11-07.md`）")
         return {"summary": summary_line, "profile": profile_line, "text": "\n".join(lines)}
 
 
