@@ -3,8 +3,9 @@
 The digest is a **single global work log across every project**. Its job is to
 tell a later model what has already been done, so it deliberately excludes
 lessons, preferences, speculation and future plans. Each project also gets a
-Markdown summary file at its repository root (``DSH_MEMORY.md``) so the project
-itself carries a readable record of its work.
+Markdown summary at ``.agents/memory/MEMORY.md`` (see
+:mod:`memory_system.project_files`) so the checkout itself carries a readable
+record of its work.
 
 **Generation is a pure function of the prompt.** :class:`DigestService` turns a
 selection of memories into a *request* (system + user message, prompt version,
@@ -47,6 +48,12 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .errors import ConflictError, NotFoundError, ValidationError
+from .project_files import (
+    LEGACY_PROJECT_SUMMARY_FILE,
+    PROJECT_MEMORY_RELATIVE,
+    PROJECT_SUMMARY_MARKER,
+    memory_path,
+)
 from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens
@@ -79,9 +86,11 @@ AUTO_MODE = "idle"
 SCOPES: tuple[str, ...] = ("global",)
 LEGACY_SCOPES: tuple[str, ...] = ("project",)
 
-# Each project owns a human-readable work summary at its repository root.
-PROJECT_SUMMARY_FILE = "DSH_MEMORY.md"
-PROJECT_SUMMARY_MARKER = "<!-- dsh-memory:project-summary -->"
+# Each project owns a human-readable work summary inside its checkout. The
+# legacy root ``DSH_MEMORY.md`` is only recognized so an old checkout can be
+# migrated; new writes always go to the ``.agents`` location.
+PROJECT_SUMMARY_FILE = PROJECT_MEMORY_RELATIVE
+LEGACY_SUMMARY_FILE = LEGACY_PROJECT_SUMMARY_FILE
 PROJECT_SUMMARY_MAX_ITEMS = 300
 # A work log names a project by its label, not by its checkout path: the
 # headings are fixed overhead against the digest budget, and a Windows path
@@ -872,7 +881,7 @@ class DigestService:
 
         Only the one global digest is advertised. Legacy project digests are
         deliberately ignored: project-level detail now lives in that project's
-        ``DSH_MEMORY.md`` file instead of the prompt path.
+        ``.agents/memory/MEMORY.md`` file instead of the prompt path.
         """
         # Nothing ever persisted this flag, so it was always the default: an
         # anchor carries the digest unless the caller says otherwise.
@@ -915,7 +924,7 @@ class DigestService:
                 + (f"，更新于 {profile_line['updated_at']}" if profile_line["updated_at"] else "")
             )
             lines.append("- 涉及用户偏好、习惯、技术栈或协作方式时，调用 memory_profile_read 读取完整画像。")
-        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目根目录另有 DSH_MEMORY.md 记录该项目的工作摘要。")
+        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目在 `.agents/memory/MEMORY.md` 记录工作摘要，项目约定/规则在 `.agents/rules/`（会话开始时自动注入）。")
         lines.append("@@")
         return {"summary": summary_line, "profile": profile_line, "text": "\n".join(lines)}
 
@@ -933,12 +942,21 @@ def _age_days(raw: str) -> float:
 def write_project_summaries(
     memory: MemorySystem, *, project_id: str | None = None
 ) -> list[str]:
-    """Write a readable work summary into every project's root directory.
+    """Write a readable work summary into every project's checkout.
 
     The file is a *derived* view of L2: it never feeds back into recall or the
-    global digest. A project without a registered ``root_path`` is skipped, as
-    is a root that no longer exists. Failures are contained per project so a
-    read-only checkout cannot break digest generation.
+    global digest. It lives at ``<root>/.agents/memory/MEMORY.md``; the target
+    directory is created on demand. A project without a registered
+    ``root_path`` is skipped, as is a root that no longer exists. Failures are
+    contained per project so a read-only checkout cannot break digest
+    generation.
+
+    After a successful write, a legacy root ``DSH_MEMORY.md`` is removed when
+    it still carries this writer's marker. That file is a generated artifact
+    from an older layout, not user content, so leaving it behind would keep
+    two copies of the same derived summary and make readers wonder which one
+    is current. A root file *without* the marker is left alone: it may be the
+    user's own notes.
     """
     if project_id:
         try:
@@ -956,19 +974,38 @@ def write_project_summaries(
         if not root.is_dir():
             continue
         text = _project_summary_markdown(memory, project)
-        target = root / PROJECT_SUMMARY_FILE
+        target = memory_path(root)
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
             if target.is_file() and target.read_text(encoding="utf-8") == text:
+                _remove_legacy_summary(root)
                 continue
             temporary = target.with_name(target.name + ".tmp")
             with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
             os.replace(temporary, target)
+            _remove_legacy_summary(root)
         except OSError:
             # A read-only or vanished checkout must not fail the digest call.
             continue
         written.append(str(target))
     return written
+
+
+def _remove_legacy_summary(root: Path) -> None:
+    """Delete the old root artifact if it is provably one of ours.
+
+    The marker is written on line one by every version of the writer, so its
+    presence identifies a generated file; a ``DSH_MEMORY.md`` the user wrote by
+    hand does not have it and survives. A failure here is ignored: the new
+    location has already been written, and cleanup is best effort.
+    """
+    legacy = root / LEGACY_PROJECT_SUMMARY_FILE
+    try:
+        if legacy.is_file() and legacy.read_text(encoding="utf-8").startswith(PROJECT_SUMMARY_MARKER):
+            legacy.unlink()
+    except OSError:
+        pass
 
 
 def _project_summary_markdown(memory: MemorySystem, project: Any) -> str:
@@ -995,6 +1032,7 @@ def _project_summary_markdown(memory: MemorySystem, project: Any) -> str:
         "",
         f"> 项目 ID：`{project.project_id}` · 由 dsh-memory 自动维护 · 更新于 {updated}",
         "> 只记录已做过的工作；经验教训与偏好不在此文件中。",
+        "> 用户对项目的约定、规则、限制在 `.agents/rules/`（一条规则一份 markdown）。",
         "",
     ]
     if not rows:

@@ -5,7 +5,7 @@
 | 部分 | 位置 | 职责 |
 |---|---|---|
 | Python 核心 | `memory_system/` | 存储、衰减、检索、图谱校验、摘要、画像、备份、L4（项目技能与全局技能都是文件）。单文件 SQLite，无必需第三方依赖 |
-| DSH 插件 | `dsh-memory-plugin/` | 把核心接入 DeepSeek Harness：12 个模型工具、系统提示词锚点、会话事件、摘要的模型调用、设置页路由 |
+| DSH 插件 | `dsh-memory-plugin/` | 把核心接入 DeepSeek Harness：13 个模型工具、系统提示词锚点（含项目记忆与规则）、会话事件、摘要的模型调用、设置页路由 |
 
 插件本身不实现记忆逻辑，所有读写都通过子进程 + 行分隔 JSON 协议交给 Python 核心。因此 Python 侧可以脱离 DSH 单独使用和测试。
 
@@ -78,10 +78,12 @@ dsh plugin --profile web add D:\Coding\dsh-memory
 ```text
 DSH 宿主进程（JS 插件）                   Python 子进程（memory_system）
 ──────────────────────────               ─────────────────────────────
-apply(ctx)：注册 12 个工具 / 锚点 / 事件 / 路由
+apply(ctx)：注册 13 个工具 / 锚点 / 事件 / 路由
 系统提示词装配 ──digest.anchor──────────▶ 读摘要元信息 + 用户画像规模
+系统提示词装配 ──project.context───────▶ 读 .agents/memory/MEMORY.md + .agents/rules/*
 memory_add ────memory.remember──────────▶ L2 事件 + L3 事实（同一事务）
-                                            └─▶ 重写 <repo>/DSH_MEMORY.md
+                                            └─▶ 重写 <repo>/.agents/memory/MEMORY.md
+rule_add ──────rule.write────────────────▶ <repo>/.agents/rules/<name>.md
 skill_create ──skill.create─────────────▶ <repo>/.agents/skills/<name>/SKILL.md
                                             或 ~/.agents/skills/<name>/SKILL.md（需用户同意）
 turn/end ──15s 防抖──▶ digest.plan ──▶ 宿主 llm.stream ──▶ digest.commit
@@ -90,9 +92,9 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 ```
 
 1. **插件加载**：只注册工具、提示词 section（记忆锚点）、会话事件和设置页路由，**不启动子进程**。第一次真正调用工具时才 spawn。
-2. **首次提示词装配**：异步请求 `digest.anchor` 与当前项目的 `memory.list`，按 `cwd` 缓存 15 秒。首次没有缓存，模型看到的是占位文本。锚点含摘要规模、时间、画像规模，以及**本项目最近 8 条以内、合计不超过 400 字的工作摘要**（`RECENT_CHARS`），**不含全文**；没有记忆的项目不出现这一节。技能的使用与创建方式由工具定义和 DSH 自带的技能目录提供，提示词不再另列索引。
-3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并立即生成该项目的 `DSH_MEMORY.md`。
-4. **读写**：模型通过 `memory_add` 主动写入记忆；通过 `memory_recall` / `memory_search` / `memory_digest_read` / `memory_profile_read` 读取。**当前版本不会自动抄录对话。**
+2. **首次提示词装配**：异步请求 `digest.anchor` 与当前项目的 `project.context`，按 `cwd` 缓存 15 秒。首次没有缓存，模型看到的是占位文本。锚点含摘要规模、时间、画像规模，以及**项目上下文**：`.agents/memory/MEMORY.md` 的最新工作行（不超过 1200 字）与 `.agents/rules/*.md` 的全部规则（不超过 2400 字 / 12 条）；记忆文件缺失时回退到该项目最新的 L2 工作条目（最多 8 条）。没有记忆也没有规则的项目不出现这一节。提示词里只是摘录——完整历史从 `.agents/memory/MEMORY.md` 读，完整规则从 `.agents/rules/` 读。技能的使用与创建方式由工具定义和 DSH 自带的技能目录提供，提示词不再另列索引。
+3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并立即生成该项目的 `.agents/memory/MEMORY.md`（目录按需创建）。
+4. **读写**：模型通过 `memory_add` 主动写入记忆；通过 `rule_add` 把用户对项目的约定、规则写成 `.agents/rules/<name>.md`；通过 `memory_recall` / `memory_search` / `memory_digest_read` / `memory_profile_read` 读取。**当前版本不会自动抄录对话。**
 5. **技能**：模型通过 `skill_create` 把**验证过、可复用**的做法写成技能文件——默认是**本项目仓库里的文件**（`.agents/skills/<name>/SKILL.md`），用户明确同意后也可写全局的 `~/.agents/skills/<name>/SKILL.md`。DSH 自己的技能目录会列出它们、用 `skill` 工具加载；`skill_list` / `skill_get` 查看，`skill_run` 记录执行结果，`skill_retire` 把目录移进 `.retired/`。见下文「L4 程序性技能」。
 6. **心跳（默认关闭）**：自上次写入起每经过 `heartbeatSteps` 个**模型步**（`step/start`，一个模型步 = 一次模型调用）在提示词尾部出现一次记忆提醒，随后重新计数；`0` 关闭。提醒文本在系统提示词里，所以它每出现/消失一次都会让前缀缓存失效，默认关。
 7. **回合结束**：`turn/end` 后等待 `autoSummaryDelayMs`（默认 15 秒）。同一会话再次结束会取消并重排定时器；全局摘要同时只允许一个生成任务。
@@ -103,8 +105,9 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | 时机 | 触发者 | 动作 | 写库 |
 |---|---|---|---|
 | 插件加载 | DSH | 注册工具 / 锚点 / 事件 / 路由 | 否 |
-| 首次提示词装配 | 系统提示词 | 异步刷新锚点与本项目最近工作，首屏显示「正在读取记忆摘要…」 | 否 |
-| 首次工具调用 | 模型 | 注册项目 + 创建 `DSH_MEMORY.md` | 是 |
+| 首次提示词装配 | 系统提示词 | 异步刷新锚点与项目上下文（`.agents/memory/MEMORY.md` 摘录 + `.agents/rules/*.md`），首屏显示「正在读取记忆摘要…」 | 否 |
+| 首次工具调用 | 模型 | 注册项目 + 创建 `.agents/memory/MEMORY.md`（并清理带标记的旧 `DSH_MEMORY.md`） | 是 |
+| 用户给出项目约定 | 模型 | `rule_add` → 写 `<repo>/.agents/rules/<name>.md`（不写库、不进摘要） | 否（只写文件） |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
 | 模型判断做法可复用 | 模型 | `skill_create` → 写 `<repo>/.agents/skills/...`；用户同意后也可写 `~/.agents/skills/...` | 是（L2 审计记录） |
 | 技能被真正用过 | 模型 | `skill_run` → `<memoryHome>/l4_runs/<项目>/<name>.jsonl` 执行记录与成功率（全局技能记在 `_global`） | 否（写台账） |
@@ -117,7 +120,9 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | `session/disposed` | 插件 | 一次模型补写检查 | 是（0–N 条） |
 | 设置页操作 | 用户 | 改配置 / 画像 / 条目 / 摘要 / 备份 | 是 |
 
-## 模型可用的 12 个工具
+## 模型可用的 13 个工具
+
+13 个工具 = 7 个 `memory_*` 记忆工具 + 1 个 `rule_add` 规则工具 + 5 个 `skill_*` 技能工具。
 
 | 工具 | 作用 |
 |---|---|
@@ -128,6 +133,7 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | `memory_profile_read` | 读取用户自己维护的画像 |
 | `memory_digest_read` | 读取全局摘要全文 |
 | `memory_digest_generate` | 调用一次模型，重新生成全局摘要 |
+| `rule_add` | 把用户对项目的约定、规则写成 `<repo>/.agents/rules/<name>.md`；同名文件不覆盖，规则不进记忆库与摘要 |
 | `skill_create` | 把一个验证过的做法写成技能文件：默认本项目 `.agents/skills/<name>/SKILL.md`；`scope=global` 写 `~/.agents/skills/<name>/SKILL.md`——全局必须先用 `ask_user_question`（问题 id `dsh-memory:skill-scope`）取得用户答复，宿主读到答复才放行 |
 | `skill_list` | 列出本项目可见的技能（磁盘上的项目技能 + `~/.agents/skills` 里的全局技能） |
 | `skill_get` | 读取一个技能的完整定义（项目技能与全局技能都直接返回 `SKILL.md` 正文） |
@@ -185,6 +191,14 @@ score = similarity × (0.2 + 0.8 × R)
 
 技能**定义**不进入 L2/L3/摘要：它们不在 `memory_search` / `memory_recall` / 全局摘要里，只在 DSH 的技能目录、`skill_list` 和文件本身。创建动作会留一条 L2 审计记录（何时、从哪个项目、存到哪个文件），但它不参与检索排序或摘要生成。
 
+### 项目规则（`.agents/rules/`）
+
+用户对项目的约定、规则、限制（例如“注释用中文”“不要写 release 分支”）不是记忆条目，而是**一条一份的 markdown 文件**，放在项目根目录的 `.agents/rules/`：
+
+- 文件名 kebab-case（如 `project-memory-file-location.md`）；frontmatter 含 `name` / `description` / `metadata.origin` / `metadata.title` / `metadata.created-at`，正文以 `# <中文标题>` 开头，后面是规则本身；
+- 模型用 `rule_add` 写入（同名文件不覆盖，先读再改）；插件在会话首次装配系统提示词时自动读取并注入全部规则（不超过 2400 字 / 12 条）；
+- 规则是**要求**而不是做过的工作：不写记忆库、不参与召回、不进入全局摘要。它与 `.agents/memory/MEMORY.md` 的工作记录分开，避免“做过什么”和“应该怎么做”混在一起；规则文件进版本库，工作记录是派生文件、默认忽略。
+
 ### 检索路径
 
 `memory_recall` 是启发式路由，不调用模型：
@@ -204,7 +218,8 @@ score = similarity × (0.2 + 0.8 × R)
 ~/.dsh/memory/            # 可由 memoryHome / DSH_MEMORY_HOME / DSH_HOME 覆盖
 ├── memory.db             # 唯一主库（WAL，运行时伴生 -wal / -shm）
 └── exports/              # 超大备份落盘
-<repo>/DSH_MEMORY.md      # 每个项目根目录的派生工作摘要
+<repo>/.agents/memory/MEMORY.md   # 每个项目的派生工作摘要（gitignore）
+<repo>/.agents/rules/<name>.md    # 每个项目的规则，一条一份（进版本库）
 ```
 
 一个 SQLite 文件**跨项目共享**，项目靠 `project_id` 隔离。主要表：
@@ -217,16 +232,16 @@ score = similarity × (0.2 + 0.8 × R)
 
 `meta` 保存 `schema_version`、`embedding_dim`、`embedding_fingerprint`、摘要长度、用户画像、维护时间戳等。实测默认指纹为 `hash:256:True`。没有 `sqlite-vec` 时自动退化为普通表精确扫描，功能完整、只是更慢。
 
-`DSH_MEMORY.md` 不是主存储，只是从 L2 工作记录派生的可读视图（最多 300 条，原子替换）。它不会反馈进召回，也不进入全局摘要材料。
+`.agents/memory/MEMORY.md` 不是主存储，只是从 L2 工作记录派生的可读视图（最多 300 条，原子替换）。它不会反馈进召回，也不进入全局摘要材料。旧版根目录的 `DSH_MEMORY.md` 只在带 `<!-- dsh-memory:project-summary -->` 标记时会被识别为派生文件：下次成功写入后自动删除；没有标记的同名文件视为用户手写内容，保留不动。
 
 ## 全局摘要与用户画像
 
-- 只有**一份全局摘要**，覆盖所有项目；`project` 作用域仅为历史兼容保留。项目级内容由 `DSH_MEMORY.md` 承载。
+- 只有**一份全局摘要**，覆盖所有项目；`project` 作用域仅为历史兼容保留。项目级工作记录由 `.agents/memory/MEMORY.md` 承载，项目规则在 `.agents/rules/`。
 - `digest.plan` 收集所有项目的 L2 工作记录，排除 `preference` / `user_message`、已遗忘和已被替代的条目；每个项目最多 160 条，材料预算随摘要长度档位变化。
 - 摘要由**宿主侧模型**生成：插件先拿材料与提示词，用会话最近一次使用的 provider/model 调 `ctx.llm.stream`，再原样 `digest.commit`。提交时**不按预算截断**。
 - 模型调用带宿主会话 id（`llm.stream({sessionId})`）：按会话路由的提供方（如 `opencode-go` 要求 `x-opencode-session`）缺这个头会直接 400。插件用本次会话的 id；设置页手动生成时退回到本进程最近一次见到的会话。
 - 生成需要本进程记录过模型路由；库里没有可总结的工作记录时不会硬编摘要。自动生成与手动生成走同一条路径，只有 `reason` 不同。失败的尝试仍会留一条 `status=error` 的摘要行（`latest()` 会忽略它），但**不会**推进“摘要已更新”的时间戳。
-- 每次提交后会刷新所有已注册项目的 `DSH_MEMORY.md`。
+- 每次提交后会刷新所有已注册项目的 `.agents/memory/MEMORY.md`。
 
 ## 插件配置
 
@@ -265,6 +280,13 @@ python -m memory_system --list              # 查看支持的命令
 
 每次请求可带 `home`、`db_path`、`embedding_preset`。stdio 强制 UTF-8：Windows 旧控制台代码页（GBK）曾把中文解码成乱码，因此 `memory_system.__main__` 按字节读取并按 UTF-8 解码。同一时刻只有一个请求在途；超时后先 `ping`，进程无响应才重启，避免响应错位。
 
+### 项目记忆与规则相关的命令
+
+- `project.context`：读取当前项目的记忆摘录与规则。请求 `{"cwd": "...", "memory_chars"?: 1200, "max_rules"?: 12, "rule_chars"?: 2400, "recent_limit"?: 8}`；返回 `{"project_id", "root_path", "memory": {"path", "exists", "chars", "updated", "excerpt", "truncated"}, "rules_dir", "rules": [{"name", "title", "description", "path", "chars", "content"}], "rules_truncated", "recent": [{"summary"}]}`。记忆文件不存在时（`memory.exists=false`）`recent` 给出该项目最新的 L2 工作条目作兜底；第一次访问一个 checkout 时会先生成派生文件。
+- `rule.write`：把一条规则写成 `<projectRoot>/.agents/rules/<name>.md`。请求 `{"cwd": "...", "name": "kebab-case", "title": "...", "description": "...", "content": "..."}`，返回 `{"path", "name", "project_id", "root_path"}`；同名文件已存在时返回 `conflict`，不覆盖。
+
+`status` 的返回里，`project_memory` 与 `project_rules` 分别是当前项目记忆文件与规则目录的路径；旧的 `project_summary` 键仍保留（现在同样指向 `.agents/memory/MEMORY.md`）。
+
 ## 设置页
 
 Web profile 下注册 `/dsh-memory/*` 路由：
@@ -280,14 +302,14 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 | `backup` | 导出 Markdown；从 Markdown 预览并恢复（只新增，不删除） |
 | `health` | 健康检查：桥接延迟、最近一次摘要尝试（含失败原因）、到期维护任务。设置页本身不调用它，供运维/脚本用 |
 
-修改记忆摘要会同时重算向量和 FTS body；`forget` 是软删除（`state='archived'` + `meta.forgotten_at`），可恢复；每次编辑都会刷新 `DSH_MEMORY.md`。
+修改记忆摘要会同时重算向量和 FTS body；`forget` 是软删除（`state='archived'` + `meta.forgotten_at`），可恢复；每次编辑都会刷新 `.agents/memory/MEMORY.md`。
 
 ## 已知边界
 
 这些是当前代码的实际行为，不是设计目标：
 
-1. **没有“会话开始”钩子。** 不会自动读取或注入 `DSH_MEMORY.md`，也不会预加载项目记忆。`AGENTS.md` 里的“先读 `DSH_MEMORY.md`”需要模型自己执行。
-2. **不自动采集对话。** 唯一由模型触发的写入是 `memory_add`；会话结束检查是额外补写。桥接层仍有 `memory.capture`（幂等、有测试），但插件不调用它——它留给需要自动采集的宿主，不是死代码。
+1. **没有“会话开始”钩子，但首次装配会注入项目上下文。** 插件没有 `session/created` / `session/start` 处理器；它在第一次系统提示词装配时读 `.agents/memory/MEMORY.md` 摘录与 `.agents/rules/*.md` 并注入锚点，之后按 `cwd` 缓存 15 秒。它不会抄录对话，也不会主动读取或注入其他文件。
+2. **不自动采集对话。** 唯一由模型触发的**记忆**写入是 `memory_add`（`rule_add` 写的是 `.agents/rules/` 里的规则文件，不进记忆库）；会话结束检查是额外补写。桥接层仍有 `memory.capture`（幂等、有测试），但插件不调用它——它留给需要自动采集的宿主，不是死代码。
 3. **锚点有 15 秒缓存，但写入会主动失效。** 摘要生成、画像保存、摘要删除都会立刻重读锚点，下一次装配就能看到新值；普通会话仍按 15 秒 TTL 刷新。冷启动（进程刚起或插件刚重载）的首个装配显示「正在读取记忆摘要…」，读完即替换，不再声称「还没有摘要」。
 4. **心跳按模型步计数，且只在默认关闭时无成本。** 监听 `step/start`（一次模型调用）：一个跑 30 次工具调用的长回合算 30 步。开启后每满一个窗口才出现一次并重新计数；关掉（`0`）则不进入提示词。
 5. **后台维护由插件定时问、Python 侧自限。** 每 `maintenanceIntervalMs`（默认 10 分钟）调用一次 `maintenance.run`；`decay` / `consolidate` / `communities` / `archive_scan` / `promotions` 各自按 `MaintenanceConfig` 的间隔决定是否真的执行，所以早到的 tick 只是一次空转。关掉 tick 后 `state` 列会重新开始滞后——召回实时计算 R 仍然正确。技能都是文件，没有 Hot/Warm/Cold 分层。
@@ -300,7 +322,7 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 ## 测试
 
 ```bash
-pytest            # 278 项
+pytest            # 312 项
 ```
 
 ## 文档

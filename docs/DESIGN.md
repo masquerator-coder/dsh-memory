@@ -1,6 +1,6 @@
 # DSH Memory — 系统设计
 
-本文档描述 `memory-system` 的架构、接口契约，以及**与原始设计方案不一致之处**。实现代码在 `memory_system/`，测试在 `tests/`（169 项，全部通过）。
+本文档描述 `memory-system` 的架构、接口契约，以及**与原始设计方案不一致之处**。实现代码在 `memory_system/`，测试在 `tests/`（312 项，全部通过）。
 
 > 目标 Agent 是 DeepSeek Harness，但核心不依赖 DSH：没有任何 `memory_system.*` 模块 import `@deepseek-ai/*`。宿主接入通过 `memory_system/adapters/turns.py` 定义的端口完成。
 
@@ -308,7 +308,8 @@ memory_system/
   l3.py            L3 图
   retrieval.py     路由 / 快慢路径 / RRF
   communities.py   社区检测与摘要
-  summary.py       全局工作摘要 / 项目根 Markdown / 用户画像
+  summary.py       全局工作摘要 / 项目记忆文件 / 用户画像
+  project_files.py 项目记忆文件与规则文件（`.agents/memory` / `.agents/rules`）
   migrate.py       嵌入模型迁移（逐层重建向量）
   l4.py            技能结构 / 预算规划 / 渲染
   skills.py        L4 注册表 / 匹配 / 运行记录
@@ -320,7 +321,7 @@ memory_system/
   adapters/
     turns.py       宿主端口（NormalizedEvent / TurnContext / ProjectResolver）
     dsh.py         DSH 接口桩（未实现，仅记录绑定点）
-tests/             204 项
+tests/             312 项
 ```
 
 **digest 的遗忘承诺**：digest 是宿主唯一注入提示词的路径，因此它与检索遵守同一条
@@ -332,6 +333,17 @@ tests/             204 项
 预算（300–3000 字）作为**生成指令**写入提示词：预算大时模型展开更多工作项与细节，
 预算小时只写每个项目的结论；`commit` 原样保存模型输出，不做按预算截断。
 
-**项目根摘要文件**：每个项目在 `root_path` 下维护一个 `DSH_MEMORY.md`，由 L2 工作记录
+**项目记忆文件**：每个项目在 `root_path` 下维护 `.agents/memory/MEMORY.md`，由 L2 工作记录
 按日期派生，记录该项目做过的工作，不进入召回或全局摘要。项目首次被解析（`projects`）
 以及每次记忆写入/编辑/遗忘/恢复、全局摘要提交后都会刷新；写失败被隔离，不影响记忆写入。
+它从仓库根挪进 `.agents/`：同为生成物，放在 agent 约定目录里比在仓库根丢一个文件更整洁，
+且项目可以选择忽略或跟踪它而不必再动布局。写入成功后，如果仓库根还留着一份带
+`<!-- dsh-memory:project-summary -->` 标记的旧 `DSH_MEMORY.md`，会被删除——那是旧布局的
+生成物，留着会出现两份“当前摘要”；没有标记的同名文件可能是用户手写内容，保留不动。
+
+**项目规则文件**：用户对项目的约定、规则、限制写在 `.agents/rules/<name>.md`，一条规则一份
+markdown，`name` / `description` / `metadata.title` 在 frontmatter，正文是规则本身。规则是
+**要求**而不是做过的工作，因此不写数据库、不进 L2/L3、不进摘要；模型通过 `rule_add`
+（桥接 `rule.write`）写入，同名文件不覆盖（要改就编辑文件，历史留在版本库里）。会话首次
+装配提示词时，插件通过 `project.context` 读记忆摘录（≤1200 字）与全部规则（≤2400 字 /
+12 条）注入锚点，因此模型开局就带着项目上下文，而不必先手动找文件。

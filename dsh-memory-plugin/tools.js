@@ -407,6 +407,42 @@ export function buildTools({
       },
     },
     {
+      name: 'rule_add',
+      description:
+        '把用户对当前项目的约定、规则或限制写成一份规则文件（.agents/rules/<name>.md，一条规则一份）。这类规则会随每次会话自动注入；同名规则已存在时不要重复创建，直接读取并按用户新要求改写该文件。',
+      parameters: {
+        name: {
+          type: 'string',
+          required: true,
+          description: '规则文件名：小写 kebab-case ASCII，如 commit-message-style。',
+        },
+        title: { type: 'string', required: true, description: '中文短标题。' },
+        description: { type: 'string', required: true, description: '一句话说明这条规则约束什么。' },
+        content: {
+          type: 'string',
+          required: true,
+          description: '规则正文：写清必须/禁止、适用范围与例外。',
+        },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args, exec) {
+        // The rule belongs to the project directory, not to a memory project
+        // id: the Python side resolves `.agents/rules/<name>.md` from `cwd`.
+        const result = await call(
+          'rule.write',
+          {
+            cwd: cwdOf(exec),
+            name: args.name,
+            title: args.title,
+            description: args.description,
+            content: args.content,
+          },
+          exec?.signal,
+        )
+        return textOutput(`已写入项目规则 \`${result?.path ?? ''}\`；它会在每次会话自动注入。`)
+      },
+    },
+    {
       name: 'skill_create',
       description:
         '把一个刚被验证过的程序性做法存成技能。默认存**本项目**：写入 `<项目根>/.agents/skills/<name>/SKILL.md`；传 `scope="global"` 则存成**公共技能**，写入 `~/.agents/skills/<name>/SKILL.md`，对本机所有项目可见。两个目录都是 DSH 技能目录扫描的位置，下一回合起模型目录（`available_skills`）会列出它，人和别的工具也读同一个文件。`name` 必填，必须是小写 kebab-case ASCII（如 `locate-failing-test`），中文标题放 `title`。只在做法可复用时调用：同一套步骤在不同任务里会被反复用到（例如定位失败的测试、发布前的检查、生成某类文件的固定流程）。一次性任务、只是读过代码、还没验证过的猜测都不要存。宁缺毋滥：一个会话最多新建 1 个技能，且必须先 `skill_list` 确认没有同类技能。**要存成公共技能（`scope="global"`）时，必须先用 `ask_user_question` 问用户、问题 id 设为 `dsh-memory:skill-scope`、其中一个选项 id 设为 `global`；宿主只认这次真实答复，没有它全局写入会被直接拒绝，模型参数里任何自我声明都无效。**',

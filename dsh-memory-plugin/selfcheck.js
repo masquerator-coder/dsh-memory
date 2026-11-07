@@ -7,18 +7,28 @@
  *
  * 1. the heartbeat counts model steps (`step/start`), not user turns, and the
  *    reminder text says so;
- * 2. the recent-work section appears only for a project that has memories,
- *    stays inside its character budget, and disappears without one;
- * 3. digest generation reaches a model even when no session in this process has
+ * 2. the anchor's project context is requested with the bridge budgets, shows
+ *    `.agents/rules` in order, shows the `.agents/memory/MEMORY.md` excerpt (or
+ *    the recent-work fallback while that file is missing), and stays out of an
+ *    assembly that has no working directory;
+ * 3. `rule_add` writes exactly one `.agents/rules/<name>.md` through the bridge
+ *    and reports the resulting path;
+ * 4. digest generation reaches a model even when no session in this process has
  *    used one yet, via the deployment default model — and carries the session
  *    id, without which providers that route per conversation reject the call;
- * 4. a maintenance tick asks the Python side for the due background tasks.
+ * 5. a maintenance tick asks the Python side for the due background tasks.
  *
  * Exits non-zero on the first failed expectation.
  */
 
 import { BridgeClient } from './bridge.js'
-import { apply } from './index.js'
+import {
+  apply,
+  PROJECT_MEMORY_CHARS,
+  PROJECT_RECENT_LIMIT,
+  PROJECT_RULES_CHARS,
+  PROJECT_RULES_MAX,
+} from './index.js'
 
 /**
  * The bridge must never start from a self-check.
@@ -35,7 +45,6 @@ BridgeClient.prototype.ensureChild = async () => {
 }
 
 const CWD = 'D:/selfcheck/project'
-const RECENT_BUDGET = 400
 
 let failures = 0
 
@@ -54,10 +63,13 @@ function check(condition, label) {
 
 /**
  * Render the prompt sections for one scenario, and expose what `apply` mounted.
- * @param {{memories?: Array<{summary: string}>, events?: Array<{type: string, data?: any}>, llm?: any, defaultModel?: any, calls?: Array<{command: string, payload: any}>, config?: object, run?: (assembled: any) => Promise<void>}} scenario - inputs.
+ * @param {{cwd?: string, memories?: Array<{summary: string}>, projectContext?: any, events?: Array<{type: string, data?: any}>, llm?: any, defaultModel?: any, calls?: Array<{command: string, payload: any}>, config?: object, run?: (assembled: any) => Promise<void>}} scenario - inputs.
  * @returns {Promise<{anchor: string}>} rendered text per section.
  */
 async function assemble(scenario) {
+  // Most scenarios work in the fixture project; `''` models a session whose
+  // working directory is not known yet.
+  const cwd = scenario.cwd ?? CWD
   const sections = new Map()
   const listeners = []
   const registered = []
@@ -152,6 +164,23 @@ async function assemble(scenario) {
     if (command === 'memory.list') {
       return { items: payload.state === 'active' ? (scenario.memories ?? []) : [] }
     }
+    if (command === 'project.context') {
+      if (scenario.projectContext) return scenario.projectContext
+      return {
+        project_id: 'selfcheck-project',
+        root_path: CWD,
+        memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+        rules_dir: null,
+        rules: [],
+        rules_truncated: false,
+        // `project.context` carries no `state` field, so this default stays
+        // empty unless a scenario passes its own `projectContext`.
+        recent: payload.state === 'active' ? (scenario.memories ?? []) : [],
+      }
+    }
+    if (command === 'rule.write') {
+      return { path: `${CWD}/.agents/rules/${payload.name}.md`, name: payload.name }
+    }
     if (command === 'instruction.read') return scenario.instruction ?? { content: '', enabled: false }
     return {}
   }
@@ -162,7 +191,7 @@ async function assemble(scenario) {
     apply(stub, { heartbeatSteps: 20, ...(scenario.config ?? {}) })
     const emit = (event) => {
       for (const entry of listeners) {
-        if (entry.event === 'session/event') entry.listener({ id: 's1', header: { cwd: CWD } }, event)
+        if (entry.event === 'session/event') entry.listener({ id: 's1', header: { cwd } }, event)
       }
     }
     // Forward `agent/request` as the loop does: the listener returns the route
@@ -176,7 +205,7 @@ async function assemble(scenario) {
 
     // Assembly is synchronous and the bridge read resolves off to the side:
     // one pass starts it, the wait lets it land, the next pass renders it.
-    const context = { agent: { session: { id: 's1', header: { cwd: CWD } } } }
+    const context = { agent: { session: { id: 's1', header: { cwd } } } }
     // A scenario that turns the memory anchor off (`systemPromptAnchor: false`)
     // has no such section, and the rest of the checks still have to run.
     const render = () => {
@@ -419,33 +448,224 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
   check(asks[6]?.text.includes('未创建'), 'a timed-out ask grants nothing')
 }
 
-console.log('recent work is bounded and conditional')
+console.log('project context: the memory excerpt is injected within its budget')
 {
-  const memories = Array.from({ length: 8 }, (_, i) => ({
-    summary: `selfcheck 工作项 ${i} 一句话说明改了哪个模块并跑了什么命令，再补一句结果，让摘要长到需要截断`,
-  }))
-  const { anchor } = await assemble({ memories })
-  check(anchor.includes('本项目最近的工作'), 'a project with memories shows them')
-  const section = anchor.slice(
-    anchor.indexOf('**本项目最近的工作**'),
-    anchor.indexOf('**记忆写入**'),
-  ).trim()
-  check(section.length <= RECENT_BUDGET + 120, `the section stays near its budget (${section.length} chars)`)
-  check(section.includes('更早的用'), 'a cut list points at memory_search instead of pretending to be complete')
-}
-{
-  // Short summaries that all fit: the section must not claim there is more.
-  const memories = Array.from({ length: 3 }, (_, i) => ({ summary: `短条目 ${i}` }))
-  const { anchor } = await assemble({ memories })
-  const section = anchor.slice(
-    anchor.indexOf('**本项目最近的工作**'),
-    anchor.indexOf('**记忆写入**'),
+  const excerpt = [
+    '## 2026-11-05',
+    '- 记忆文件迁到 .agents/memory/MEMORY.md',
+    '- 规则目录用 .agents/rules/<name>.md',
+  ].join('\n')
+  const calls = []
+  const { anchor } = await assemble({
+    calls,
+    projectContext: {
+      project_id: 'selfcheck-project',
+      root_path: CWD,
+      memory: {
+        path: `${CWD}/.agents/memory/MEMORY.md`,
+        exists: true,
+        chars: excerpt.length,
+        updated: '2026-11-05 13:10:36',
+        excerpt,
+        truncated: true,
+      },
+      rules_dir: `${CWD}/.agents/rules`,
+      rules: [],
+      rules_truncated: false,
+      recent: [],
+    },
+  })
+  check(anchor.includes('**本项目工作记录**'), 'a project memory file shows its excerpt block')
+  check(anchor.includes('.agents/memory/MEMORY.md'), 'the block names the memory file')
+  check(anchor.includes('更新于 2026-11-05 13:10:36'), 'the block shows the file update stamp')
+  check(anchor.includes('记忆文件迁到 .agents/memory/MEMORY.md'), 'the excerpt text reaches the prompt')
+  check(anchor.includes('更早的内容读 `.agents/memory/MEMORY.md`'), 'a cut excerpt points at the file')
+  check(!anchor.includes('**本项目最近的工作**'), 'the DB fallback is not used while the memory file exists')
+  const section = anchor
+    .slice(anchor.indexOf('**本项目工作记录**'), anchor.indexOf('**记忆写入**'))
+    .trim()
+  check(
+    section.length <= PROJECT_MEMORY_CHARS + 200,
+    `the memory block stays near its budget (${section.length} chars)`,
   )
-  check(!section.includes('更早的用'), 'a complete list points at DSH_MEMORY.md only')
+  const contextCall = calls.find((entry) => entry.command === 'project.context')
+  check(contextCall !== undefined, 'the anchor reads the project context through the bridge')
+  check(contextCall?.payload?.cwd === CWD, 'the project-context read carries the session cwd')
+  check(
+    contextCall?.payload?.memory_chars === PROJECT_MEMORY_CHARS,
+    'the memory excerpt is requested with its budget',
+  )
+  check(contextCall?.payload?.rule_chars === PROJECT_RULES_CHARS, 'the rules are requested with their budget')
+  check(contextCall?.payload?.max_rules === PROJECT_RULES_MAX, 'the rule count is capped')
+  check(contextCall?.payload?.recent_limit === PROJECT_RECENT_LIMIT, 'the fallback list is capped')
+}
+
+console.log('project context: a project without a memory file falls back to recent work')
+{
+  const { anchor } = await assemble({
+    projectContext: {
+      project_id: 'selfcheck-project',
+      root_path: CWD,
+      memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+      rules_dir: `${CWD}/.agents/rules`,
+      rules: [],
+      rules_truncated: false,
+      recent: [{ summary: '最近完成了规则目录迁移' }, { summary: '把 DSH_MEMORY.md 搬到 .agents' }],
+    },
+  })
+  check(anchor.includes('**本项目最近的工作**'), 'a project with no memory file shows the recent-work fallback')
+  check(anchor.includes('- 最近完成了规则目录迁移'), 'the fallback lists the newest work lines')
+  check(anchor.includes('全量历史读 `.agents/memory/MEMORY.md`'), 'the fallback points at the memory file')
+  check(!anchor.includes('**本项目工作记录**'), 'the excerpt block is not shown without a memory file')
+}
+
+console.log('project context: an empty project adds no resident block')
+{
+  const { anchor } = await assemble({})
+  check(!anchor.includes('**本项目工作记录**'), 'no memory file means no excerpt block')
+  check(!anchor.includes('**本项目最近的工作**'), 'no fallback entries means no recent-work block')
+  check(!anchor.includes('**本项目规则**'), 'no rule files means no rules block')
 }
 {
-  const { anchor } = await assemble({ memories: [] })
-  check(!anchor.includes('本项目最近的工作'), 'a project with no memories omits the section entirely')
+  // First contact materializes `<repo>/.agents/memory/MEMORY.md` even when the
+  // project has no work yet; the file exists but carries nothing to inject.
+  const { anchor } = await assemble({
+    projectContext: {
+      project_id: 'selfcheck-project',
+      root_path: CWD,
+      memory: {
+        path: `${CWD}/.agents/memory/MEMORY.md`,
+        exists: true,
+        chars: 120,
+        updated: null,
+        excerpt: '',
+        truncated: false,
+      },
+      rules_dir: `${CWD}/.agents/rules`,
+      rules: [],
+      rules_truncated: false,
+      recent: [],
+    },
+  })
+  check(!anchor.includes('**本项目工作记录**'), 'a materialized but empty memory file adds no block')
+  check(!anchor.includes('完整记录见'), 'an empty memory file does not advertise itself every turn')
+}
+
+console.log('project context: the rules are injected in order')
+{
+  const rules = [
+    {
+      name: 'commit-message-style',
+      title: '提交信息格式',
+      description: '约束提交信息的写法',
+      path: `${CWD}/.agents/rules/commit-message-style.md`,
+      chars: 40,
+      content: '提交信息用中文。\n第一行写结论，正文写清改了什么。',
+    },
+    {
+      name: 'no-em-dash',
+      title: '不用破折号',
+      description: '约束用户可见文案的标点',
+      path: `${CWD}/.agents/rules/no-em-dash.md`,
+      chars: 18,
+      content: '用户可见文案里不要用破折号。',
+    },
+  ]
+  const { anchor } = await assemble({
+    projectContext: {
+      project_id: 'selfcheck-project',
+      root_path: CWD,
+      memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+      rules_dir: `${CWD}/.agents/rules`,
+      rules,
+      rules_truncated: true,
+      recent: [],
+    },
+  })
+  check(anchor.includes('**本项目规则**'), 'a project with rules gets a rules block')
+  check(anchor.includes('共 2 条'), 'the heading counts the rules')
+  check(anchor.includes('**提交信息格式**（`commit-message-style`）'), 'a rule renders its title and name')
+  check(anchor.includes('提交信息用中文。'), 'the first rule body is injected')
+  check(anchor.includes('  第一行写结论，正文写清改了什么。'), 'rule bodies are indented under their heading')
+  check(anchor.includes('**不用破折号**（`no-em-dash`）'), 'the second rule is injected too')
+  check(anchor.includes('用户可见文案里不要用破折号。'), 'the second rule body is injected')
+  check(anchor.indexOf('**提交信息格式**') < anchor.indexOf('**不用破折号**'), 'the rules keep their order')
+  check(anchor.includes('还有规则未全部注入'), 'a truncated rule list says more rules exist')
+  check(anchor.indexOf('**本项目规则**') < anchor.indexOf('**记忆写入**'), 'the rules read before the tool usage guide')
+}
+{
+  const { anchor } = await assemble({})
+  check(!anchor.includes('**本项目规则**'), 'a project with no rules omits the rules block entirely')
+}
+
+console.log('rule_add writes one rule file through the bridge')
+{
+  const calls = []
+  const content = '提交信息用中文。\n第一行写结论，正文写清改了什么。'
+  let result
+  await assemble({
+    calls,
+    async run({ runTool }) {
+      result = await runTool('rule_add', {
+        name: 'commit-message-style',
+        title: '提交信息格式',
+        description: '约束提交信息的写法',
+        content,
+      })
+    },
+  })
+  const writes = calls.filter((entry) => entry.command === 'rule.write')
+  check(writes.length === 1, 'rule_add makes exactly one rule.write call')
+  const payload = writes[0]?.payload ?? {}
+  check(payload.cwd === CWD, 'the write carries the session working directory')
+  check(payload.name === 'commit-message-style', 'the rule name reaches the bridge')
+  check(payload.title === '提交信息格式', 'the title reaches the bridge')
+  check(payload.description === '约束提交信息的写法', 'the description reaches the bridge')
+  check(payload.content === content, 'the rule body reaches the bridge verbatim')
+  check(
+    String(result?.text ?? '').includes('.agents/rules/commit-message-style.md'),
+    'the tool reports the written path',
+  )
+}
+
+console.log('a cwd-less assembly never borrows another project context')
+{
+  const calls = []
+  const { anchor } = await assemble({
+    cwd: '',
+    calls,
+    // If anything asked the bridge anyway, this answer would render; the point
+    // is that a session with no working directory never asks.
+    projectContext: {
+      project_id: 'other-project',
+      root_path: 'D:/other/project',
+      memory: {
+        path: 'D:/other/project/.agents/memory/MEMORY.md',
+        exists: true,
+        chars: 10,
+        updated: '2026-11-05 13:10:36',
+        excerpt: '另一个项目的工作记录',
+        truncated: false,
+      },
+      rules_dir: 'D:/other/project/.agents/rules',
+      rules: [
+        {
+          name: 'other-rule',
+          title: '别人的规则',
+          description: '不该出现',
+          path: 'D:/other/project/.agents/rules/other-rule.md',
+          chars: 4,
+          content: '不该出现',
+        },
+      ],
+      rules_truncated: false,
+      recent: [],
+    },
+  })
+  const contextCalls = calls.filter((entry) => entry.command === 'project.context')
+  check(contextCalls.length === 0, 'no project context is requested without a working directory')
+  check(!anchor.includes('另一个项目的工作记录'), 'no project memory leaks into a cwd-less assembly')
+  check(!anchor.includes('别人的规则'), 'no project rules leak into a cwd-less assembly')
 }
 
 console.log('digest generation finds a model without a session route')

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_system import FactInput, MemoryConfig, MemorySystem
+from memory_system import FactInput, MemoryConfig, MemorySystem, project_files
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
 from memory_system.errors import ValidationError
 from memory_system.summary import (
@@ -423,6 +423,239 @@ def test_bridge_project_registration_creates_the_markdown_file(tmp_path: Path):
     assert "还没有记录任何工作" in summary.read_text(encoding="utf-8")
 
 
+def test_bridge_project_context_returns_memory_excerpt_and_rules(tmp_path: Path):
+    """One read gives the host everything a session starts with."""
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    nested = repo / "src"
+    nested.mkdir()
+    home = str(tmp_path / "mem")
+
+    remembered = handle(
+        {
+            "id": "1",
+            "command": "memory.remember",
+            "payload": {
+                "home": home,
+                "cwd": str(nested),
+                "summary": "接入了记忆工具",
+                "event_type": "note",
+            },
+        }
+    )
+    assert remembered["ok"], remembered
+    # Two rules written out of alphabetical order: the injected order is the
+    # file name so the system prompt prefix is stable.
+    for index, name in enumerate(("zeta-rule", "alpha-rule")):
+        written = handle(
+            {
+                "id": f"r{index}",
+                "command": "rule.write",
+                "payload": {
+                    "home": home,
+                    "cwd": str(nested),
+                    "name": name,
+                    "title": f"规则{index}",
+                    "description": f"说明{index}",
+                    "content": f"正文{index}",
+                },
+            }
+        )
+        assert written["ok"], written
+
+    response = handle(
+        {"id": "2", "command": "project.context", "payload": {"home": home, "cwd": str(nested)}}
+    )
+    assert response["ok"], response
+    result = response["result"]
+    assert result["project_id"] == resolve_project_id(str(nested))
+    # A session started in a subdirectory still reads the checkout root's files.
+    assert Path(result["root_path"]).resolve() == repo.resolve()
+
+    memory_view = result["memory"]
+    assert memory_view["exists"] is True
+    assert Path(memory_view["path"]) == repo / PROJECT_SUMMARY_FILE
+    assert "接入了记忆工具" in memory_view["excerpt"]
+    assert memory_view["chars"] > len(memory_view["excerpt"])
+    assert memory_view["updated"]
+
+    assert Path(result["rules_dir"]) == repo / ".agents" / "rules"
+    assert [rule["name"] for rule in result["rules"]] == ["alpha-rule", "zeta-rule"]
+    assert result["rules"][0]["content"] == "正文1"
+    assert result["rules_truncated"] is False
+    # The file exists, so the database fallback is deliberately not consulted.
+    assert result["recent"] == []
+
+    limited = handle(
+        {
+            "id": "3",
+            "command": "project.context",
+            "payload": {"home": home, "cwd": str(nested), "max_rules": 1},
+        }
+    )
+    assert limited["ok"], limited
+    assert len(limited["result"]["rules"]) == 1
+    assert limited["result"]["rules_truncated"] is True
+
+
+def test_bridge_project_context_falls_back_to_recent_work(tmp_path: Path, monkeypatch):
+    """A checkout that cannot be written still yields the project's history."""
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+    remembered = handle(
+        {
+            "id": "1",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(repo), "summary": "修复了登录竞态", "event_type": "fix"},
+        }
+    )
+    assert remembered["ok"], remembered
+    summary = repo / PROJECT_SUMMARY_FILE
+    assert summary.is_file()
+    summary.unlink()  # simulated read-only / cleaned checkout
+
+    def refuse(*args, **kwargs):
+        raise OSError("read-only checkout")
+
+    monkeypatch.setattr("memory_system.summary.write_project_summaries", refuse)
+
+    response = handle(
+        {"id": "2", "command": "project.context", "payload": {"home": home, "cwd": str(repo)}}
+    )
+    assert response["ok"], response
+    result = response["result"]
+    assert result["memory"]["exists"] is False
+    assert result["memory"]["excerpt"] == ""
+    assert result["rules"] == []
+    assert result["recent"], result
+    assert "修复了登录竞态" in result["recent"][0]["summary"]
+
+
+def test_bridge_rule_write_round_trips_and_refuses_duplicates(tmp_path: Path):
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+    payload = {
+        "home": home,
+        "cwd": str(repo),
+        "name": "comments-in-chinese",
+        "title": "注释使用中文",
+        "description": "代码注释必须写中文",
+        "content": "所有注释使用中文，标识符保留英文。",
+    }
+
+    written = handle({"id": "1", "command": "rule.write", "payload": payload})
+    assert written["ok"], written
+    assert Path(written["result"]["path"]) == repo / ".agents" / "rules" / "comments-in-chinese.md"
+    assert written["result"]["name"] == "comments-in-chinese"
+
+    rules, truncated = project_files.read_rules(repo)
+    assert truncated is False
+    assert len(rules) == 1
+    assert rules[0]["title"] == "注释使用中文"
+    assert rules[0]["description"] == "代码注释必须写中文"
+    assert rules[0]["content"] == "所有注释使用中文，标识符保留英文。"
+
+    duplicate = handle(
+        {
+            "id": "2",
+            "command": "rule.write",
+            "payload": {**payload, "title": "另一个标题", "content": "另一段正文"},
+        }
+    )
+    assert duplicate["ok"] is False
+    assert duplicate["error"]["code"] == "conflict"
+    # The refused write leaves the first rule exactly as it was.
+    rules, _ = project_files.read_rules(repo)
+    assert rules[0]["content"] == "所有注释使用中文，标识符保留英文。"
+    assert rules[0]["title"] == "注释使用中文"
+
+
+def test_bridge_rule_write_requires_valid_fields_and_a_root(tmp_path: Path):
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+
+    missing_title = handle(
+        {
+            "id": "1",
+            "command": "rule.write",
+            "payload": {
+                "home": home,
+                "cwd": str(repo),
+                "name": "no-title",
+                "title": " ",
+                "description": "说明",
+                "content": "正文",
+            },
+        }
+    )
+    assert missing_title["ok"] is False
+    assert missing_title["error"]["code"] == "validation"
+
+    no_cwd = handle(
+        {
+            "id": "2",
+            "command": "rule.write",
+            "payload": {
+                "home": home,
+                "name": "no-cwd",
+                "title": "标题",
+                "description": "说明",
+                "content": "正文",
+            },
+        }
+    )
+    assert no_cwd["ok"] is False
+    assert no_cwd["error"]["code"] == "bad_request"
+
+
+def test_bridge_memory_add_cleans_up_the_generated_legacy_file(tmp_path: Path):
+    """The first write through the bridge finishes the layout migration."""
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+    legacy = repo / "DSH_MEMORY.md"
+    legacy.write_text(
+        f"{PROJECT_SUMMARY_MARKER}\n# 项目摘要：旧位置\n\n- `09:00` 旧工作\n",
+        encoding="utf-8",
+    )
+
+    remembered = handle(
+        {
+            "id": "1",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(repo), "summary": "在新的位置记录工作", "event_type": "note"},
+        }
+    )
+    assert remembered["ok"], remembered
+    assert (repo / PROJECT_SUMMARY_FILE).is_file()
+    assert "在新的位置记录工作" in (repo / PROJECT_SUMMARY_FILE).read_text(encoding="utf-8")
+    assert not legacy.exists()
+
+
+def test_bridge_memory_add_keeps_a_hand_written_root_file(tmp_path: Path):
+    """A root ``DSH_MEMORY.md`` the user wrote is not the writer's to delete."""
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    home = str(tmp_path / "mem")
+    legacy = repo / "DSH_MEMORY.md"
+    handwritten = "# 我自己的笔记\n- 不能删除\n"
+    legacy.write_text(handwritten, encoding="utf-8")
+
+    remembered = handle(
+        {
+            "id": "1",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(repo), "summary": "新位置的工作", "event_type": "note"},
+        }
+    )
+    assert remembered["ok"], remembered
+    assert (repo / PROJECT_SUMMARY_FILE).is_file()
+    assert legacy.read_text(encoding="utf-8") == handwritten
+
+
 # ── notepad ─────────────────────────────────────────────────────────────
 
 
@@ -801,6 +1034,12 @@ def test_bridge_status_reports_project(tmp_path: Path):
     assert result["project_id"] == resolve_project_id(str(tmp_path))
     assert result["settings"]["length"] == DEFAULT_LENGTH
     assert result["probe"]["provider"]
+    # The status payload advertises the new locations; the legacy
+    # ``project_summary`` key points at the same file so old readers break
+    # loudly instead of reading a stale root path.
+    assert Path(result["project_memory"]) == tmp_path / PROJECT_SUMMARY_FILE
+    assert Path(result["project_rules"]) == tmp_path / ".agents" / "rules"
+    assert Path(result["project_summary"]) == Path(result["project_memory"])
 
 
 def test_bridge_digest_flow(tmp_path: Path):

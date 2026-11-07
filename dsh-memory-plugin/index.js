@@ -27,6 +27,7 @@ export const TOOL_NAMES = [
   'memory_profile_read',
   'memory_digest_read',
   'memory_digest_generate',
+  'rule_add',
   'skill_create',
   'skill_list',
   'skill_get',
@@ -55,16 +56,25 @@ const INSTRUCTION_REFRESH_MS = 15_000
 const ANCHOR_REFRESH_MS = 15_000
 
 /**
- * How much recent work the anchor shows for the current project.
+ * How long a cached project context stays usable before it is re-read.
  *
- * A hard ceiling, not a target: the block is resident in every request, and a
- * digest plus a five-line list is the point where the rest is cheaper to read
- * from `DSH_MEMORY.md` than to carry every turn.
+ * The rules and the project memory live in `<repo>/.agents`, which the user may
+ * edit between turns; a short TTL keeps the resident block honest without
+ * hitting the disk on every assembly.
  */
-const RECENT_CHARS = 400
+export const PROJECT_CONTEXT_REFRESH_MS = 15_000
 
-/** How many newest memories the anchor considers before the character cut. */
-const RECENT_LIMIT = 8
+/**
+ * Hard ceilings for the resident project block, passed to the bridge.
+ *
+ * The Python side does the cutting because it owns the files: these are request
+ * budgets, not targets. The block rides in every request, so the excerpt and
+ * the rules stay small enough that the full files remain the place for detail.
+ */
+export const PROJECT_MEMORY_CHARS = 1200
+export const PROJECT_RULES_CHARS = 2400
+export const PROJECT_RULES_MAX = 12
+export const PROJECT_RECENT_LIMIT = 8
 
 /** Default configuration; the row's YAML may override any field. */
 const DEFAULTS_INNER = {
@@ -860,8 +870,8 @@ export function apply(ctx, rawConfig) {
   async function generateDigest({ cwd, signal, reason = 'manual', length, sessionId } = {}) {
     cwd = resolveCwd(cwd)
     // Resolving the project also registers its root path, which is what lets
-    // the Python side refresh that project's DSH_MEMORY.md. It is never a
-    // reason to fail a global digest.
+    // the Python side write that project's `.agents/memory/MEMORY.md`. It is
+    // never a reason to fail a global digest.
     let projectId
     if (cwd) {
       try {
@@ -1140,14 +1150,16 @@ export function apply(ctx, rawConfig) {
   if (config.systemPromptAnchor) {
     /**
      * One slot for the global part, one slot per working directory for the
-     * project part.
+     * project context.
      *
      * The `@@dsh-memory` count line and the profile are global — `digest.anchor`
      * ignores the caller's directory — so keying that part by directory only
      * made N projects each age out and each pay for an identical round trip.
-     * `recent` is per project, so it is keyed by cwd: a shared slot let a
-     * refresh stamped for one directory install its lines under every other
-     * session, which is how another project's work reached the block.
+     * The project context (the `.agents/memory/MEMORY.md` excerpt and the
+     * `.agents/rules` files) is per project, so it is keyed by cwd: a shared
+     * slot let a refresh stamped for one directory install its content under
+     * every other session, which is how another project's rules reached the
+     * block.
      */
     const anchorSlotShared = {
       at: 0,
@@ -1158,8 +1170,17 @@ export function apply(ctx, rawConfig) {
       failed: false,
     }
 
-    /** @type {Map<string, {recent: {lines: string[], truncated: boolean, ok: boolean} | null, at: number}>} */
-    const recentSlots = new Map()
+    /**
+     * Per-directory project-context cache.
+     *
+     * `data` is null until the first successful read and `at` is that read's
+     * stamp (0 while unknown). Keeping the stamp separate from `failed` is what
+     * lets a failed refresh keep the previous block on screen while still
+     * retrying on the next assembly instead of serving stale content for a
+     * whole TTL.
+     * @type {Map<string, {data: object | null, at: number, pending: boolean, failed: boolean}>}
+     */
+    const projectSlots = new Map()
 
     /** @param {string} cwd - session working directory; the global part is shared. */
     function anchorSlot(_cwd) {
@@ -1167,16 +1188,16 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * The recent-work entry for one directory.
+     * The project-context entry for one directory.
      * @param {string} cwd - session working directory, '' when unknown.
-     * @returns {{recent: {lines: string[], truncated: boolean, ok: boolean} | null, at: number}} the entry.
+     * @returns {{data: object | null, at: number, pending: boolean, failed: boolean}} the entry.
      */
-    function recentSlot(cwd) {
+    function projectSlot(cwd) {
       const key = cwd || ''
-      let slot = recentSlots.get(key)
+      let slot = projectSlots.get(key)
       if (!slot) {
-        slot = { recent: null, at: 0 }
-        recentSlots.set(key, slot)
+        slot = { data: null, at: 0, pending: false, failed: false }
+        projectSlots.set(key, slot)
       }
       return slot
     }
@@ -1206,35 +1227,104 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * Read the count line, the profile and the project's recent work.
+     * In-flight project-context reads, keyed like {@link projectSlots}.
+     *
+     * One assembly can start two reads of the same directory: the global
+     * anchor's refresh (which re-reads the project half so a digest commit's
+     * fresh `MEMORY.md` is not missed) and the per-directory timer. Joining the
+     * in-flight promise keeps that a single bridge call.
+     * @type {Map<string, Promise<void>>}
+     */
+    const projectLoads = new Map()
+
+    /**
+     * Read this project's context — the memory excerpt and the rules — into
+     * its directory slot.
+     *
+     * Only a successful read is stored. A failure keeps the previous `data`
+     * (dropping a block because a child process hiccuped would silently change
+     * what the model believes about the project) and does not stamp `at`, so
+     * the next assembly retries instead of serving the old content for a whole
+     * refresh window.
+     * @param {string} cwd - the session's working directory.
+     * @returns {Promise<void>} resolves when the slot is up to date (or kept).
+     */
+    async function loadProjectContext(cwd) {
+      const key = cwd || ''
+      const running = projectLoads.get(key)
+      if (running) return running
+      const slot = projectSlot(cwd)
+      slot.pending = true
+      const task = (async () => {
+        try {
+          const data = await call('project.context', {
+            cwd,
+            memory_chars: PROJECT_MEMORY_CHARS,
+            rule_chars: PROJECT_RULES_CHARS,
+            max_rules: PROJECT_RULES_MAX,
+            recent_limit: PROJECT_RECENT_LIMIT,
+          })
+          slot.data = data
+          slot.failed = false
+          slot.at = Date.now()
+        } catch (error) {
+          slot.failed = true
+          try {
+            logger.warn(`[dsh-memory] project-context refresh failed: ${error?.message ?? error}`)
+          } catch {
+            // Logging must never turn a read failure into an unhandled rejection.
+          }
+        }
+      })()
+      projectLoads.set(key, task)
+      // The read never rejects (its failure is recorded on the slot), so this
+      // only clears the shared flags once the task settles.
+      task.finally(() => {
+        slot.pending = false
+        if (projectLoads.get(key) === task) projectLoads.delete(key)
+      })
+      return task
+    }
+
+    /**
+     * Start a project-context refresh when this directory's copy has aged.
+     *
+     * Mirrors {@link refreshAnchor}: synchronous, guarded by `pending` and by
+     * the cache stamp, and it never throws because the read runs off to the
+     * side and this assembly continues with what is cached. `rememberCwd` is
+     * not repeated here — {@link refreshAnchor} already runs it on every
+     * assembly.
+     * @param {any} context - assembly context carrying the agent.
+     */
+    function refreshProjectContext(context) {
+      const session = context?.agent?.session
+      const cwd = session?.header?.cwd ?? ''
+      // No working directory means no project: asking the bridge for a project
+      // without a cwd is how another project's memory could be installed.
+      if (!cwd) return
+      const slot = projectSlot(cwd)
+      if (slot.pending) return
+      if (slot.at > 0 && Date.now() - slot.at < PROJECT_CONTEXT_REFRESH_MS) return
+      void loadProjectContext(cwd)
+    }
+
+    /**
+     * Read the count line, the profile and the project context.
      *
      * The count line and the profile are global — one cross-project digest, for
-     * every session, stamped by the shared slot's `at`. The per-project lines
-     * are read into that directory's own slot, and a failure there must not
-     * lose the global part.
-     *
-     * A recent-work read that did not happen (`ok: false`) is not stored: the
-     * directory keeps whatever it had and its slot stays unstamped, so the next
-     * assembly retries instead of serving a wrong or empty block for a whole
-     * refresh window.
+     * every session, stamped by the shared slot's `at`. The project part is
+     * read into that directory's own slot; `loadProjectContext` swallows its
+     * own failure, so a failed project read can never lose the global part.
      * @param {string} cwd - session working directory, '' when unknown.
      */
     async function loadAnchor(cwd) {
       const slot = anchorSlotShared
-      const recent = recentSlot(cwd)
       try {
         await readAnchorLine()
-        try {
-          const result = await refreshRecent(cwd)
-          if (result.ok) {
-            recent.recent = result
-            recent.at = Date.now()
-          }
-        } catch (error) {
-          logger.warn(`[dsh-memory] recent-work refresh failed: ${error?.message ?? error}`)
-          recent.recent = { lines: [], truncated: false, ok: true }
-          recent.at = Date.now()
-        }
+        // A digest/profile refresh re-reads the project context too, so the
+        // next assembly shows both halves together. An in-flight project read
+        // started by `refreshProjectContext` is joined, not duplicated.
+        if (cwd) await loadProjectContext(cwd)
       } finally {
         slot.at = Date.now()
         slot.pending = false
@@ -1259,54 +1349,6 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * Read this project's most recent work lines for the anchor.
-     *
-     * The digest is cross-project, so for the project the session is actually
-     * in it says almost nothing. These are the newest L2 summaries for this
-     * project only, cut to a hard character budget: the block is resident in
-     * every request, so the section earns its tokens by answering "what has
-     * been done here" without a tool round trip, and by staying short enough
-     * that the full digest and `DSH_MEMORY.md` remain the place for detail.
-     *
-     * A project with no memories answers `[]`, and the block then omits the
-     * section entirely instead of advertising emptiness every turn.
-     *
-     * `ok: false` means the project could not be resolved, which is not the
-     * same as an empty project: the read never happened. The caller must not
-     * cache that state, and must not fall back to an unfiltered query — an
-     * empty project id makes `memory.list` list every project's memories, so a
-     * session whose cwd is not known yet would carry another project's work in
-     * its recent-work block for a full refresh window.
-     *
-     * @param {string} cwd - the session's working directory.
-     * @returns {Promise<{lines: string[], truncated: boolean, ok: boolean}>} the lines.
-     */
-    async function refreshRecent(cwd) {
-      const projectId = await projectFor(cwd)
-      if (!projectId) {
-        logger.warn(`[dsh-memory] recent-work skipped: no project for cwd ${JSON.stringify(cwd)}`)
-        return { lines: [], truncated: false, ok: false }
-      }
-      const result = await call('memory.list', {
-        project_id: projectId,
-        limit: RECENT_LIMIT,
-        state: 'active',
-      })
-      const items = Array.isArray(result?.items) ? result.items : []
-      const lines = []
-      let used = 0
-      for (const item of items) {
-        const summary = String(item?.summary ?? '').replace(/\s+/g, ' ').trim()
-        if (!summary) continue
-        const line = `- ${summary}`
-        if (used + line.length > RECENT_CHARS) break
-        lines.push(line)
-        used += line.length
-      }
-      return { lines, truncated: items.length > lines.length, ok: true }
-    }
-
-    /**
      * The anchor body for one assembly.
      *
      * An empty slot means "never read yet" and a failed read lands here too, so
@@ -1328,23 +1370,70 @@ export function apply(ctx, rawConfig) {
     }
 
     /**
-     * The per-project work lines, or '' when this project has no memories yet.
+     * The project-context block for one assembly, or '' when there is none.
      *
-     * Absent is not the same as empty here: a fresh project would otherwise
-     * spend resident tokens announcing that it has nothing.
-     *
-     * @param {{recent?: {lines?: string[], truncated?: boolean} | null} | null} entry -
-     *   this directory's recent-work slot; null when it was never read.
+     * Rendered from what the bridge returned for this directory: the rules
+     * first — they are constraints and must be read before the history — then
+     * the excerpt of `.agents/memory/MEMORY.md`. While that file does not exist
+     * yet, the newest DB work lines stand in as a fallback; a project with
+     * neither emits nothing rather than spending resident tokens advertising
+     * emptiness.
+     * @param {{data?: object | null} | null} slot - this directory's cache entry.
      * @returns {string} the section, or ''.
      */
-    function recentSection(entry) {
-      const recent = entry?.recent
-      const lines = recent?.lines ?? []
-      if (lines.length === 0) return ''
-      const tail = recent.truncated
-        ? `- …更早的用 \`memory_search\`（state 可查 dormant/archived）或读仓库根的 \`DSH_MEMORY.md\``
-        : '- 全量历史读仓库根的 `DSH_MEMORY.md`'
-      return ['**本项目最近的工作**（从新到旧，节选用）', ...lines, tail].join('\n')
+    function projectSection(slot) {
+      const data = slot?.data
+      if (!data) return ''
+      const blocks = []
+      const rules = Array.isArray(data.rules) ? data.rules : []
+      if (rules.length > 0) {
+        const lines = [`**本项目规则**（必须遵守；来自 \`.agents/rules/\`，共 ${rules.length} 条）`]
+        rules.forEach((rule, index) => {
+          const name = String(rule?.name ?? '')
+          const title = String(rule?.title ?? name)
+          lines.push(`${index + 1}. **${title}**（\`${name}\`）`)
+          // Indented under its own heading so a multi-line rule cannot be
+          // mistaken for the next rule's title.
+          for (const contentLine of String(rule?.content ?? '').split('\n')) {
+            if (contentLine.trim()) lines.push(`  ${contentLine}`)
+          }
+        })
+        if (data.rules_truncated) lines.push('- 还有规则未全部注入；完整目录见 `.agents/rules/`')
+        blocks.push(lines.join('\n'))
+      }
+      const memory = data.memory ?? {}
+      // A materialized but empty file (a project that has recorded no work) is
+      // not worth a resident heading plus "read the file" line every turn; the
+      // excerpt is what earns the block its tokens.
+      const hasExcerpt = Boolean(String(memory.excerpt ?? '').trim())
+      if (memory.exists && hasExcerpt) {
+        const lines = [
+          `**本项目工作记录**（来自 \`.agents/memory/MEMORY.md\`，更新于 ${memory.updated || '未知时间'}）`,
+        ]
+        if (memory.excerpt) lines.push(String(memory.excerpt))
+        lines.push(
+          memory.truncated
+            ? '- 更早的内容读 `.agents/memory/MEMORY.md`，或用 `memory_search`（state 可查 dormant/archived）'
+            : '- 完整记录见 `.agents/memory/MEMORY.md`',
+        )
+        blocks.push(lines.join('\n'))
+      } else {
+        const recent = Array.isArray(data.recent) ? data.recent : []
+        const lines = recent
+          .map((item) => String(item?.summary ?? '').trim())
+          .filter(Boolean)
+          .map((summary) => `- ${summary}`)
+        if (lines.length > 0) {
+          blocks.push(
+            [
+              '**本项目最近的工作**（从新到旧，节选用）',
+              ...lines,
+              '- 全量历史读 `.agents/memory/MEMORY.md`',
+            ].join('\n'),
+          )
+        }
+      }
+      return blocks.join('\n\n')
     }
 
     /**
@@ -1375,18 +1464,22 @@ export function apply(ctx, rawConfig) {
           interpolate: false,
           text: (context) => {
             refreshAnchor(context)
+            // The project context has its own TTL: the digest/profile line and
+            // the files under `.agents` age independently, so the project half
+            // is started here instead of riding the global slot's stamp.
+            refreshProjectContext(context)
             // Same assembly context the refresh just looked at. The count line
-            // is global, so every session reads the shared slot; the
-            // recent-work section comes from this directory's own slot.
+            // is global, so every session reads the shared slot; the project
+            // context comes from this directory's own slot.
             const session = context?.agent?.session
             const cwd = session?.header?.cwd ?? ''
             const slot = anchorSlot(cwd)
             // The rules are unconditional: a project with an empty store still
             // needs to know that writing memory is its job. Only the anchor
-            // body, the recent-work section and the heartbeat vary.
-            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', anchorBody(slot)).replace(
-              '{{recent_work}}',
-              recentSection(recentSlot(cwd)),
+            // body, the project-context block and the heartbeat vary.
+            return `${ANCHOR_HEADER.replace('{{memory_anchor}}', () => anchorBody(slot)).replace(
+              '{{project_context}}',
+              () => projectSection(projectSlot(cwd)),
             )}${heartbeatLine(session?.id)}`
           },
         }),
@@ -1399,11 +1492,11 @@ export function apply(ctx, rawConfig) {
      * Digest generation and profile writes use this so the next prompt
      * assembly sees the new state; the 15s TTL stays for ordinary sessions.
      *
-     * Those callers only change the global part. The project's recent work is
-     * re-read when a session cwd is known (a memory write may have changed it);
+     * Those callers only change the global part. The project context is re-read
+     * when a session cwd is known (a memory or rule write may have changed it);
      * with no cwd there is nothing project-specific to refresh, so the global
-     * read alone runs — calling the recent-work read with an empty path is how
-     * a block for the wrong project (or for every project) could be installed.
+     * read alone runs — asking the bridge for a project without a cwd is how a
+     * block for the wrong project could be installed.
      */
     refreshAnchorNow = async () => {
       anchorSlotShared.pending = true
@@ -1419,8 +1512,8 @@ export function apply(ctx, rawConfig) {
     // Warm the global part at load. Assembly is synchronous, so without this
     // the very first prompt after a host start or a plugin reload carries the
     // "not read yet" body even though the digest is already on disk. The
-    // per-project lines are not read here: there is no session cwd yet, and
-    // stamping the slot with an empty one would hide them for a full TTL.
+    // project context is not read here: there is no session cwd yet, and
+    // stamping a slot with an empty one would hide it for a full TTL.
     void readAnchorLine()
   }
 
@@ -1946,8 +2039,10 @@ const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_g
  * The anchor block.
  *
  * `{{memory_anchor}}` is the Python-rendered count line (digest size and age,
- * profile size), and `{{recent_work}}` this project's newest work lines — or
- * nothing, when the project has no memories yet.
+ * profile size), and `{{project_context}}` the project block: the rules from
+ * `.agents/rules`, the excerpt of `.agents/memory/MEMORY.md`, or — while that
+ * file does not exist yet — this project's newest DB work lines. Either half
+ * may be empty; an empty section is dropped before it reaches the prompt.
  *
  * What a tool's own definition already says stays out of here: this block is
  * resident in every request and the full tool schemas ride along with it, so
@@ -1966,7 +2061,7 @@ const ANCHOR_HEADER = [
   '',
   '{{memory_anchor}}',
   '',
-  '{{recent_work}}',
+  '{{project_context}}',
   '',
   '### 记忆的写入与召回',
   '',
@@ -1981,9 +2076,14 @@ const ANCHOR_HEADER = [
   '',
   '- 问题需要过往经验时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造。',
   '- 换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。',
-  '- 摘要与 `DSH_MEMORY.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
+  '- 摘要与 `.agents/memory/MEMORY.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
   '- 用户画像只能读，由用户自己在设置页维护。',
   '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"。',
+  '',
+  '**项目规则**：',
+  '',
+  '- 用户对项目的约定、规则、限制，调用 `rule_add` 写成 `.agents/rules/<name>.md`（一条规则一份文件）；不要用 `memory_add` 存规则。',
+  '- 规则文件会在每次会话自动注入；完整规则见 `.agents/rules/`。',
   '',
   '**技能固化**：',
   '',

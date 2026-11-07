@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import project_skills
+from . import project_files, project_skills
 from .config import MemoryConfig
 from .errors import ConflictError, MemoryError, NotFoundError, ProviderError, ValidationError
 from .l2 import summary_hash
@@ -51,7 +51,6 @@ from .summary import (
     LENGTH_MAX,
     LENGTH_MIN,
     LENGTH_PRESETS,
-    PROJECT_SUMMARY_FILE,
     PROMPT_VERSION,
     SUMMARY_MAX_CHARS,
     DigestService,
@@ -147,7 +146,7 @@ def resolve_project_id(cwd: str | None) -> str:
 
 
 def resolve_project_root(cwd: str | None) -> str | None:
-    """The directory that owns a project's ``DSH_MEMORY.md``.
+    """The directory that owns a project's ``.agents`` memory and rule files.
 
     A session may start in a subdirectory, so walk up to the git top level
     when there is one; otherwise the working directory itself is the root.
@@ -326,8 +325,9 @@ def _register_project(memory: MemorySystem, payload: dict[str, Any]) -> str:
     ``memory.remember`` registers the project id but knows nothing about the
     checkout it belongs to, so a write routed through this function has no
     ``root_path`` and the project summary cannot be written. Registering it
-    here is what makes "read ``DSH_MEMORY.md`` at session start" hold after a
-    ``memory_add`` that never touched ``projects`` or ``status`` first.
+    here is what makes "read ``.agents/memory/MEMORY.md`` at session start"
+    hold after a ``memory_add`` that never touched ``projects`` or ``status``
+    first.
     """
     project = _project(payload)
     memory.ensure_project(
@@ -391,7 +391,9 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
         "projects": [p.project_id for p in memory.list_projects()],
         "settings": settings.to_dict(),
         "digest": latest.to_dict() if latest else None,
-        "project_summary": str(Path(root) / PROJECT_SUMMARY_FILE) if root else None,
+        "project_summary": str(Path(root) / project_files.PROJECT_MEMORY_RELATIVE) if root else None,
+        "project_memory": str(project_files.memory_path(root)) if root else None,
+        "project_rules": str(project_files.rules_dir(root)) if root else None,
         "memories": listing["total"],
         "probe": probe_payload(memory),
         "stats": stats,
@@ -420,6 +422,124 @@ def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any
             }
             for p in memory.list_projects()
         ],
+    }
+
+
+# ── project files: work summary + rules ─────────────────────────────────
+#
+# A checkout carries two kinds of memory files (see ``project_files``):
+# ``.agents/memory/MEMORY.md`` (derived from L2) and ``.agents/rules/*.md``
+# (user-authored constraints). The host reads both at session start so the
+# model begins with the project's work record and rules already in context,
+# instead of having to discover and read the files itself. This command is the
+# single read path: it resolves the root, materializes the derived file on
+# first contact, and returns prompt-sized excerpts under caller-chosen caps.
+#
+# The caps are caller input because prompt budget belongs to the host: the
+# Python side has no idea how many tokens are already spoken for.
+
+
+@command("project.context")
+def cmd_project_context(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """The project memory excerpt and rules a session starts with.
+
+    Returns ``memory`` even when the file is absent (``exists: false``), so the
+    host can tell "not read yet" from "this project has no work". When the file
+    is absent but the project has database records, ``recent`` carries the
+    newest work lines as a fallback: a read-only checkout cannot be written, and
+    losing the project's history there would be worse than reading the store.
+    """
+    project = _project(payload)
+    root = resolve_project_root(payload.get("cwd"))
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=root
+    )
+    result: dict[str, Any] = {
+        "project_id": project,
+        "root_path": root,
+        "memory": {
+            "path": None,
+            "exists": False,
+            "chars": 0,
+            "updated": None,
+            "excerpt": "",
+            "truncated": False,
+        },
+        "rules_dir": None,
+        "rules": [],
+        "rules_truncated": False,
+        "recent": [],
+    }
+    if not root:
+        return result
+
+    target = project_files.memory_path(root)
+    if not target.is_file():
+        # First contact with this checkout: write the derived file now so the
+        # session reads the same file a human would, rather than betting that
+        # some earlier command already regenerated it.
+        try:
+            DigestService(memory).write_project_summaries(project_id=project)
+        except Exception:  # noqa: BLE001 - a derived file must never fail a read
+            pass
+
+    result["memory"] = project_files.read_project_memory(
+        root, max_chars=_limit(payload, "memory_chars", 1200, 8000)
+    )
+    result["rules_dir"] = str(project_files.rules_dir(root))
+    rules, truncated = project_files.read_rules(
+        root,
+        max_rules=_limit(payload, "max_rules", 12, 100),
+        max_chars=_limit(payload, "rule_chars", 2400, 8000),
+    )
+    result["rules"] = rules
+    result["rules_truncated"] = truncated
+
+    if not result["memory"]["exists"]:
+        listing = MemoryNotepad(memory).list(
+            project_id=project,
+            state="active",
+            limit=_limit(payload, "recent_limit", 8, 50),
+        )
+        result["recent"] = [
+            {"summary": str(item.get("summary") or "").strip()}
+            for item in listing.get("items", [])
+            if str(item.get("summary") or "").strip()
+        ]
+    return result
+
+
+@command("rule.write")
+def cmd_rule_write(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
+    """Write one project rule as ``<projectRoot>/.agents/rules/<name>.md``.
+
+    The file is the source of truth, so there is no database row and no
+    digest material: a rule is a requirement, not work that was done. A
+    duplicate name is refused rather than overwritten; the caller edits the
+    existing file instead, which keeps the rule's history in Markdown.
+    """
+    root = resolve_project_root(payload.get("cwd"))
+    if not root:
+        raise BridgeError(
+            "bad_request",
+            "cwd is required: project rules live in <projectRoot>/.agents/rules",
+        )
+    project = _project(payload)
+    path = project_files.create_rule(
+        root,
+        name=str(payload.get("name") or ""),
+        title=str(payload.get("title") or ""),
+        description=str(payload.get("description") or ""),
+        content=str(payload.get("content") or ""),
+    )
+    memory.ensure_project(
+        project, display_name=payload.get("display_name"), root_path=root
+    )
+    return {
+        "path": str(path),
+        "name": path.stem,
+        "project_id": project,
+        "root_path": root,
     }
 
 
