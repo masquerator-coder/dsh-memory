@@ -26,12 +26,13 @@ node_modules/
 # text and local paths, so they stay on the machine that produced them.
 dsh-memory-*.md
 
-# Per-project work summary derived from the local memory database. dsh-memory
-# rewrites it whenever work is recorded, so it stays out of version control.
-# It lives under .agents/memory/ now; the legacy root DSH_MEMORY.md is no longer
-# written (a generated file left there is migrated and removed automatically).
-# Rules under .agents/rules/ are authored content and stay tracked.
-.agents/memory/MEMORY.md
+# Per-project work records derived from the local memory database. dsh-memory
+# rewrites them whenever work is recorded, so they stay out of version control.
+# One generated file per UTC day lives under .agents/memory/; the previous
+# single-file layout (.agents/memory/MEMORY.md) and the older root DSH_MEMORY.md
+# are migrated and removed automatically. Rules under .agents/rules/ are
+# authored content and stay tracked.
+.agents/memory/
 
 # Local scratch output
 .tmp_*

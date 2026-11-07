@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,14 @@ import pytest
 from memory_system import FactInput, MemoryConfig, MemorySystem, project_files
 from memory_system.bridge import handle, parse_backup_markdown, resolve_project_id
 from memory_system.errors import ValidationError
+from memory_system.storage import to_iso, utcnow
+from memory_system.project_files import (
+    PROJECT_SUMMARY_MARKER,
+    list_memory_files,
+    memory_dir,
+    read_project_memory,
+    single_file_memory_path,
+)
 from memory_system.summary import (
     AUTO_MODE,
     BACKUP_MARKER,
@@ -22,8 +31,6 @@ from memory_system.summary import (
     LENGTH_MIN,
     LENGTH_PRESETS,
     META_UPDATED,
-    PROJECT_SUMMARY_FILE,
-    PROJECT_SUMMARY_MARKER,
     DigestService,
     Materials,
     MemoryNotepad,
@@ -32,6 +39,11 @@ from memory_system.summary import (
     export_markdown,
     nearest_preset,
 )
+
+
+def _project_memory_text(root: Path) -> str:
+    """Everything the checkout's day files hold, concatenated for assertions."""
+    return "\n".join(path.read_text(encoding="utf-8") for path in list_memory_files(root))
 
 
 @pytest.fixture()
@@ -320,7 +332,7 @@ def test_anchor_is_empty_without_memory(service: DigestService):
     assert service.anchors()["text"] == ""
 
 
-def test_commit_writes_each_project_root_markdown(service: DigestService, memory: MemorySystem, tmp_path: Path):
+def test_commit_writes_each_project_day_record(service: DigestService, memory: MemorySystem, tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()
     memory.ensure_project("proj-md", display_name="Markdown Project", root_path=str(root))
@@ -340,14 +352,45 @@ def test_commit_writes_each_project_root_markdown(service: DigestService, memory
 
     service.commit(text="## 全局\n工作记录")
 
-    path = root / PROJECT_SUMMARY_FILE
-    content = path.read_text(encoding="utf-8")
+    files = list_memory_files(root)
+    assert len(files) == 1
+    assert files[0].parent == memory_dir(root)
+    content = files[0].read_text(encoding="utf-8")
     assert content.startswith(PROJECT_SUMMARY_MARKER)
     assert "Markdown Project" in content
     assert "实现了 DSH_MEMORY.md 导出" in content
     assert "临时调试记录" not in content
     assert "用户偏好 dark mode" not in content
+    # The date in the file name and the date heading are the record's own day.
+    assert files[0].stem in content
     assert kept["memory_id"] != gone["memory_id"]
+
+
+def test_records_are_split_into_one_file_per_day(service: DigestService, memory: MemorySystem, tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    memory.ensure_project("proj-days", display_name="Days", root_path=str(root))
+    memory.remember(project_id="proj-days", summary="今天的工作", event_type="fix")
+    yesterday = memory.remember(project_id="proj-days", summary="昨天的工作", event_type="note")
+    # Backdate one row to the previous UTC day; the derived files must split.
+    previous = utcnow() - timedelta(days=1)
+    memory.store.execute(
+        "UPDATE l2_episodes SET created_at = ? WHERE memory_id = ?",
+        (to_iso(previous), yesterday["memory_id"]),
+    )
+
+    DigestService(memory).write_project_summaries(project_id="proj-days")
+
+    today_day = utcnow().strftime("%Y-%m-%d")
+    previous_day = previous.strftime("%Y-%m-%d")
+    files = list_memory_files(root)
+    assert [path.stem for path in files] == [today_day, previous_day]
+    assert "今天的工作" in files[0].read_text(encoding="utf-8")
+    assert "昨天的工作" in files[1].read_text(encoding="utf-8")
+    assert "今天的工作" not in files[1].read_text(encoding="utf-8")
+    info = read_project_memory(root)
+    assert info["days"] == [today_day, previous_day]
+    assert info["excerpt"].index(f"## {today_day}") < info["excerpt"].index(f"## {previous_day}")
 
 
 def test_bridge_memory_add_refreshes_the_project_markdown(tmp_path: Path):
@@ -371,7 +414,7 @@ def test_bridge_memory_add_refreshes_the_project_markdown(tmp_path: Path):
         }
     )
     assert remembered["ok"], remembered
-    content = (repo / PROJECT_SUMMARY_FILE).read_text(encoding="utf-8")
+    content = _project_memory_text(repo)
     assert "接入了记忆工具" in content
 
 
@@ -388,7 +431,9 @@ def test_project_markdown_stamp_follows_the_newest_record(tmp_path: Path):
         memory.ensure_project("proj-stamp", display_name="Stamp", root_path=str(root))
         memory.remember(project_id="proj-stamp", summary="第一条", event_type="note")
         DigestService(memory).write_project_summaries(project_id="proj-stamp")
-        path = root / PROJECT_SUMMARY_FILE
+        files = list_memory_files(root)
+        assert len(files) == 1
+        path = files[0]
         first = path.read_text(encoding="utf-8")
 
         # Nothing new was written: a later commit must leave the file alone.
@@ -408,19 +453,32 @@ def test_project_markdown_stamp_follows_the_newest_record(tmp_path: Path):
         memory.close()
 
 
-def test_bridge_project_registration_creates_the_markdown_file(tmp_path: Path):
+def test_bridge_project_registration_creates_the_day_record_file(tmp_path: Path):
     repo = tmp_path / "checkout"
     (repo / ".git").mkdir(parents=True)
     nested = repo / "src"
     nested.mkdir()
     home = str(tmp_path / "mem")
+    # Registration alone records no work, so it writes no day file.
     project = handle(
         {"id": "1", "command": "projects", "payload": {"home": home, "cwd": str(nested)}}
     )
     assert project["ok"], project
-    summary = repo / PROJECT_SUMMARY_FILE
-    assert summary.is_file()
-    assert "还没有记录任何工作" in summary.read_text(encoding="utf-8")
+    assert list_memory_files(repo) == []
+
+    # The first recorded work materializes the day file at the checkout root.
+    remembered = handle(
+        {
+            "id": "2",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(nested), "summary": "第一条工作", "event_type": "note"},
+        }
+    )
+    assert remembered["ok"], remembered
+    files = list_memory_files(repo)
+    assert len(files) == 1
+    assert files[0].parent == memory_dir(repo)
+    assert "第一条工作" in files[0].read_text(encoding="utf-8")
 
 
 def test_bridge_project_context_returns_memory_excerpt_and_rules(tmp_path: Path):
@@ -473,8 +531,13 @@ def test_bridge_project_context_returns_memory_excerpt_and_rules(tmp_path: Path)
     assert Path(result["root_path"]).resolve() == repo.resolve()
 
     memory_view = result["memory"]
+    files = list_memory_files(repo)
+    assert files
     assert memory_view["exists"] is True
-    assert Path(memory_view["path"]) == repo / PROJECT_SUMMARY_FILE
+    assert memory_view["legacy"] is False
+    assert Path(memory_view["path"]) == files[0]
+    assert memory_view["files"] == [str(path) for path in files]
+    assert memory_view["days"] == [path.stem for path in files]
     assert "接入了记忆工具" in memory_view["excerpt"]
     assert memory_view["chars"] > len(memory_view["excerpt"])
     assert memory_view["updated"]
@@ -511,9 +574,10 @@ def test_bridge_project_context_falls_back_to_recent_work(tmp_path: Path, monkey
         }
     )
     assert remembered["ok"], remembered
-    summary = repo / PROJECT_SUMMARY_FILE
-    assert summary.is_file()
-    summary.unlink()  # simulated read-only / cleaned checkout
+    files = list_memory_files(repo)
+    assert files
+    for path in files:
+        path.unlink()  # simulated read-only / cleaned checkout
 
     def refuse(*args, **kwargs):
         raise OSError("read-only checkout")
@@ -630,8 +694,9 @@ def test_bridge_memory_add_cleans_up_the_generated_legacy_file(tmp_path: Path):
         }
     )
     assert remembered["ok"], remembered
-    assert (repo / PROJECT_SUMMARY_FILE).is_file()
-    assert "在新的位置记录工作" in (repo / PROJECT_SUMMARY_FILE).read_text(encoding="utf-8")
+    files = list_memory_files(repo)
+    assert files
+    assert "在新的位置记录工作" in _project_memory_text(repo)
     assert not legacy.exists()
 
 
@@ -652,7 +717,7 @@ def test_bridge_memory_add_keeps_a_hand_written_root_file(tmp_path: Path):
         }
     )
     assert remembered["ok"], remembered
-    assert (repo / PROJECT_SUMMARY_FILE).is_file()
+    assert list_memory_files(repo)
     assert legacy.read_text(encoding="utf-8") == handwritten
 
 
@@ -1022,11 +1087,12 @@ def test_bridge_unknown_command_answers_on_the_wire():
 
 
 def test_bridge_status_reports_project(tmp_path: Path):
+    home = str(tmp_path / "mem")
     response = handle(
         {
             "id": "s",
             "command": "status",
-            "payload": {"home": str(tmp_path / "mem"), "cwd": str(tmp_path), "display_name": "T"},
+            "payload": {"home": home, "cwd": str(tmp_path), "display_name": "T"},
         }
     )
     assert response["ok"], response
@@ -1034,12 +1100,31 @@ def test_bridge_status_reports_project(tmp_path: Path):
     assert result["project_id"] == resolve_project_id(str(tmp_path))
     assert result["settings"]["length"] == DEFAULT_LENGTH
     assert result["probe"]["provider"]
-    # The status payload advertises the new locations; the legacy
-    # ``project_summary`` key points at the same file so old readers break
-    # loudly instead of reading a stale root path.
-    assert Path(result["project_memory"]) == tmp_path / PROJECT_SUMMARY_FILE
+    # project_memory is now the day-file directory; the legacy project_summary
+    # key names the newest day file and is None while the project has no work.
+    assert Path(result["project_memory"]) == memory_dir(tmp_path)
     assert Path(result["project_rules"]) == tmp_path / ".agents" / "rules"
-    assert Path(result["project_summary"]) == Path(result["project_memory"])
+    assert result["project_summary"] is None
+
+    remembered = handle(
+        {
+            "id": "r",
+            "command": "memory.remember",
+            "payload": {"home": home, "cwd": str(tmp_path), "summary": "状态测试记录"},
+        }
+    )
+    assert remembered["ok"], remembered
+    again = handle(
+        {
+            "id": "s2",
+            "command": "status",
+            "payload": {"home": home, "cwd": str(tmp_path), "display_name": "T"},
+        }
+    )
+    files = list_memory_files(tmp_path)
+    assert files
+    assert again["result"]["project_summary"] == str(files[0])
+    assert Path(again["result"]["project_memory"]) == memory_dir(tmp_path)
 
 
 def test_bridge_digest_flow(tmp_path: Path):

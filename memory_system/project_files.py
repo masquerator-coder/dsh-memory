@@ -1,17 +1,25 @@
-"""Files a checkout carries beside its code: its work summary and its rules.
+"""Files a checkout carries beside its code: its daily work records and rules.
 
 The memory database is machine-wide, but two kinds of project content belong to
 the checkout itself, not to one machine's store::
 
-    <projectRoot>/.agents/memory/MEMORY.md    derived work summary (an L2 view)
-    <projectRoot>/.agents/rules/<name>.md     one project rule per file
+    <projectRoot>/.agents/memory/<YYYY-MM-DD>.md  derived work record, one file per day
+    <projectRoot>/.agents/rules/<name>.md         one project rule per file
 
-**The memory file is derived.** It is rewritten from the newest L2 episodes and
-never read back as a source of truth; deleting it loses nothing but the local
-readable copy. Keeping it under ``.agents/`` puts it next to the other
-agent-facing files (``.agents/skills``) instead of dropping a generated file in
-the repository root, and a project that wants it versioned or ignored can
+**The work records are derived.** A day file is rewritten from that day's L2
+episodes and never read back as a source of truth; deleting one loses nothing
+but the local readable copy. Splitting the record by day keeps it navigable: a
+diff names the day that changed, a year of work does not become one unbounded
+file, and the prompt path can show the newest days without reading the whole
+history. Keeping the files under ``.agents/`` puts them next to the other
+agent-facing files (``.agents/skills``) instead of dropping generated files in
+the repository root, and a project that wants them versioned or ignored can
 choose either without the layout moving again.
+
+The file date is the UTC date of the records it holds — the same date the
+timestamps inside it show — so the derived text is identical on every machine
+that shares the checkout. A record made at 00:30 local time in UTC+8 therefore
+belongs to the previous UTC day; that is deliberate stability, not an accident.
 
 **The rules are authored content.** A rule is a constraint the user places on
 the project ("comments are Chinese", "never write to the release branch"), so
@@ -37,28 +45,37 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from .errors import ConflictError, ValidationError
 from .project_skills import SKILL_NAME, parse_frontmatter
 from .storage import to_iso, utcnow
 
-#: Agent-facing directory shared by the memory file, the rules and the skills.
+#: Agent-facing directory shared by the work records, the rules and the skills.
 AGENTS_DIR = Path(".agents")
 MEMORY_DIR = AGENTS_DIR / "memory"
 RULES_DIR = AGENTS_DIR / "rules"
-MEMORY_FILE = "MEMORY.md"
 
-#: The marker the writer puts on line 1; it is how a legacy root file is told
-#: apart from a Markdown file the user wrote by hand. Kept identical to the
-#: historical ``DSH_MEMORY.md`` marker so old checkouts are recognized.
+#: One generated work record per day, named after the UTC date of its records.
+MEMORY_FILE_SUFFIX = ".md"
+_MEMORY_DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+_MEMORY_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: The marker the writer puts on line 1 of every generated file; it is how a
+#: generated record is told apart from a Markdown file a human wrote by hand.
+#: Kept identical to the historical ``DSH_MEMORY.md`` marker so old checkouts
+#: are recognized.
 PROJECT_SUMMARY_MARKER = "<!-- dsh-memory:project-summary -->"
 
 #: The pre-``.agents`` location. Still recognized, never written again.
 LEGACY_PROJECT_SUMMARY_FILE = "DSH_MEMORY.md"
 
-#: Forward-slash spelling used in docs, status payloads and tests.
-PROJECT_MEMORY_RELATIVE = MEMORY_DIR.as_posix() + "/" + MEMORY_FILE
+#: The one-file-per-project ``.agents`` layout, where ``MEMORY.md`` held every
+#: day. Recognized only so the writer can replace it with the date files.
+LEGACY_PROJECT_MEMORY_FILE = "MEMORY.md"
+
+#: Forward-slash spellings used in docs, status payloads and tests.
+PROJECT_MEMORY_DIR_RELATIVE = MEMORY_DIR.as_posix()
 PROJECT_RULES_RELATIVE = RULES_DIR.as_posix()
 
 #: The writer's own header line records the newest record's time.
@@ -69,9 +86,14 @@ _RULE_HEADING = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 # ══ paths ═══════════════════════════════════════════════════════════════
 
 
-def memory_path(project_root: Path | str) -> Path:
-    """Where this checkout's derived work summary lives."""
-    return Path(project_root) / MEMORY_DIR / MEMORY_FILE
+def memory_dir(project_root: Path | str) -> Path:
+    """The directory holding this checkout's one-file-per-day work records."""
+    return Path(project_root) / MEMORY_DIR
+
+
+def day_memory_path(project_root: Path | str, day: str) -> Path:
+    """The record file for one UTC day, e.g. ``.agents/memory/2026-11-07.md``."""
+    return memory_dir(project_root) / f"{day}{MEMORY_FILE_SUFFIX}"
 
 
 def rules_dir(project_root: Path | str) -> Path:
@@ -82,6 +104,11 @@ def rules_dir(project_root: Path | str) -> Path:
 def legacy_memory_path(project_root: Path | str) -> Path:
     """The old root file, kept only so the writer can clean it up."""
     return Path(project_root) / LEGACY_PROJECT_SUMMARY_FILE
+
+
+def single_file_memory_path(project_root: Path | str) -> Path:
+    """The previous ``.agents/memory/MEMORY.md`` layout, kept for migration."""
+    return memory_dir(project_root) / LEGACY_PROJECT_MEMORY_FILE
 
 
 # ══ the derived work summary ════════════════════════════════════════════
@@ -132,28 +159,99 @@ def _cap_lines(text: str, max_chars: int) -> tuple[str, bool]:
     return excerpt, True
 
 
-def read_project_memory(project_root: Path | str, *, max_chars: int = 1200) -> dict[str, Any]:
-    """Read the work summary into the shape the prompt renderer consumes.
+def _generated_memory_files(project_root: Path | str) -> list[tuple[str, Path, str]]:
+    """This checkout's generated day files as ``(day, path, text)``, newest first.
 
-    A missing or unreadable file is not an error: ``exists: false`` is a
-    project that has not recorded work yet (or a read-only checkout), and the
-    caller falls back to the database. ``chars`` is the whole file, so a host
-    can say "there is more" without reading it again.
+    Only files named ``YYYY-MM-DD.md`` and carrying the writer's marker are
+    returned: ``.agents/memory`` is agent-facing, but a hand-written note that
+    happens to be date-named must not be read back as recorded work or deleted
+    by the writer. Unreadable files are skipped, exactly as a missing directory
+    is: a read-only checkout is not an error.
     """
-    path = memory_path(project_root)
+    base = memory_dir(project_root)
+    try:
+        entries = sorted(base.iterdir(), key=lambda path: path.name, reverse=True)
+    except OSError:
+        return []
+    found: list[tuple[str, Path, str]] = []
+    for path in entries:
+        match = _MEMORY_DAY_FILE.match(path.name)
+        if match is None or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not text.lstrip().startswith(PROJECT_SUMMARY_MARKER):
+            continue
+        found.append((match.group(1), path, text))
+    return found
+
+
+def list_memory_files(project_root: Path | str) -> list[Path]:
+    """The generated day files, newest date first (unreadable ones skipped)."""
+    return [path for _day, path, _text in _generated_memory_files(project_root)]
+
+
+def read_project_memory(project_root: Path | str, *, max_chars: int = 1200) -> dict[str, Any]:
+    """Read the day records into the shape the prompt renderer consumes.
+
+    The excerpt is built newest day first so a session always sees the most
+    recent work; the whole-file ``chars`` (summed over days) lets a host say
+    "there is more" without reading the records again. A project that recorded
+    nothing — or a read-only checkout — is not an error: ``exists: false`` means
+    "no readable record", and the caller falls back to the database.
+
+    A checkout written by the previous single-file layout still yields its
+    excerpt until the writer has converted it, so a read-only copy of an old
+    project does not lose its context the moment the plugin is upgraded.
+    """
     result: dict[str, Any] = {
-        "path": str(path),
+        "dir": str(memory_dir(project_root)),
+        "path": None,
         "exists": False,
+        "files": [],
+        "days": [],
         "chars": 0,
         "updated": None,
         "excerpt": "",
         "truncated": False,
+        "legacy": False,
     }
+
+    files = _generated_memory_files(project_root)
+    if files:
+        chunks: list[str] = []
+        for day, path, text in files:
+            result["files"].append(str(path))
+            result["days"].append(day)
+            result["chars"] += len(text)
+            if result["updated"] is None:
+                stamp = _UPDATED.search(text)
+                if stamp:
+                    result["updated"] = stamp.group(1)
+            cleaned = _clean_memory_text(text)
+            if cleaned:
+                chunks.append(cleaned)
+        result["exists"] = True
+        result["path"] = str(files[0][1])
+        excerpt, truncated = _cap_lines("\n".join(chunks), int(max_chars))
+        result["excerpt"] = excerpt
+        result["truncated"] = truncated
+        return result
+
+    # The previous single-file layout. Read-only checkouts keep working until
+    # some write can convert the file into per-day records.
+    legacy = single_file_memory_path(project_root)
     try:
-        text = path.read_text(encoding="utf-8")
+        text = legacy.read_text(encoding="utf-8")
     except OSError:
         return result
+    if not text.strip():
+        return result
     result["exists"] = True
+    result["legacy"] = True
+    result["path"] = str(legacy)
     result["chars"] = len(text)
     stamp = _UPDATED.search(text)
     result["updated"] = stamp.group(1) if stamp else None
@@ -161,6 +259,119 @@ def read_project_memory(project_root: Path | str, *, max_chars: int = 1200) -> d
     result["excerpt"] = excerpt
     result["truncated"] = truncated
     return result
+
+
+# ══ writing the derived day records ═════════════════════════════════════
+
+
+def render_memory_day(
+    *,
+    project_id: str,
+    display_name: str | None,
+    day: str,
+    updated: str,
+    entries: Sequence[str],
+) -> str:
+    """One day's record file: marker, title, provenance block, date and lines.
+
+    ``entries`` are already-rendered ``- ...`` lines; separating the formatting
+    from the database query keeps this module free of storage imports. The
+    per-day ``## day`` heading is kept even though the file name carries the
+    date: the prompt concatenates several day excerpts, and a heading is what
+    keeps the boundary readable there.
+    """
+    display = display_name or project_id
+    lines = [
+        PROJECT_SUMMARY_MARKER,
+        f"# 项目摘要：{display} · {day}",
+        "",
+        f"> 项目 ID：`{project_id}` · 由 dsh-memory 自动维护 · 更新于 {updated}",
+        f"> 本文件只记录 {day} 已做过的工作；经验教训与偏好不在此文件中。",
+        "> 用户对项目的约定、规则、限制在 `.agents/rules/`（一条规则一份 markdown）。",
+        "",
+        f"## {day}",
+        "",
+        *entries,
+        "",
+    ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_memory_files(
+    project_root: Path | str,
+    days: Mapping[str, str],
+    *,
+    known_days: Sequence[str] | None = None,
+) -> list[str]:
+    """Reconcile ``.agents/memory`` with the derived per-day records.
+
+    Each changed day is written atomically (temp file + ``os.replace``) with
+    LF endings; a day whose file already holds the exact text is left alone, so
+    a digest commit that records nothing new touches no file.
+
+    ``known_days`` is every day this project has ever had a record on, whatever
+    its later state. A generated day file is deleted only when its day is in
+    ``known_days`` but no longer in ``days`` (all its records were forgotten or
+    superseded). A file whose day the project never knew is left alone on
+    purpose: project identity can drift (a git remote added later turns a
+    path-based id into a remote-based one), and a checkout shared by two ids
+    must not lose the other id's record to a reconcile. Files without the
+    writer's marker are never deleted: a hand-written note there is not
+    provably ours. The single-file ``MEMORY.md`` and the older root
+    ``DSH_MEMORY.md`` are removed once they carry the marker and there are
+    records to replace them, which is what finishes the two layout migrations.
+    OSError is left to the caller, which contains it per project so a read-only
+    checkout cannot fail digest generation.
+    """
+    root = Path(project_root)
+    base = memory_dir(root)
+    wanted = {
+        str(day): str(text)
+        for day, text in days.items()
+        if _MEMORY_DAY.match(str(day)) and str(text).strip()
+    }
+    if wanted:
+        base.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    for day in sorted(wanted, reverse=True):
+        target = day_memory_path(root, day)
+        text = wanted[day]
+        if target.is_file():
+            try:
+                if target.read_text(encoding="utf-8") == text:
+                    continue
+            except OSError:
+                pass
+        temporary = target.with_name(target.name + ".tmp")
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.replace(temporary, target)
+        written.append(str(target))
+
+    known = set(known_days or ())
+    for day, path, _text in _generated_memory_files(root):
+        if day in wanted:
+            continue
+        if day not in known:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            # Cleanup is best effort: the new records have already been
+            # written, and a vanished/locked old file is not a write failure.
+            pass
+
+    if wanted:
+        for legacy in (single_file_memory_path(root), legacy_memory_path(root)):
+            try:
+                if legacy.is_file() and legacy.read_text(
+                    encoding="utf-8"
+                ).lstrip().startswith(PROJECT_SUMMARY_MARKER):
+                    legacy.unlink()
+            except OSError:
+                pass
+    return written
 
 
 # ══ project rules (one Markdown per rule) ═══════════════════════════════

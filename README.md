@@ -80,9 +80,9 @@ DSH 宿主进程（JS 插件）                   Python 子进程（memory_syst
 ──────────────────────────               ─────────────────────────────
 apply(ctx)：注册 13 个工具 / 锚点 / 事件 / 路由
 系统提示词装配 ──digest.anchor──────────▶ 读摘要元信息 + 用户画像规模
-系统提示词装配 ──project.context───────▶ 读 .agents/memory/MEMORY.md + .agents/rules/*
+系统提示词装配 ──project.context───────▶ 读 .agents/memory/<YYYY-MM-DD>.md + .agents/rules/*
 memory_add ────memory.remember──────────▶ L2 事件 + L3 事实（同一事务）
-                                            └─▶ 重写 <repo>/.agents/memory/MEMORY.md
+                                            └─▶ 重写该日的 <repo>/.agents/memory/<YYYY-MM-DD>.md
 rule_add ──────rule.write────────────────▶ <repo>/.agents/rules/<name>.md
 skill_create ──skill.create─────────────▶ <repo>/.agents/skills/<name>/SKILL.md
                                             或 ~/.agents/skills/<name>/SKILL.md（需用户同意）
@@ -92,8 +92,8 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 ```
 
 1. **插件加载**：只注册工具、提示词 section（记忆锚点）、会话事件和设置页路由，**不启动子进程**。第一次真正调用工具时才 spawn。
-2. **首次提示词装配**：异步请求 `digest.anchor` 与当前项目的 `project.context`，按 `cwd` 缓存 15 秒。首次没有缓存，模型看到的是占位文本。锚点含摘要规模、时间、画像规模，以及**项目上下文**：`.agents/memory/MEMORY.md` 的最新工作行（不超过 1200 字）与 `.agents/rules/*.md` 的全部规则（不超过 2400 字 / 12 条）；记忆文件缺失时回退到该项目最新的 L2 工作条目（最多 8 条）。没有记忆也没有规则的项目不出现这一节。提示词里只是摘录——完整历史从 `.agents/memory/MEMORY.md` 读，完整规则从 `.agents/rules/` 读。技能的使用与创建方式由工具定义和 DSH 自带的技能目录提供，提示词不再另列索引。
-3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并立即生成该项目的 `.agents/memory/MEMORY.md`（目录按需创建）。
+2. **首次提示词装配**：异步请求 `digest.anchor` 与当前项目的 `project.context`，按 `cwd` 缓存 15 秒。首次没有缓存，模型看到的是占位文本。锚点含摘要规模、时间、画像规模，以及**项目上下文**：`.agents/memory/` 下按 UTC 日期分文件的近日工作记录（最新一天优先拼接，合计不超过 1200 字）与 `.agents/rules/*.md` 的全部规则（不超过 2400 字 / 12 条）；日文件还没生成、或 checkout 只读时回退到旧的单文件 `.agents/memory/MEMORY.md`，再没有就回退到该项目最新的 L2 工作条目（最多 8 条）。没有记忆也没有规则的项目不出现这一节。提示词里只是摘录——完整历史从 `.agents/memory/` 的日文件读，完整规则从 `.agents/rules/` 读。技能的使用与创建方式由工具定义和 DSH 自带的技能目录提供，提示词不再另列索引。
+3. **首次工具调用**：`memory_recall` / `memory_add` / `memory_search` / `skill_*` 会先解析项目。项目 id 优先来自 git remote（向上找 `.git/config`），否则由路径推导；随后注册项目并把该项目的派生工作记录写成 `.agents/memory/<YYYY-MM-DD>.md`（一天一份，目录按需创建，原子替换；带 `<!-- dsh-memory:project-summary -->` 标记的旧单文件 `MEMORY.md` 与旧根 `DSH_MEMORY.md` 会被删除）。
 4. **读写**：模型通过 `memory_add` 主动写入记忆；通过 `rule_add` 把用户对项目的约定、规则写成 `.agents/rules/<name>.md`；通过 `memory_recall` / `memory_search` / `memory_digest_read` / `memory_profile_read` 读取。**当前版本不会自动抄录对话。**
 5. **技能**：模型通过 `skill_create` 把**验证过、可复用**的做法写成技能文件——默认是**本项目仓库里的文件**（`.agents/skills/<name>/SKILL.md`），用户明确同意后也可写全局的 `~/.agents/skills/<name>/SKILL.md`。DSH 自己的技能目录会列出它们、用 `skill` 工具加载；`skill_list` / `skill_get` 查看，`skill_run` 记录执行结果，`skill_retire` 把目录移进 `.retired/`。见下文「L4 程序性技能」。
 6. **心跳（默认关闭）**：自上次写入起每经过 `heartbeatSteps` 个**模型步**（`step/start`，一个模型步 = 一次模型调用）在提示词尾部出现一次记忆提醒，随后重新计数；`0` 关闭。提醒文本在系统提示词里，所以它每出现/消失一次都会让前缀缓存失效，默认关。
@@ -105,8 +105,8 @@ session/disposed ──reviewSessionEnd─────▶ memory.remember(source
 | 时机 | 触发者 | 动作 | 写库 |
 |---|---|---|---|
 | 插件加载 | DSH | 注册工具 / 锚点 / 事件 / 路由 | 否 |
-| 首次提示词装配 | 系统提示词 | 异步刷新锚点与项目上下文（`.agents/memory/MEMORY.md` 摘录 + `.agents/rules/*.md`），首屏显示「正在读取记忆摘要…」 | 否 |
-| 首次工具调用 | 模型 | 注册项目 + 创建 `.agents/memory/MEMORY.md`（并清理带标记的旧 `DSH_MEMORY.md`） | 是 |
+| 首次提示词装配 | 系统提示词 | 异步刷新锚点与项目上下文（`.agents/memory/` 日文件摘录 + `.agents/rules/*.md`），首屏显示「正在读取记忆摘要…」 | 否 |
+| 首次工具调用 | 模型 | 注册项目 + 写 `.agents/memory/<YYYY-MM-DD>.md` 日文件（并清理带标记的旧 `MEMORY.md` / `DSH_MEMORY.md`） | 是 |
 | 用户给出项目约定 | 模型 | `rule_add` → 写 `<repo>/.agents/rules/<name>.md`（不写库、不进摘要） | 否（只写文件） |
 | 模型判断值得记 | 模型 | `memory_add` → L2 + L3 原子写 | 是 |
 | 模型判断做法可复用 | 模型 | `skill_create` → 写 `<repo>/.agents/skills/...`；用户同意后也可写 `~/.agents/skills/...` | 是（L2 审计记录） |
@@ -197,7 +197,7 @@ score = similarity × (0.2 + 0.8 × R)
 
 - 文件名 kebab-case（如 `project-memory-file-location.md`）；frontmatter 含 `name` / `description` / `metadata.origin` / `metadata.title` / `metadata.created-at`，正文以 `# <中文标题>` 开头，后面是规则本身；
 - 模型用 `rule_add` 写入（同名文件不覆盖，先读再改）；插件在会话首次装配系统提示词时自动读取并注入全部规则（不超过 2400 字 / 12 条）；
-- 规则是**要求**而不是做过的工作：不写记忆库、不参与召回、不进入全局摘要。它与 `.agents/memory/MEMORY.md` 的工作记录分开，避免“做过什么”和“应该怎么做”混在一起；规则文件进版本库，工作记录是派生文件、默认忽略。
+- 规则是**要求**而不是做过的工作：不写记忆库、不参与召回、不进入全局摘要。它与 `.agents/memory/` 下按日的工作记录分开，避免“做过什么”和“应该怎么做”混在一起；规则文件进版本库，工作记录是派生文件、可忽略或跟踪。
 
 ### 检索路径
 
@@ -218,7 +218,7 @@ score = similarity × (0.2 + 0.8 × R)
 ~/.dsh/memory/            # 可由 memoryHome / DSH_MEMORY_HOME / DSH_HOME 覆盖
 ├── memory.db             # 唯一主库（WAL，运行时伴生 -wal / -shm）
 └── exports/              # 超大备份落盘
-<repo>/.agents/memory/MEMORY.md   # 每个项目的派生工作摘要（gitignore）
+<repo>/.agents/memory/<YYYY-MM-DD>.md  # 每个项目按 UTC 日派生的工作记录，一天一份（派生视图，可忽略或跟踪）
 <repo>/.agents/rules/<name>.md    # 每个项目的规则，一条一份（进版本库）
 ```
 
@@ -232,16 +232,16 @@ score = similarity × (0.2 + 0.8 × R)
 
 `meta` 保存 `schema_version`、`embedding_dim`、`embedding_fingerprint`、摘要长度、用户画像、维护时间戳等。实测默认指纹为 `hash:256:True`。没有 `sqlite-vec` 时自动退化为普通表精确扫描，功能完整、只是更慢。
 
-`.agents/memory/MEMORY.md` 不是主存储，只是从 L2 工作记录派生的可读视图（最多 300 条，原子替换）。它不会反馈进召回，也不进入全局摘要材料。旧版根目录的 `DSH_MEMORY.md` 只在带 `<!-- dsh-memory:project-summary -->` 标记时会被识别为派生文件：下次成功写入后自动删除；没有标记的同名文件视为用户手写内容，保留不动。
+`.agents/memory/` 下的日文件不是主存储，只是从 L2 工作记录派生的可读视图：每天一个 `<YYYY-MM-DD>.md`（取记录的 UTC 日期，与文件里的 `HH:MM` 时间戳同一天），单日最多 300 条；内容变化的文件原子替换（`.tmp` + `os.replace`，LF 换行），没变化的文件不重写，较早的日子各自留在自己的文件里，没有全局条数上限。它不会反馈进召回，也不进入全局摘要材料。清理只针对能证明是生成物的文件：带 `<!-- dsh-memory:project-summary -->` 标记的旧单文件 `.agents/memory/MEMORY.md` 与旧根 `DSH_MEMORY.md` 在成功写入后被删除；某一天的记录全部被遗忘/替代时，那一天的日文件才删除；本项目从未记录过的那些日子（例如同一个 checkout 里另一个项目 id 留下的记录）与没有标记的手写文件都保留不动。
 
 ## 全局摘要与用户画像
 
-- 只有**一份全局摘要**，覆盖所有项目；`project` 作用域仅为历史兼容保留。项目级工作记录由 `.agents/memory/MEMORY.md` 承载，项目规则在 `.agents/rules/`。
+- 只有**一份全局摘要**，覆盖所有项目；`project` 作用域仅为历史兼容保留。项目级工作记录由 `.agents/memory/` 下按 UTC 日期分的日文件承载，项目规则在 `.agents/rules/`。
 - `digest.plan` 收集所有项目的 L2 工作记录，排除 `preference` / `user_message`、已遗忘和已被替代的条目；每个项目最多 160 条，材料预算随摘要长度档位变化。
 - 摘要由**宿主侧模型**生成：插件先拿材料与提示词，用会话最近一次使用的 provider/model 调 `ctx.llm.stream`，再原样 `digest.commit`。提交时**不按预算截断**。
 - 模型调用带宿主会话 id（`llm.stream({sessionId})`）：按会话路由的提供方（如 `opencode-go` 要求 `x-opencode-session`）缺这个头会直接 400。插件用本次会话的 id；设置页手动生成时退回到本进程最近一次见到的会话。
 - 生成需要本进程记录过模型路由；库里没有可总结的工作记录时不会硬编摘要。自动生成与手动生成走同一条路径，只有 `reason` 不同。失败的尝试仍会留一条 `status=error` 的摘要行（`latest()` 会忽略它），但**不会**推进“摘要已更新”的时间戳。
-- 每次提交后会刷新所有已注册项目的 `.agents/memory/MEMORY.md`。
+- 每次提交后会刷新所有已注册项目的 `.agents/memory/` 日文件（只重写内容变化的那几天）。
 
 ## 插件配置
 
@@ -282,10 +282,10 @@ python -m memory_system --list              # 查看支持的命令
 
 ### 项目记忆与规则相关的命令
 
-- `project.context`：读取当前项目的记忆摘录与规则。请求 `{"cwd": "...", "memory_chars"?: 1200, "max_rules"?: 12, "rule_chars"?: 2400, "recent_limit"?: 8}`；返回 `{"project_id", "root_path", "memory": {"path", "exists", "chars", "updated", "excerpt", "truncated"}, "rules_dir", "rules": [{"name", "title", "description", "path", "chars", "content"}], "rules_truncated", "recent": [{"summary"}]}`。记忆文件不存在时（`memory.exists=false`）`recent` 给出该项目最新的 L2 工作条目作兜底；第一次访问一个 checkout 时会先生成派生文件。
+- `project.context`：读取当前项目的记忆摘录与规则。请求 `{"cwd": "...", "memory_chars"?: 1200, "max_rules"?: 12, "rule_chars"?: 2400, "recent_limit"?: 8}`；返回 `{"project_id", "root_path", "memory": {"dir", "path", "exists", "files", "days", "chars", "updated", "excerpt", "truncated", "legacy"}, "rules_dir", "rules": [{"name", "title", "description", "path", "chars", "content"}], "rules_truncated", "recent": [{"summary"}]}`。`dir` 是 `.agents/memory/` 目录，`path` 是最新一天的日文件（没有日文件时为旧单文件 `MEMORY.md`），`files` / `days` 是读到的日文件路径与日期（新的在前），`chars` 是所有日文件的字数之和，`legacy` 表示这次读的是旧的单文件布局。没有可读记录时（`memory.exists=false`）`recent` 给出该项目最新的 L2 工作条目作兜底；第一次访问一个 checkout 时会先把日文件写出来。
 - `rule.write`：把一条规则写成 `<projectRoot>/.agents/rules/<name>.md`。请求 `{"cwd": "...", "name": "kebab-case", "title": "...", "description": "...", "content": "..."}`，返回 `{"path", "name", "project_id", "root_path"}`；同名文件已存在时返回 `conflict`，不覆盖。
 
-`status` 的返回里，`project_memory` 与 `project_rules` 分别是当前项目记忆文件与规则目录的路径；旧的 `project_summary` 键仍保留（现在同样指向 `.agents/memory/MEMORY.md`）。
+`status` 的返回里，`project_memory` 是当前项目记忆**目录** `.agents/memory/` 的路径，`project_rules` 是规则目录的路径；旧的 `project_summary` 键仍保留，现在指向最新一天的日文件（还没有日文件时指向旧单文件 `MEMORY.md`，两者都没有则为 `null`）。
 
 ## 设置页
 
@@ -302,13 +302,13 @@ Web profile 下注册 `/dsh-memory/*` 路由：
 | `backup` | 导出 Markdown；从 Markdown 预览并恢复（只新增，不删除） |
 | `health` | 健康检查：桥接延迟、最近一次摘要尝试（含失败原因）、到期维护任务。设置页本身不调用它，供运维/脚本用 |
 
-修改记忆摘要会同时重算向量和 FTS body；`forget` 是软删除（`state='archived'` + `meta.forgotten_at`），可恢复；每次编辑都会刷新 `.agents/memory/MEMORY.md`。
+修改记忆摘要会同时重算向量和 FTS body；`forget` 是软删除（`state='archived'` + `meta.forgotten_at`），可恢复；每次编辑都会刷新该项目 `.agents/memory/` 的日文件。
 
 ## 已知边界
 
 这些是当前代码的实际行为，不是设计目标：
 
-1. **没有“会话开始”钩子，但首次装配会注入项目上下文。** 插件没有 `session/created` / `session/start` 处理器；它在第一次系统提示词装配时读 `.agents/memory/MEMORY.md` 摘录与 `.agents/rules/*.md` 并注入锚点，之后按 `cwd` 缓存 15 秒。它不会抄录对话，也不会主动读取或注入其他文件。
+1. **没有“会话开始”钩子，但首次装配会注入项目上下文。** 插件没有 `session/created` / `session/start` 处理器；它在第一次系统提示词装配时读 `.agents/memory/` 下按日的工作记录摘录与 `.agents/rules/*.md` 并注入锚点，之后按 `cwd` 缓存 15 秒。它不会抄录对话，也不会主动读取或注入其他文件。
 2. **不自动采集对话。** 唯一由模型触发的**记忆**写入是 `memory_add`（`rule_add` 写的是 `.agents/rules/` 里的规则文件，不进记忆库）；会话结束检查是额外补写。桥接层仍有 `memory.capture`（幂等、有测试），但插件不调用它——它留给需要自动采集的宿主，不是死代码。
 3. **锚点有 15 秒缓存，但写入会主动失效。** 摘要生成、画像保存、摘要删除都会立刻重读锚点，下一次装配就能看到新值；普通会话仍按 15 秒 TTL 刷新。冷启动（进程刚起或插件刚重载）的首个装配显示「正在读取记忆摘要…」，读完即替换，不再声称「还没有摘要」。
 4. **心跳按模型步计数，且只在默认关闭时无成本。** 监听 `step/start`（一次模型调用）：一个跑 30 次工具调用的长回合算 30 步。开启后每满一个窗口才出现一次并重新计数；关掉（`0`）则不进入提示词。

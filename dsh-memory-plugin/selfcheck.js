@@ -8,9 +8,9 @@
  * 1. the heartbeat counts model steps (`step/start`), not user turns, and the
  *    reminder text says so;
  * 2. the anchor's project context is requested with the bridge budgets, shows
- *    `.agents/rules` in order, shows the `.agents/memory/MEMORY.md` excerpt (or
- *    the recent-work fallback while that file is missing), and stays out of an
- *    assembly that has no working directory;
+ *    `.agents/rules` in order, shows the `.agents/memory/<YYYY-MM-DD>.md` day
+ *    excerpts (or the recent-work fallback while no day file exists), and stays
+ *    out of an assembly that has no working directory;
  * 3. `rule_add` writes exactly one `.agents/rules/<name>.md` through the bridge
  *    and reports the resulting path;
  * 4. digest generation reaches a model even when no session in this process has
@@ -169,7 +169,20 @@ async function assemble(scenario) {
       return {
         project_id: 'selfcheck-project',
         root_path: CWD,
-        memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+        // The shape `project_files.read_project_memory` returns: the memory
+        // directory, the newest day file, and every day file newest first.
+        memory: {
+          dir: `${CWD}/.agents/memory`,
+          path: null,
+          exists: false,
+          files: [],
+          days: [],
+          chars: 0,
+          updated: null,
+          excerpt: '',
+          truncated: false,
+          legacy: false,
+        },
         rules_dir: null,
         rules: [],
         rules_truncated: false,
@@ -450,9 +463,13 @@ console.log('a global skill needs an answer the host saw, not a flag the model s
 
 console.log('project context: the memory excerpt is injected within its budget')
 {
+  // Two days worth of records, newest first: the excerpt the bridge assembles
+  // from several `.agents/memory/<YYYY-MM-DD>.md` files.
   const excerpt = [
+    '## 2026-11-06',
+    '- 项目记忆改成一天一个文件',
     '## 2026-11-05',
-    '- 记忆文件迁到 .agents/memory/MEMORY.md',
+    '- 记忆文件迁到 .agents/memory/<日期>.md',
     '- 规则目录用 .agents/rules/<name>.md',
   ].join('\n')
   const calls = []
@@ -462,12 +479,16 @@ console.log('project context: the memory excerpt is injected within its budget')
       project_id: 'selfcheck-project',
       root_path: CWD,
       memory: {
-        path: `${CWD}/.agents/memory/MEMORY.md`,
+        dir: `${CWD}/.agents/memory`,
+        path: `${CWD}/.agents/memory/2026-11-06.md`,
         exists: true,
+        files: [`${CWD}/.agents/memory/2026-11-06.md`, `${CWD}/.agents/memory/2026-11-05.md`],
+        days: ['2026-11-06', '2026-11-05'],
         chars: excerpt.length,
-        updated: '2026-11-05 13:10:36',
+        updated: '2026-11-06 09:20:11',
         excerpt,
         truncated: true,
+        legacy: false,
       },
       rules_dir: `${CWD}/.agents/rules`,
       rules: [],
@@ -475,12 +496,20 @@ console.log('project context: the memory excerpt is injected within its budget')
       recent: [],
     },
   })
-  check(anchor.includes('**本项目工作记录**'), 'a project memory file shows its excerpt block')
-  check(anchor.includes('.agents/memory/MEMORY.md'), 'the block names the memory file')
-  check(anchor.includes('更新于 2026-11-05 13:10:36'), 'the block shows the file update stamp')
-  check(anchor.includes('记忆文件迁到 .agents/memory/MEMORY.md'), 'the excerpt text reaches the prompt')
-  check(anchor.includes('更早的内容读 `.agents/memory/MEMORY.md`'), 'a cut excerpt points at the file')
-  check(!anchor.includes('**本项目最近的工作**'), 'the DB fallback is not used while the memory file exists')
+  check(anchor.includes('**本项目工作记录**'), 'a project with work records shows its excerpt block')
+  check(
+    anchor.includes('（来自 `.agents/memory/` 下的按日期文件'),
+    'the block names the per-day files under the memory directory',
+  )
+  check(anchor.includes('更新于 2026-11-06 09:20:11'), 'the block shows the newest record update stamp')
+  check(anchor.includes('项目记忆改成一天一个文件'), 'the newest day excerpt reaches the prompt')
+  check(anchor.includes('记忆文件迁到 .agents/memory/<日期>.md'), 'an older day excerpt reaches the prompt too')
+  check(anchor.includes('更早的内容在 `.agents/memory/`'), 'a cut excerpt points at the memory directory')
+  check(anchor.includes('.agents/memory/<YYYY-MM-DD>.md'), 'a cut excerpt names the per-day file pattern')
+  check(
+    !anchor.includes('**本项目最近的工作**'),
+    'the DB fallback is not used while day records exist',
+  )
   const section = anchor
     .slice(anchor.indexOf('**本项目工作记录**'), anchor.indexOf('**记忆写入**'))
     .trim()
@@ -500,46 +529,69 @@ console.log('project context: the memory excerpt is injected within its budget')
   check(contextCall?.payload?.recent_limit === PROJECT_RECENT_LIMIT, 'the fallback list is capped')
 }
 
-console.log('project context: a project without a memory file falls back to recent work')
+console.log('project context: a project without day records falls back to recent work')
 {
   const { anchor } = await assemble({
     projectContext: {
       project_id: 'selfcheck-project',
       root_path: CWD,
-      memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+      memory: {
+        dir: `${CWD}/.agents/memory`,
+        path: null,
+        exists: false,
+        files: [],
+        days: [],
+        chars: 0,
+        updated: null,
+        excerpt: '',
+        truncated: false,
+        legacy: false,
+      },
       rules_dir: `${CWD}/.agents/rules`,
       rules: [],
       rules_truncated: false,
       recent: [{ summary: '最近完成了规则目录迁移' }, { summary: '把 DSH_MEMORY.md 搬到 .agents' }],
     },
   })
-  check(anchor.includes('**本项目最近的工作**'), 'a project with no memory file shows the recent-work fallback')
+  check(anchor.includes('**本项目最近的工作**'), 'a project with no day records shows the recent-work fallback')
   check(anchor.includes('- 最近完成了规则目录迁移'), 'the fallback lists the newest work lines')
-  check(anchor.includes('全量历史读 `.agents/memory/MEMORY.md`'), 'the fallback points at the memory file')
-  check(!anchor.includes('**本项目工作记录**'), 'the excerpt block is not shown without a memory file')
+  check(
+    anchor.includes('全量历史见 `.agents/memory/`'),
+    'the fallback points at the per-day record directory',
+  )
+  check(
+    anchor.includes('`.agents/memory/<YYYY-MM-DD>.md`'),
+    'the fallback names the per-day file pattern',
+  )
+  check(!anchor.includes('**本项目工作记录**'), 'the excerpt block is not shown without day records')
 }
 
 console.log('project context: an empty project adds no resident block')
 {
   const { anchor } = await assemble({})
-  check(!anchor.includes('**本项目工作记录**'), 'no memory file means no excerpt block')
+  check(!anchor.includes('**本项目工作记录**'), 'no work records means no excerpt block')
   check(!anchor.includes('**本项目最近的工作**'), 'no fallback entries means no recent-work block')
   check(!anchor.includes('**本项目规则**'), 'no rule files means no rules block')
 }
 {
-  // First contact materializes `<repo>/.agents/memory/MEMORY.md` even when the
-  // project has no work yet; the file exists but carries nothing to inject.
+  // First contact materializes today's `<repo>/.agents/memory/<YYYY-MM-DD>.md`
+  // even when the project has no work yet; the file exists but carries nothing
+  // to inject.
   const { anchor } = await assemble({
     projectContext: {
       project_id: 'selfcheck-project',
       root_path: CWD,
       memory: {
-        path: `${CWD}/.agents/memory/MEMORY.md`,
+        dir: `${CWD}/.agents/memory`,
+        path: `${CWD}/.agents/memory/2026-11-06.md`,
         exists: true,
+        files: [`${CWD}/.agents/memory/2026-11-06.md`],
+        days: ['2026-11-06'],
         chars: 120,
         updated: null,
         excerpt: '',
         truncated: false,
+        legacy: false,
       },
       rules_dir: `${CWD}/.agents/rules`,
       rules: [],
@@ -547,8 +599,8 @@ console.log('project context: an empty project adds no resident block')
       recent: [],
     },
   })
-  check(!anchor.includes('**本项目工作记录**'), 'a materialized but empty memory file adds no block')
-  check(!anchor.includes('完整记录见'), 'an empty memory file does not advertise itself every turn')
+  check(!anchor.includes('**本项目工作记录**'), 'a materialized but empty day record adds no block')
+  check(!anchor.includes('完整记录见'), 'an empty day record does not advertise itself every turn')
 }
 
 console.log('project context: the rules are injected in order')
@@ -575,7 +627,18 @@ console.log('project context: the rules are injected in order')
     projectContext: {
       project_id: 'selfcheck-project',
       root_path: CWD,
-      memory: { path: null, exists: false, chars: 0, updated: null, excerpt: '', truncated: false },
+      memory: {
+        dir: `${CWD}/.agents/memory`,
+        path: null,
+        exists: false,
+        files: [],
+        days: [],
+        chars: 0,
+        updated: null,
+        excerpt: '',
+        truncated: false,
+        legacy: false,
+      },
       rules_dir: `${CWD}/.agents/rules`,
       rules,
       rules_truncated: true,
@@ -640,12 +703,16 @@ console.log('a cwd-less assembly never borrows another project context')
       project_id: 'other-project',
       root_path: 'D:/other/project',
       memory: {
-        path: 'D:/other/project/.agents/memory/MEMORY.md',
+        dir: 'D:/other/project/.agents/memory',
+        path: 'D:/other/project/.agents/memory/2026-11-05.md',
         exists: true,
+        files: ['D:/other/project/.agents/memory/2026-11-05.md'],
+        days: ['2026-11-05'],
         chars: 10,
         updated: '2026-11-05 13:10:36',
         excerpt: '另一个项目的工作记录',
         truncated: false,
+        legacy: false,
       },
       rules_dir: 'D:/other/project/.agents/rules',
       rules: [

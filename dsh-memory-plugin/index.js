@@ -870,8 +870,9 @@ export function apply(ctx, rawConfig) {
   async function generateDigest({ cwd, signal, reason = 'manual', length, sessionId } = {}) {
     cwd = resolveCwd(cwd)
     // Resolving the project also registers its root path, which is what lets
-    // the Python side write that project's `.agents/memory/MEMORY.md`. It is
-    // never a reason to fail a global digest.
+    // the Python side write that project's per-day records under
+    // `.agents/memory/<YYYY-MM-DD>.md`. It is never a reason to fail a global
+    // digest.
     let projectId
     if (cwd) {
       try {
@@ -1155,11 +1156,11 @@ export function apply(ctx, rawConfig) {
      * The `@@dsh-memory` count line and the profile are global — `digest.anchor`
      * ignores the caller's directory — so keying that part by directory only
      * made N projects each age out and each pay for an identical round trip.
-     * The project context (the `.agents/memory/MEMORY.md` excerpt and the
-     * `.agents/rules` files) is per project, so it is keyed by cwd: a shared
-     * slot let a refresh stamped for one directory install its content under
-     * every other session, which is how another project's rules reached the
-     * block.
+     * The project context (the newest `.agents/memory/<YYYY-MM-DD>.md` day
+     * excerpts and the `.agents/rules` files) is per project, so it is keyed by
+     * cwd: a shared slot let a refresh stamped for one directory install its
+     * content under every other session, which is how another project's rules
+     * reached the block.
      */
     const anchorSlotShared = {
       at: 0,
@@ -1231,8 +1232,8 @@ export function apply(ctx, rawConfig) {
      *
      * One assembly can start two reads of the same directory: the global
      * anchor's refresh (which re-reads the project half so a digest commit's
-     * fresh `MEMORY.md` is not missed) and the per-directory timer. Joining the
-     * in-flight promise keeps that a single bridge call.
+     * freshly rewritten day files are not missed) and the per-directory timer.
+     * Joining the in-flight promise keeps that a single bridge call.
      * @type {Map<string, Promise<void>>}
      */
     const projectLoads = new Map()
@@ -1374,10 +1375,10 @@ export function apply(ctx, rawConfig) {
      *
      * Rendered from what the bridge returned for this directory: the rules
      * first — they are constraints and must be read before the history — then
-     * the excerpt of `.agents/memory/MEMORY.md`. While that file does not exist
-     * yet, the newest DB work lines stand in as a fallback; a project with
-     * neither emits nothing rather than spending resident tokens advertising
-     * emptiness.
+     * the excerpt of the newest `.agents/memory/<YYYY-MM-DD>.md` day files,
+     * newest first. While no day file exists yet, the newest DB work lines
+     * stand in as a fallback; a project with neither emits nothing rather than
+     * spending resident tokens advertising emptiness.
      * @param {{data?: object | null} | null} slot - this directory's cache entry.
      * @returns {string} the section, or ''.
      */
@@ -1402,19 +1403,30 @@ export function apply(ctx, rawConfig) {
         blocks.push(lines.join('\n'))
       }
       const memory = data.memory ?? {}
-      // A materialized but empty file (a project that has recorded no work) is
-      // not worth a resident heading plus "read the file" line every turn; the
-      // excerpt is what earns the block its tokens.
+      // A materialized but empty day record (a project that has recorded no
+      // work) is not worth a resident heading plus "read the files" line every
+      // turn; the excerpt is what earns the block its tokens.
       const hasExcerpt = Boolean(String(memory.excerpt ?? '').trim())
       if (memory.exists && hasExcerpt) {
+        // A read-only checkout can still be on the previous single-file layout:
+        // say where the text came from instead of claiming day files that were
+        // never written. The next successful write converts it.
+        const legacyLayout = Boolean(memory.legacy)
+        const source = legacyLayout
+          ? '`.agents/memory/MEMORY.md`（旧单文件布局）'
+          : '`.agents/memory/` 下的按日期文件'
         const lines = [
-          `**本项目工作记录**（来自 \`.agents/memory/MEMORY.md\`，更新于 ${memory.updated || '未知时间'}）`,
+          `**本项目工作记录**（来自 ${source}，更新于 ${memory.updated || '未知时间'}）`,
         ]
         if (memory.excerpt) lines.push(String(memory.excerpt))
         lines.push(
           memory.truncated
-            ? '- 更早的内容读 `.agents/memory/MEMORY.md`，或用 `memory_search`（state 可查 dormant/archived）'
-            : '- 完整记录见 `.agents/memory/MEMORY.md`',
+            ? legacyLayout
+              ? '- 更早的内容读 `.agents/memory/MEMORY.md`，或用 `memory_search`（state 可查 dormant/archived）'
+              : '- 更早的内容在 `.agents/memory/` 的按日期文件里（`.agents/memory/<YYYY-MM-DD>.md`），或用 `memory_search`（state 可查 dormant/archived）'
+            : legacyLayout
+              ? '- 完整记录见 `.agents/memory/MEMORY.md`'
+              : '- 完整记录见 `.agents/memory/`（一天一个文件）',
         )
         blocks.push(lines.join('\n'))
       } else {
@@ -1428,7 +1440,7 @@ export function apply(ctx, rawConfig) {
             [
               '**本项目最近的工作**（从新到旧，节选用）',
               ...lines,
-              '- 全量历史读 `.agents/memory/MEMORY.md`',
+              '- 全量历史见 `.agents/memory/`（一天一个文件，`.agents/memory/<YYYY-MM-DD>.md`）',
             ].join('\n'),
           )
         }
@@ -2040,9 +2052,10 @@ const ANCHOR_NO_SUMMARY = '（尚未生成全局摘要；可用 `memory_digest_g
  *
  * `{{memory_anchor}}` is the Python-rendered count line (digest size and age,
  * profile size), and `{{project_context}}` the project block: the rules from
- * `.agents/rules`, the excerpt of `.agents/memory/MEMORY.md`, or — while that
- * file does not exist yet — this project's newest DB work lines. Either half
- * may be empty; an empty section is dropped before it reaches the prompt.
+ * `.agents/rules`, the excerpt of the newest `.agents/memory/<YYYY-MM-DD>.md`
+ * day files, or — while no day file exists yet — this project's newest DB work
+ * lines. Either half may be empty; an empty section is dropped before it
+ * reaches the prompt.
  *
  * What a tool's own definition already says stays out of here: this block is
  * resident in every request and the full tool schemas ride along with it, so
@@ -2076,7 +2089,7 @@ const ANCHOR_HEADER = [
   '',
   '- 问题需要过往经验时，先用 `memory_recall`（按相关度）再回答，不要凭印象编造。',
   '- 换了说法的关键词用 `memory_search` 补，`state` 可查 dormant / archived，召回默认只给 active。',
-  '- 摘要与 `.agents/memory/MEMORY.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
+  '- 摘要与 `.agents/memory/<日期>.md` 只记工程动作，经验、决策、偏好、教训只在检索里。',
   '- 用户画像只能读，由用户自己在设置页维护。',
   '- `memory_forget` 是软删除：做完告知用户"已归档、可恢复"。',
   '',

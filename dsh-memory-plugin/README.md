@@ -3,7 +3,7 @@
 DSH 记忆插件：把 `D:\Coding\dsh-memory\memory_system` 的长期记忆接入 DeepSeek Harness。
 
 插件本身**不含任何记忆逻辑**。全局摘要生成、按预算控制详细程度、用户画像、条目编辑、
-Markdown 备份、项目记忆文件与项目规则文件全部由 `memory_system` 实现，插件只做三件事：
+Markdown 备份、项目每日工作记录与项目规则文件全部由 `memory_system` 实现，插件只做三件事：
 
 1. 把记忆锚点（全局规模/时间 + **本项目记忆与规则**）注入系统提示词；
 2. 在回合结束、会话结束时驱动**一份覆盖全部项目的全局工作摘要**；
@@ -29,11 +29,11 @@ Markdown 备份、项目记忆文件与项目规则文件全部由 `memory_syste
 | Section | order | 内容 | 开关 |
 | --- | --- | --- | --- |
 | `dsh-memory:instruction` | `1` | 用户自己写的**系统指令**原文，`interpolate: false`（`{{…}}` 保持字面） | 设置页开关（`config.systemPromptAnchor` 无关） |
-| `dsh-memory:anchor` | `9500` | 记忆锚点：摘要规模/时间、用户画像规模、本项目 `.agents/memory/MEMORY.md` 摘录与 `.agents/rules/*.md`、工具使用规则 | `systemPromptAnchor` |
+| `dsh-memory:anchor` | `9500` | 记忆锚点：摘要规模/时间、用户画像规模、本项目 `.agents/memory/` 日文件摘录与 `.agents/rules/*.md`、工具使用规则 | `systemPromptAnchor` |
 
 系统指令放在最前面（`1`，紧跟 `dsh-system-prompt` 保留给部署人格前缀的 `0`），因为它是用户自己的文字，读起来就是人格的一部分，而不是记忆条目。空文本或开关关闭时该 section 渲染成 `''`，`renderPrompt` 会丢弃空 section——所以没写指令的用户一分 token 都不付。
 
-锚点里的**项目上下文**在会话首次装配时通过桥接 `project.context` 读取，按 `cwd` 缓存 15 秒：`.agents/memory/MEMORY.md` 的最新工作行（≤1200 字）与 `.agents/rules/*.md` 的全部规则（≤2400 字 / 12 条，按文件名排序以保证稳定、利于前缀缓存）；记忆文件缺失时退回该项目最新的 L2 工作条目（≤8 条）。提示词只放摘录，完整历史从文件读、完整规则从 `.agents/rules/` 读。
+锚点里的**项目上下文**在会话首次装配时通过桥接 `project.context` 读取，按 `cwd` 缓存 15 秒：`.agents/memory/` 下按 UTC 日期分的日文件（最新一天在前拼接，≤1200 字）与 `.agents/rules/*.md` 的全部规则（≤2400 字 / 12 条，按文件名排序以保证稳定、利于前缀缓存）；还没有日文件时退回上一版的单文件 `MEMORY.md`（只读 checkout 里常见），再无记录时退回该项目最新的 L2 工作条目（≤8 条）。提示词只放摘录，完整历史从日文件读、完整规则从 `.agents/rules/` 读。
 
 技能分两处存，都是文件：**项目技能**在仓库 `.agents/skills`（DSH 自己的技能目录会列出它，并用原生 `skill` 工具加载），**全局技能**在 `~/.agents/skills`（所有项目共享，可用 `DSH_MEMORY_GLOBAL_SKILLS` 覆盖）。`org` / `sys` 数据库作用域已移除；全局技能的创建与退役是用户决策，模型必须先征得同意。每次成功创建还会在记忆库留一条 L2 审计记录，但技能定义本身只在 `SKILL.md` 里。
 
@@ -51,10 +51,11 @@ Markdown 备份、项目记忆文件与项目规则文件全部由 `memory_syste
 | 记忆条目 | **记忆查看与编辑**：列出、搜索、改内容/重要度/类型/标签、归档与恢复 |
 | 备份与恢复 | 导出 Markdown；从 Markdown 预览并恢复 |
 
-除全局摘要外，`memory_system` 还会自动维护每个项目的两处文件：`.agents/memory/MEMORY.md`
-按时间记录该项目做过的工作（派生视图，可随时重新生成），`.agents/rules/` 下一条规则一份
-markdown 记录用户对项目的约定。两者都会在会话首次装配系统提示词时自动注入。旧版仓库根目录的
-`DSH_MEMORY.md` 会迁移到 `.agents/memory/MEMORY.md` 后删除（只处理带 `<!-- dsh-memory:project-summary -->`
+除全局摘要外，`memory_system` 还会自动维护每个项目的两类文件：`.agents/memory/<YYYY-MM-DD>.md`
+按 UTC 日记录该项目那天做过的工作（派生视图，可随时重新生成；单日最多 300 条，内容变化才原子
+替换），`.agents/rules/` 下一条规则一份 markdown 记录用户对项目的约定。两者都会在会话首次装配
+系统提示词时自动注入。上一版布局的单文件 `.agents/memory/MEMORY.md` 与更早的仓库根
+`DSH_MEMORY.md` 会在成功写入日文件后删除（只处理带 `<!-- dsh-memory:project-summary -->`
 标记的生成文件，用户手写的不动）。
 
 ## 安装
@@ -122,10 +123,10 @@ python -m memory_system status '{\"cwd\": \"D:\\\\Coding\\\\dsh-memory\"}'
 
 ### 项目记忆与规则相关命令
 
-- `project.context`：请求 `{"cwd": "...", "memory_chars"?: 1200, "max_rules"?: 12, "rule_chars"?: 2400, "recent_limit"?: 8}`；返回当前项目的记忆摘录 `memory {path, exists, chars, updated, excerpt, truncated}`、规则列表 `rules [{name, title, description, path, chars, content}]`、`rules_dir`、`rules_truncated`，以及记忆文件缺失时的兜底 `recent [{summary}]`。插件在首次提示词装配时调用它，按 cwd 缓存 15 秒。
+- `project.context`：请求 `{"cwd": "...", "memory_chars"?: 1200, "max_rules"?: 12, "rule_chars"?: 2400, "recent_limit"?: 8}`；返回当前项目的记忆摘录 `memory {dir, path, exists, files, days, chars, updated, excerpt, truncated, legacy}`、规则列表 `rules [{name, title, description, path, chars, content}]`、`rules_dir`、`rules_truncated`，以及没有可读记录时的兜底 `recent [{summary}]`。`dir` 是 `.agents/memory/` 目录，`path` 是最新一天的日文件（没有日文件时为旧单文件 `MEMORY.md`），`files` / `days` 是读到的日文件路径与日期（新的在前），`legacy` 表示这次读的是上一版的单文件布局。插件在首次提示词装配时调用它，按 cwd 缓存 15 秒。
 - `rule.write`：请求 `{"cwd": "...", "name": "kebab-case", "title": "...", "description": "...", "content": "..."}`，写 `<projectRoot>/.agents/rules/<name>.md`，返回 `{"path", "name", "project_id", "root_path"}`；同名文件已存在返回 `conflict`。
 
-`status` 增加 `project_memory` / `project_rules`（当前项目记忆文件与规则目录的路径）；旧的 `project_summary` 仍然返回（现在同样指向 `.agents/memory/MEMORY.md`）。
+`status` 增加 `project_memory` / `project_rules`（当前项目记忆**目录** `.agents/memory/` 与规则目录的路径）；旧的 `project_summary` 仍然返回，现在指向最新一天的日文件（没有日文件时指向旧单文件 `MEMORY.md`，两者都没有则为 `null`）。
 
 ## 模型调用
 
@@ -137,13 +138,13 @@ python -m memory_system status '{\"cwd\": \"D:\\\\Coding\\\\dsh-memory\"}'
   回退到 DSH 的默认模型（`agentDefaultModel` 的 `currentSelection()`，即新建 agent 会用的那一个）；
 - 记忆库为空时不会硬编摘要，而是记录「还没有可总结的工作记录」；
 - 自动生成与手动生成走同一条路径，只有 `reason` 不同；
-- 每次提交还会刷新各项目的 `.agents/memory/MEMORY.md`；该文件由 L2 工作记录派生，失败不会影响摘要。
+- 每次提交还会刷新各项目的 `.agents/memory/` 日文件；它们由 L2 工作记录派生，失败不会影响摘要。
 
 ## 数据安全
 
 - 记忆条目只做**软删除**（`archived`），随时可恢复；
 - 恢复备份只新增条目，从不删除现有记忆；
-- 记忆锚点只包含摘要规模、时间、用户画像规模、**本项目 `.agents/memory/MEMORY.md` 摘录（≤1200 字）与 `.agents/rules/*.md` 规则（≤2400 字 / 12 条）**与工具指引，**不含摘要正文**，全文通过工具按需读取；
+- 记忆锚点只包含摘要规模、时间、用户画像规模、**本项目 `.agents/memory/` 日文件摘录（≤1200 字）与 `.agents/rules/*.md` 规则（≤2400 字 / 12 条）**与工具指引，**不含摘要正文**，全文通过工具按需读取；
 - 全局摘要只记录“做过什么工作”，不写入经验教训与用户偏好；
-- `.agents/memory/MEMORY.md` 是派生文件，只包含该项目的工作记录，可随时重新生成；`.agents/rules/` 下的规则是写下来的约定，进版本库；
+- `.agents/memory/` 的日文件是派生文件，只包含该项目按 UTC 日的工作记录，可随时重新生成；`.agents/rules/` 下的规则是写下来的约定，进版本库；
 - 会话结束检查存的是模型整理后的一句话摘要，不存模型输出全文或完整对话。

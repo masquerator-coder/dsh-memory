@@ -312,7 +312,7 @@ def _is_known_project(project: str | None) -> bool:
 
 
 def _refresh_project_summary(memory: MemorySystem, project_id: str) -> None:
-    """Keep the project's root Markdown in step with a memory edit/write."""
+    """Keep the project's per-day work records in step with an edit/write."""
     try:
         DigestService(memory).write_project_summaries(project_id=project_id)
     except Exception:  # noqa: BLE001 - a derived file must never fail a write
@@ -324,10 +324,9 @@ def _register_project(memory: MemorySystem, payload: dict[str, Any]) -> str:
 
     ``memory.remember`` registers the project id but knows nothing about the
     checkout it belongs to, so a write routed through this function has no
-    ``root_path`` and the project summary cannot be written. Registering it
-    here is what makes "read ``.agents/memory/MEMORY.md`` at session start"
-    hold after a ``memory_add`` that never touched ``projects`` or ``status``
-    first.
+    ``root_path`` and the project's work records cannot be written. Registering
+    it here is what makes "read ``.agents/memory/`` at session start" hold after
+    a ``memory_add`` that never touched ``projects`` or ``status`` first.
     """
     project = _project(payload)
     memory.ensure_project(
@@ -378,6 +377,9 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     latest = service.latest(scope="global")
     notepad = MemoryNotepad(memory)
     listing = notepad.list(project_id=project, limit=1)
+    memory_info = (
+        project_files.read_project_memory(root, max_chars=0) if root else None
+    )
     stats: dict[str, Any]
     try:
         stats = _jsonable(memory.stats(project))
@@ -391,8 +393,8 @@ def cmd_status(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
         "projects": [p.project_id for p in memory.list_projects()],
         "settings": settings.to_dict(),
         "digest": latest.to_dict() if latest else None,
-        "project_summary": str(Path(root) / project_files.PROJECT_MEMORY_RELATIVE) if root else None,
-        "project_memory": str(project_files.memory_path(root)) if root else None,
+        "project_summary": (str(memory_info["path"]) if memory_info and memory_info["path"] else None),
+        "project_memory": str(project_files.memory_dir(root)) if root else None,
         "project_rules": str(project_files.rules_dir(root)) if root else None,
         "memories": listing["total"],
         "probe": probe_payload(memory),
@@ -408,7 +410,8 @@ def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any
     memory.ensure_project(
         project, display_name=payload.get("display_name"), root_path=root
     )
-    # First contact with a project is also what creates its root Markdown file.
+    # First contact with a project also writes its day record files (if it has
+    # any recorded work) so a later session reads the same files a human would.
     if root:
         DigestService(memory).write_project_summaries(project_id=project)
     return {
@@ -425,15 +428,16 @@ def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any
     }
 
 
-# ── project files: work summary + rules ─────────────────────────────────
+# ── project files: work records + rules ─────────────────────────────────
 #
 # A checkout carries two kinds of memory files (see ``project_files``):
-# ``.agents/memory/MEMORY.md`` (derived from L2) and ``.agents/rules/*.md``
-# (user-authored constraints). The host reads both at session start so the
-# model begins with the project's work record and rules already in context,
-# instead of having to discover and read the files itself. This command is the
-# single read path: it resolves the root, materializes the derived file on
-# first contact, and returns prompt-sized excerpts under caller-chosen caps.
+# ``.agents/memory/<YYYY-MM-DD>.md`` (one derived work record per day, from L2)
+# and ``.agents/rules/*.md`` (user-authored constraints). The host reads both
+# at session start so the model begins with the project's newest work and its
+# rules already in context, instead of having to discover and read the files
+# itself. This command is the single read path: it resolves the root,
+# materializes the derived day files on first contact, and returns prompt-sized
+# excerpts under caller-chosen caps.
 #
 # The caps are caller input because prompt budget belongs to the host: the
 # Python side has no idea how many tokens are already spoken for.
@@ -443,11 +447,12 @@ def cmd_projects(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any
 def cmd_project_context(memory: MemorySystem, payload: dict[str, Any]) -> dict[str, Any]:
     """The project memory excerpt and rules a session starts with.
 
-    Returns ``memory`` even when the file is absent (``exists: false``), so the
-    host can tell "not read yet" from "this project has no work". When the file
-    is absent but the project has database records, ``recent`` carries the
-    newest work lines as a fallback: a read-only checkout cannot be written, and
-    losing the project's history there would be worse than reading the store.
+    Returns ``memory`` even when no day file is readable (``exists: false``), so
+    the host can tell "not read yet" from "this project has no work". The
+    excerpt is built newest day first. When nothing is readable but the project
+    has database records, ``recent`` carries the newest work lines as a
+    fallback: a read-only checkout cannot be written, and losing the project's
+    history there would be worse than reading the store.
     """
     project = _project(payload)
     root = resolve_project_root(payload.get("cwd"))
@@ -458,12 +463,16 @@ def cmd_project_context(memory: MemorySystem, payload: dict[str, Any]) -> dict[s
         "project_id": project,
         "root_path": root,
         "memory": {
+            "dir": None,
             "path": None,
             "exists": False,
+            "files": [],
+            "days": [],
             "chars": 0,
             "updated": None,
             "excerpt": "",
             "truncated": False,
+            "legacy": False,
         },
         "rules_dir": None,
         "rules": [],
@@ -473,11 +482,11 @@ def cmd_project_context(memory: MemorySystem, payload: dict[str, Any]) -> dict[s
     if not root:
         return result
 
-    target = project_files.memory_path(root)
-    if not target.is_file():
-        # First contact with this checkout: write the derived file now so the
-        # session reads the same file a human would, rather than betting that
-        # some earlier command already regenerated it.
+    if not project_files.list_memory_files(root):
+        # First contact with this checkout: write the derived day files now so
+        # the session reads the same files a human would, rather than betting
+        # that some earlier command already regenerated them. An old single-file
+        # ``MEMORY.md`` is converted (and removed) by the same write.
         try:
             DigestService(memory).write_project_summaries(project_id=project)
         except Exception:  # noqa: BLE001 - a derived file must never fail a read

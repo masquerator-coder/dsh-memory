@@ -1,14 +1,16 @@
-"""The checkout's own files: ``.agents/memory/MEMORY.md`` and ``.agents/rules``.
+"""The checkout's own files: daily work records and ``.agents/rules``.
 
-The work summary is derived (rewritten from L2, never read back as truth); the
-rules are authored content (one Markdown per rule, the file is the source of
-truth). These tests pin the two contracts the prompt path depends on:
+The work records are derived (rewritten from L2, never read back as truth), one
+Markdown file per UTC day under ``.agents/memory/<YYYY-MM-DD>.md``; the rules
+are authored content (one Markdown per rule, the file is the source of truth).
+These tests pin the contracts the prompt path depends on:
 
-* the excerpt cleaning and character cap the host renders into a system prompt,
-  where the file's marker/title/blockquote are chrome and a missing file is not
-  an error;
-* the atomic, never-overwriting rule writer, plus the legacy root
-  ``DSH_MEMORY.md`` cleanup that makes the move lossless.
+* the excerpt cleaning, day ordering and character cap the host renders into a
+  system prompt, where the marker/title/blockquote are chrome and a missing
+  directory is not an error;
+* the atomic, unchanged-skipping day-file writer and the deletion rules that
+  make forgetting a record or migrating an older layout lossless;
+* the atomic, never-overwriting rule writer.
 """
 
 from __future__ import annotations
@@ -20,17 +22,23 @@ import pytest
 from memory_system import project_files
 from memory_system.errors import ConflictError, ValidationError
 from memory_system.project_files import (
+    LEGACY_PROJECT_MEMORY_FILE,
     LEGACY_PROJECT_SUMMARY_FILE,
-    PROJECT_MEMORY_RELATIVE,
+    PROJECT_MEMORY_DIR_RELATIVE,
     PROJECT_SUMMARY_MARKER,
     create_rule,
+    day_memory_path,
     legacy_memory_path,
-    memory_path,
+    list_memory_files,
+    memory_dir,
     read_project_memory,
     read_rules,
+    render_memory_day,
     render_rule,
     rules_dir,
+    single_file_memory_path,
     validate_rule_name,
+    write_memory_files,
 )
 from memory_system.summary import write_project_summaries
 
@@ -38,25 +46,29 @@ from memory_system.summary import write_project_summaries
 # ── helpers ─────────────────────────────────────────────────────────────
 
 
-def generated_memory_text() -> str:
-    """A file in the exact shape ``write_project_summaries`` produces."""
-    return (
-        f"{PROJECT_SUMMARY_MARKER}\n"
-        "# 项目摘要：Project A\n"
-        "\n"
-        "> 项目 ID：`proj-a` · 由 dsh-memory 自动维护 · 更新于 2026-11-07 09:30:00\n"
-        "> 只记录已做过的工作；经验教训与偏好不在此文件中。\n"
-        "> 用户对项目的约定、规则、限制在 `.agents/rules/`（一条规则一份 markdown）。\n"
-        "\n"
-        "## 2026-11-07\n"
-        "\n"
-        "- `09:30` （fix · 结果：success）修复了登录竞态\n"
-        "- `10:00` （note）接入了记忆工具\n"
+def generated_memory_text(
+    day: str = "2026-11-07",
+    *,
+    updated: str = "2026-11-07 09:30:00",
+    entries: list[str] | None = None,
+) -> str:
+    """A day file in the exact shape ``write_project_summaries`` produces."""
+    if entries is None:
+        entries = [
+            "- `09:30` （fix · 结果：success）修复了登录竞态",
+            "- `10:00` （note）接入了记忆工具",
+        ]
+    return render_memory_day(
+        project_id="proj-a",
+        display_name="Project A",
+        day=day,
+        updated=updated,
+        entries=entries,
     )
 
 
-def write_memory_file(root: Path, text: str) -> Path:
-    path = memory_path(root)
+def write_memory_file(root: Path, text: str, day: str = "2026-11-07") -> Path:
+    path = day_memory_path(root, day)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
@@ -91,15 +103,21 @@ def write_rule_file(
 
 
 def test_project_files_live_under_the_agents_directory(tmp_path: Path):
-    assert PROJECT_MEMORY_RELATIVE == ".agents/memory/MEMORY.md"
-    assert memory_path(tmp_path) == tmp_path / ".agents" / "memory" / "MEMORY.md"
+    assert PROJECT_MEMORY_DIR_RELATIVE == ".agents/memory"
+    assert memory_dir(tmp_path) == tmp_path / ".agents" / "memory"
+    assert day_memory_path(tmp_path, "2026-11-07") == (
+        tmp_path / ".agents" / "memory" / "2026-11-07.md"
+    )
+    assert single_file_memory_path(tmp_path) == (
+        tmp_path / ".agents" / "memory" / LEGACY_PROJECT_MEMORY_FILE
+    )
     assert rules_dir(tmp_path) == tmp_path / ".agents" / "rules"
     assert legacy_memory_path(tmp_path) == tmp_path / LEGACY_PROJECT_SUMMARY_FILE
     # The forward-slash spelling is the one the status payload and docs show.
-    assert memory_path(tmp_path).as_posix().endswith(PROJECT_MEMORY_RELATIVE)
+    assert memory_dir(tmp_path).as_posix().endswith(PROJECT_MEMORY_DIR_RELATIVE)
 
 
-def test_missing_memory_file_reads_as_exists_false(tmp_path: Path):
+def test_missing_memory_directory_reads_as_exists_false(tmp_path: Path):
     """A project that recorded nothing yet (or a read-only checkout) is fine.
 
     ``read_project_memory`` is a read: it must not create the directory, so the
@@ -111,11 +129,34 @@ def test_missing_memory_file_reads_as_exists_false(tmp_path: Path):
     assert result["updated"] is None
     assert result["excerpt"] == ""
     assert result["truncated"] is False
-    assert result["path"] == str(memory_path(tmp_path))
+    assert result["path"] is None
+    assert result["dir"] == str(memory_dir(tmp_path))
+    assert result["days"] == []
+    assert result["files"] == []
+    assert result["legacy"] is False
     assert not (tmp_path / ".agents").exists()
 
 
-# ── the work summary excerpt ────────────────────────────────────────────
+def test_generated_day_files_are_listed_newest_first(tmp_path: Path):
+    write_memory_file(tmp_path, generated_memory_text("2026-11-05"), "2026-11-05")
+    write_memory_file(tmp_path, generated_memory_text("2026-11-07"), "2026-11-07")
+    write_memory_file(tmp_path, generated_memory_text("2026-11-06"), "2026-11-06")
+    # Not ours: wrong name, an unmarked date-named file and a directory whose
+    # name looks like a date file.
+    (memory_dir(tmp_path) / "notes.md").write_text("note", encoding="utf-8")
+    (memory_dir(tmp_path) / "2026-11-04.md").write_text("# 手写\n", encoding="utf-8")
+    (memory_dir(tmp_path) / "2026-11-03.md").mkdir()
+
+    paths = list_memory_files(tmp_path)
+
+    assert [p.name for p in paths] == [
+        "2026-11-07.md",
+        "2026-11-06.md",
+        "2026-11-05.md",
+    ]
+
+
+# ── the work record excerpt ─────────────────────────────────────────────
 
 
 def test_excerpt_keeps_only_day_headings_and_work_lines(tmp_path: Path):
@@ -125,8 +166,12 @@ def test_excerpt_keeps_only_day_headings_and_work_lines(tmp_path: Path):
     result = read_project_memory(tmp_path)
 
     assert result["exists"] is True
-    # `chars` is the whole file so a host can say "there is more" without
-    # reading it again; the excerpt is the prompt-sized view.
+    assert result["legacy"] is False
+    assert result["days"] == ["2026-11-07"]
+    assert result["files"] == [str(day_memory_path(tmp_path, "2026-11-07"))]
+    assert result["path"] == str(day_memory_path(tmp_path, "2026-11-07"))
+    # `chars` is every file so a host can say "there is more" without reading
+    # the records again; the excerpt is the prompt-sized view.
     assert result["chars"] == len(text)
     assert result["updated"] == "2026-11-07 09:30:00"
     assert result["excerpt"] == (
@@ -143,55 +188,155 @@ def test_excerpt_keeps_only_day_headings_and_work_lines(tmp_path: Path):
     assert result["truncated"] is False
 
 
-def test_excerpt_cap_truncates_on_a_line_boundary(tmp_path: Path):
-    text = generated_memory_text()
-    write_memory_file(tmp_path, text)
-    first_line = "## 2026-11-07"
+def test_excerpt_joins_newest_first_and_truncates_on_a_line_boundary(tmp_path: Path):
+    older = generated_memory_text(
+        "2026-11-06",
+        updated="2026-11-06 18:00:00",
+        entries=["- `18:00` （note）昨天的记录"],
+    )
+    newer = generated_memory_text("2026-11-07", entries=["- `09:30` （fix）今天的记录"])
+    write_memory_file(tmp_path, older, "2026-11-06")
+    write_memory_file(tmp_path, newer, "2026-11-07")
 
-    # A budget that fits exactly one line keeps that line whole instead of
-    # cutting mid-character.
+    full = read_project_memory(tmp_path, max_chars=10_000)
+    assert full["truncated"] is False
+    assert full["days"] == ["2026-11-07", "2026-11-06"]
+    assert full["chars"] == len(newer) + len(older)
+    assert full["updated"] == "2026-11-07 09:30:00"
+    assert full["excerpt"].index("## 2026-11-07") < full["excerpt"].index("## 2026-11-06")
+    assert full["excerpt"].endswith("昨天的记录")
+
+    first_line = "## 2026-11-07"
     whole = read_project_memory(tmp_path, max_chars=len(first_line))
     assert whole["truncated"] is True
     assert whole["excerpt"] == first_line
-    assert whole["chars"] == len(text)
 
-    # A budget that falls inside line two keeps the first line and the longest
-    # prefix of the second that fits.
     partial = read_project_memory(tmp_path, max_chars=len(first_line) + 6)
     assert partial["truncated"] is True
     assert partial["excerpt"].startswith(first_line)
     assert len(partial["excerpt"]) <= len(first_line) + 6
     assert partial["excerpt"] != whole["excerpt"]
 
-    full = read_project_memory(tmp_path, max_chars=10_000)
-    assert full["truncated"] is False
-    assert full["excerpt"].endswith("接入了记忆工具")
-
     empty = read_project_memory(tmp_path, max_chars=0)
     assert empty["excerpt"] == ""
     assert empty["truncated"] is True
 
 
-def test_excerpt_is_empty_when_no_work_was_recorded(tmp_path: Path):
-    """The placeholder must not be injected as if it were work."""
-    text = (
-        f"{PROJECT_SUMMARY_MARKER}\n"
-        "# 项目摘要：Empty Project\n"
-        "\n"
-        "> 项目 ID：`proj-empty` · 由 dsh-memory 自动维护 · 更新于 （无）\n"
-        "> 只记录已做过的工作；经验教训与偏好不在此文件中。\n"
-        "\n"
-        "（还没有记录任何工作。）\n"
-    )
-    write_memory_file(tmp_path, text)
+def test_a_legacy_single_file_is_read_until_it_is_converted(tmp_path: Path):
+    """A read-only checkout written by the previous layout keeps its context."""
+    legacy = single_file_memory_path(tmp_path)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(generated_memory_text("2026-11-01"), encoding="utf-8")
 
     result = read_project_memory(tmp_path)
 
     assert result["exists"] is True
-    assert result["chars"] == len(text)
-    assert result["updated"] is None
-    assert result["excerpt"] == ""
-    assert result["truncated"] is False
+    assert result["legacy"] is True
+    assert result["path"] == str(legacy)
+    assert result["days"] == []
+    assert result["chars"] == len(generated_memory_text("2026-11-01"))
+    assert result["excerpt"].startswith("## 2026-11-01")
+
+
+# ── writing the day records ─────────────────────────────────────────────
+
+
+def test_render_memory_day_has_the_expected_shape(tmp_path: Path):
+    text = generated_memory_text(
+        "2026-11-07",
+        updated="2026-11-07 10:00:00",
+        entries=["- `10:00` （note）记录"],
+    )
+
+    assert text.startswith(PROJECT_SUMMARY_MARKER + "\n")
+    assert "# 项目摘要：Project A · 2026-11-07" in text
+    assert "> 项目 ID：`proj-a` · 由 dsh-memory 自动维护 · 更新于 2026-11-07 10:00:00" in text
+    assert "## 2026-11-07" in text
+    assert "- `10:00` （note）记录" in text
+    assert text.endswith("\n")
+    assert "\r" not in text
+
+
+def test_write_memory_files_is_atomic_lf_and_skips_unchanged(tmp_path: Path):
+    days = {
+        "2026-11-07": generated_memory_text("2026-11-07"),
+        "2026-11-06": generated_memory_text("2026-11-06"),
+    }
+    written = write_memory_files(tmp_path, days)
+    assert sorted(Path(p).name for p in written) == ["2026-11-06.md", "2026-11-07.md"]
+
+    path = day_memory_path(tmp_path, "2026-11-07")
+    raw = path.read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.decode("utf-8") == days["2026-11-07"]
+    # No scratch file is left behind by the atomic replace.
+    assert not list(memory_dir(tmp_path).glob("*.tmp"))
+
+    # Nothing changed: no file is rewritten (the mtime stays put).
+    stat = path.stat()
+    assert write_memory_files(tmp_path, days) == []
+    assert path.stat().st_mtime_ns == stat.st_mtime_ns
+
+    changed = dict(days)
+    changed["2026-11-07"] = generated_memory_text(
+        "2026-11-07", entries=["- `11:00` （fix）新增"]
+    )
+    assert write_memory_files(tmp_path, changed) == [str(path)]
+    assert "新增" in path.read_text(encoding="utf-8")
+
+
+def test_a_day_without_active_records_is_deleted_only_when_known(tmp_path: Path):
+    write_memory_file(tmp_path, generated_memory_text("2026-11-01"), "2026-11-01")
+    write_memory_file(tmp_path, generated_memory_text("2026-11-02"), "2026-11-02")
+    write_memory_file(tmp_path, generated_memory_text("2026-10-01"), "2026-10-01")
+    (memory_dir(tmp_path) / "2026-10-02.md").write_text("# 手写\n", encoding="utf-8")
+
+    written = write_memory_files(
+        tmp_path,
+        {"2026-11-02": generated_memory_text("2026-11-02")},
+        known_days={"2026-11-01", "2026-11-02"},
+    )
+
+    assert written == []
+    # 11-01 was a known day with no active records any more -> deleted.
+    assert not day_memory_path(tmp_path, "2026-11-01").exists()
+    assert day_memory_path(tmp_path, "2026-11-02").exists()
+    # A date the project never knew (another project id sharing the checkout)
+    # and a hand-written file both survive.
+    assert day_memory_path(tmp_path, "2026-10-01").exists()
+    assert (memory_dir(tmp_path) / "2026-10-02.md").exists()
+
+
+def test_write_memory_files_removes_both_legacy_layouts_when_marked(tmp_path: Path):
+    single = single_file_memory_path(tmp_path)
+    single.parent.mkdir(parents=True, exist_ok=True)
+    single.write_text(generated_memory_text("2026-11-01"), encoding="utf-8")
+    root_legacy = legacy_memory_path(tmp_path)
+    root_legacy.write_text(
+        f"{PROJECT_SUMMARY_MARKER}\n# 项目摘要：旧位置\n\n- `09:00` 旧工作\n",
+        encoding="utf-8",
+    )
+
+    write_memory_files(tmp_path, {"2026-11-07": generated_memory_text("2026-11-07")})
+
+    assert day_memory_path(tmp_path, "2026-11-07").is_file()
+    assert not single.exists()
+    assert not root_legacy.exists()
+
+
+def test_a_hand_written_legacy_file_survives_the_write(tmp_path: Path):
+    single = single_file_memory_path(tmp_path)
+    single.parent.mkdir(parents=True, exist_ok=True)
+    handwritten_single = "# 我自己的笔记\n- 不是生成的文件\n"
+    single.write_text(handwritten_single, encoding="utf-8")
+    root_legacy = legacy_memory_path(tmp_path)
+    handwritten_root = "# 我的根笔记\n- 不能删除\n"
+    root_legacy.write_text(handwritten_root, encoding="utf-8")
+
+    write_memory_files(tmp_path, {"2026-11-07": generated_memory_text("2026-11-07")})
+
+    assert single.read_text(encoding="utf-8") == handwritten_single
+    assert root_legacy.read_text(encoding="utf-8") == handwritten_root
 
 
 # ── project rules ───────────────────────────────────────────────────────
@@ -398,10 +543,10 @@ def test_create_rule_failure_leaves_no_partial_file(tmp_path: Path, monkeypatch:
     assert list(rules_dir(tmp_path).glob("*.tmp")) == []
 
 
-# ── legacy root file migration ──────────────────────────────────────────
+# ── legacy layout migration ─────────────────────────────────────────────
 
 
-def test_write_summaries_removes_a_generated_legacy_file(
+def test_write_summaries_removes_a_generated_legacy_root_file(
     tmp_path: Path, memory, project: str
 ):
     """The old root file was a generated artifact; the new write owns cleanup."""
@@ -417,10 +562,12 @@ def test_write_summaries_removes_a_generated_legacy_file(
 
     written = write_project_summaries(memory)
 
-    target = memory_path(root)
-    assert str(target) in written
-    assert target.is_file()
-    assert "迁移到 .agents 目录" in target.read_text(encoding="utf-8")
+    files = list_memory_files(root)
+    assert len(files) == 1
+    assert files[0].parent == memory_dir(root)
+    assert files[0].suffix == ".md" and len(files[0].stem) == 10
+    assert written == [str(files[0])]
+    assert "迁移到 .agents 目录" in files[0].read_text(encoding="utf-8")
     assert not legacy.exists()
 
     # The rewritten file is readable by the same excerpt path the host uses.
@@ -429,6 +576,27 @@ def test_write_summaries_removes_a_generated_legacy_file(
     assert info["excerpt"].startswith("## ")
     assert "迁移到 .agents 目录" in info["excerpt"]
     assert PROJECT_SUMMARY_MARKER not in info["excerpt"]
+
+
+def test_write_summaries_converts_the_single_file_layout(
+    tmp_path: Path, memory, project: str
+):
+    """The previous ``.agents/memory/MEMORY.md`` is replaced by day files."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    legacy = single_file_memory_path(root)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(generated_memory_text("2026-11-01"), encoding="utf-8")
+    memory.ensure_project(project, display_name="Project A", root_path=str(root))
+    memory.remember(project_id=project, summary="新布局的第一条记录", event_type="note")
+
+    write_project_summaries(memory)
+
+    assert not legacy.exists()
+    files = list_memory_files(root)
+    assert len(files) == 1
+    assert "新布局的第一条记录" in files[0].read_text(encoding="utf-8")
+    assert read_project_memory(root)["legacy"] is False
 
 
 def test_a_hand_written_root_file_survives_the_migration(
@@ -445,6 +613,6 @@ def test_a_hand_written_root_file_survives_the_migration(
 
     write_project_summaries(memory)
 
-    assert memory_path(root).is_file()
-    assert "新位置的工作" in memory_path(root).read_text(encoding="utf-8")
+    files = list_memory_files(root)
+    assert files and "新位置的工作" in files[0].read_text(encoding="utf-8")
     assert legacy.read_text(encoding="utf-8") == handwritten

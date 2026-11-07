@@ -2,8 +2,8 @@
 
 The digest is a **single global work log across every project**. Its job is to
 tell a later model what has already been done, so it deliberately excludes
-lessons, preferences, speculation and future plans. Each project also gets a
-Markdown summary at ``.agents/memory/MEMORY.md`` (see
+lessons, preferences, speculation and future plans. Each project also gets one
+Markdown work record per day under ``.agents/memory/<YYYY-MM-DD>.md`` (see
 :mod:`memory_system.project_files`) so the checkout itself carries a readable
 record of its work.
 
@@ -48,12 +48,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .project_files import (
-    LEGACY_PROJECT_SUMMARY_FILE,
-    PROJECT_MEMORY_RELATIVE,
-    PROJECT_SUMMARY_MARKER,
-    memory_path,
-)
+from .project_files import render_memory_day, write_memory_files
 from .storage import Store, to_iso, utcnow
 from .system import MemorySystem
 from .text import estimate_tokens
@@ -86,12 +81,10 @@ AUTO_MODE = "idle"
 SCOPES: tuple[str, ...] = ("global",)
 LEGACY_SCOPES: tuple[str, ...] = ("project",)
 
-# Each project owns a human-readable work summary inside its checkout. The
-# legacy root ``DSH_MEMORY.md`` is only recognized so an old checkout can be
-# migrated; new writes always go to the ``.agents`` location.
-PROJECT_SUMMARY_FILE = PROJECT_MEMORY_RELATIVE
-LEGACY_SUMMARY_FILE = LEGACY_PROJECT_SUMMARY_FILE
-PROJECT_SUMMARY_MAX_ITEMS = 300
+# Each project owns a human-readable work record inside its checkout: one
+# Markdown file per day under ``.agents/memory``. This cap is per day file, so
+# one unusually busy day stays bounded while older days keep their own files.
+PROJECT_MEMORY_MAX_ITEMS_PER_DAY = 300
 # A work log names a project by its label, not by its checkout path: the
 # headings are fixed overhead against the digest budget, and a Windows path
 # slug runs to ~50 characters on its own.
@@ -881,7 +874,7 @@ class DigestService:
 
         Only the one global digest is advertised. Legacy project digests are
         deliberately ignored: project-level detail now lives in that project's
-        ``.agents/memory/MEMORY.md`` file instead of the prompt path.
+        ``.agents/memory/<YYYY-MM-DD>.md`` day files instead of the prompt path.
         """
         # Nothing ever persisted this flag, so it was always the default: an
         # anchor carries the digest unless the caller says otherwise.
@@ -924,7 +917,7 @@ class DigestService:
                 + (f"，更新于 {profile_line['updated_at']}" if profile_line["updated_at"] else "")
             )
             lines.append("- 涉及用户偏好、习惯、技术栈或协作方式时，调用 memory_profile_read 读取完整画像。")
-        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目在 `.agents/memory/MEMORY.md` 记录工作摘要，项目约定/规则在 `.agents/rules/`（会话开始时自动注入）。")
+        lines.append("提示：摘要覆盖所有项目的已做工作；每个项目在 `.agents/memory/` 下按日期（如 `2026-11-07.md`）记录工作摘要，项目约定/规则在 `.agents/rules/`（会话开始时自动注入）。")
         lines.append("@@")
         return {"summary": summary_line, "profile": profile_line, "text": "\n".join(lines)}
 
@@ -942,21 +935,22 @@ def _age_days(raw: str) -> float:
 def write_project_summaries(
     memory: MemorySystem, *, project_id: str | None = None
 ) -> list[str]:
-    """Write a readable work summary into every project's checkout.
+    """Write each project's readable work records into its checkout.
 
-    The file is a *derived* view of L2: it never feeds back into recall or the
-    global digest. It lives at ``<root>/.agents/memory/MEMORY.md``; the target
-    directory is created on demand. A project without a registered
+    The records are a *derived* view of L2: they never feed back into recall or
+    the global digest. One file per UTC day lives at
+    ``<root>/.agents/memory/<YYYY-MM-DD>.md``; the directory is created on
+    demand and each file is replaced atomically. A project without a registered
     ``root_path`` is skipped, as is a root that no longer exists. Failures are
     contained per project so a read-only checkout cannot break digest
     generation.
 
-    After a successful write, a legacy root ``DSH_MEMORY.md`` is removed when
-    it still carries this writer's marker. That file is a generated artifact
-    from an older layout, not user content, so leaving it behind would keep
-    two copies of the same derived summary and make readers wonder which one
-    is current. A root file *without* the marker is left alone: it may be the
-    user's own notes.
+    After a successful reconcile, the previous single-file ``MEMORY.md`` and
+    the older root ``DSH_MEMORY.md`` are removed when they still carry this
+    writer's marker. Those are generated artifacts from older layouts, not user
+    content, so leaving them behind would keep two copies of the same record
+    and make readers wonder which one is current. A file without the marker is
+    left alone: it may be the user's own notes.
     """
     if project_id:
         try:
@@ -973,89 +967,79 @@ def write_project_summaries(
         root = Path(project.root_path).expanduser()
         if not root.is_dir():
             continue
-        text = _project_summary_markdown(memory, project)
-        target = memory_path(root)
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.is_file() and target.read_text(encoding="utf-8") == text:
-                _remove_legacy_summary(root)
-                continue
-            temporary = target.with_name(target.name + ".tmp")
-            with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(text)
-            os.replace(temporary, target)
-            _remove_legacy_summary(root)
+            days, known_days = _project_memory_days(memory, project)
+            written.extend(write_memory_files(root, days, known_days=known_days))
         except OSError:
             # A read-only or vanished checkout must not fail the digest call.
             continue
-        written.append(str(target))
     return written
 
 
-def _remove_legacy_summary(root: Path) -> None:
-    """Delete the old root artifact if it is provably one of ours.
+def _project_memory_days(
+    memory: MemorySystem, project: Any
+) -> tuple[dict[str, str], set[str]]:
+    """Group this project's work episodes into rendered per-day files.
 
-    The marker is written on line one by every version of the writer, so its
-    presence identifies a generated file; a ``DSH_MEMORY.md`` the user wrote by
-    hand does not have it and survives. A failure here is ignored: the new
-    location has already been written, and cleanup is best effort.
+    Returns the rendered day files plus every day the project has ever had a
+    record on. The second set is what lets the writer delete a day whose
+    records were all forgotten without deleting a file another project id left
+    in the same checkout.
+
+    Rows are newest first, so the first active row of each day supplies that
+    file's "更新于" stamp — the newest record of the day, not the moment the
+    writer ran: a wall-clock stamp would rewrite every file on every digest
+    commit and the unchanged-file guard could never fire. The per-day cap keeps
+    one unusually busy day bounded; older days are not truncated, because their
+    own files carry them.
     """
-    legacy = root / LEGACY_PROJECT_SUMMARY_FILE
-    try:
-        if legacy.is_file() and legacy.read_text(encoding="utf-8").startswith(PROJECT_SUMMARY_MARKER):
-            legacy.unlink()
-    except OSError:
-        pass
-
-
-def _project_summary_markdown(memory: MemorySystem, project: Any) -> str:
+    known = {
+        str(row["day"])
+        for row in memory.store.query(
+            "SELECT DISTINCT substr(created_at, 1, 10) AS day FROM l2_episodes "
+            "WHERE project_id = ?",
+            (project.project_id,),
+        )
+        if row["day"]
+    }
     excluded = ",".join("?" * len(NON_WORK_EVENT_TYPES))
     rows = memory.store.query(
         "SELECT summary, event_type, outcome, created_at FROM l2_episodes "
         "WHERE project_id = ? AND superseded_by IS NULL "
         "AND json_extract(meta, '$.forgotten_at') IS NULL "
         f"AND COALESCE(event_type, '') NOT IN ({excluded}) "
-        "ORDER BY created_at DESC LIMIT ?",
-        (project.project_id, *NON_WORK_EVENT_TYPES, PROJECT_SUMMARY_MAX_ITEMS),
+        "ORDER BY created_at DESC",
+        (project.project_id, *NON_WORK_EVENT_TYPES),
     )
-    display = project.display_name or project.project_id
-    # The stamp describes the newest work record, not the moment this function
-    # ran: with a wall-clock stamp every ``digest.commit`` rewrote the file even
-    # when no memory had changed, and the "unchanged -> skip" guard below could
-    # never fire.
-    updated = (
-        _normalize_iso(str(rows[0]["created_at"]))[:19].replace("T", " ") if rows else "（无）"
-    )
-    lines = [
-        PROJECT_SUMMARY_MARKER,
-        f"# 项目摘要：{display}",
-        "",
-        f"> 项目 ID：`{project.project_id}` · 由 dsh-memory 自动维护 · 更新于 {updated}",
-        "> 只记录已做过的工作；经验教训与偏好不在此文件中。",
-        "> 用户对项目的约定、规则、限制在 `.agents/rules/`（一条规则一份 markdown）。",
-        "",
-    ]
-    if not rows:
-        lines += ["（还没有记录任何工作。）", ""]
-        return "\n".join(lines).rstrip() + "\n"
-
-    current_day = ""
+    entries: dict[str, list[str]] = {}
+    updated: dict[str, str] = {}
     for row in rows:
         created = _normalize_iso(str(row["created_at"]))
         day = created[:10]
-        if day != current_day:
-            lines += [f"## {day}", ""]
-            current_day = day
-        stamp = created[11:16]
+        bucket = entries.setdefault(day, [])
+        if day not in updated:
+            updated[day] = f"{day} {created[11:19]}"
+        if len(bucket) >= PROJECT_MEMORY_MAX_ITEMS_PER_DAY:
+            continue
         kind = row["event_type"] or "work"
         outcome = row["outcome"]
         detail = f"（{kind}"
         if outcome:
             detail += f" · 结果：{_one_line(outcome, 80)}"
         detail += "）"
-        lines.append(f"- `{stamp}` {detail} {_one_line(row['summary'], 500)}")
-    lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+        bucket.append(f"- `{created[11:16]}` {detail} {_one_line(row['summary'], 500)}")
+    display = project.display_name or project.project_id
+    days = {
+        day: render_memory_day(
+            project_id=project.project_id,
+            display_name=display,
+            day=day,
+            updated=updated[day],
+            entries=bucket,
+        )
+        for day, bucket in entries.items()
+    }
+    return days, known
 
 
 # ══ Markdown export (digest + profile + memories) ═══════════════════════
